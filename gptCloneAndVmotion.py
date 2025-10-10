@@ -4,6 +4,7 @@ import time
 from datetime import datetime
 from pyVim.connect import SmartConnect, Disconnect
 from pyVmomi import vim
+from pyVmomi.vim import fault as vim_fault
 import os
 import json
 import ipaddress
@@ -119,12 +120,12 @@ def execute_command_in_guest(guest_op_manager, vm, root_auth, admin_auth, guest_
                             stdout_content = resp.text
                         else:
                             stderr_content = resp.text
-                except (vim.fault.FileNotFound, requests.exceptions.RequestException):
+                except (vim_fault.FileNotFound, requests.exceptions.RequestException):
                     pass
                 finally:
                     try:
                         file_manager.DeleteFileInGuest(vm=vm, auth=auth, filePath=fpath)
-                    except (vim.fault.FileNotFound, vim.fault.GuestOperationsFault):
+                    except (vim_fault.FileNotFound, vim_fault.GuestOperationsFault):
                         pass
         return exit_code, stdout_content.strip(), stderr_content.strip()
 
@@ -137,7 +138,7 @@ def execute_command_in_guest(guest_op_manager, vm, root_auth, admin_auth, guest_
     try:
         auth_used = "root"
         exit_code, stdout, stderr = _run_it(root_auth, command)
-    except vim.fault.InvalidGuestLogin as e:
+    except vim_fault.InvalidGuestLogin as e:
         print("[GUEST-CMD] root auth failed -> fallback to admin(sudo)")
         auth_used = "admin"
         sudo_command = f"echo '{guest_admin_password}' | sudo -S {command}"
@@ -485,10 +486,10 @@ def main():
                 if pid >= 0:
                     agent_ready = True
                     break
-            except vim.fault.InvalidGuestLogin:
+            except vim_fault.InvalidGuestLogin:
                  agent_ready = True 
                  break
-            except vim.fault.GuestOperationsUnavailable:
+            except vim_fault.GuestOperationsUnavailable:
                 if i < 9: 
                     time.sleep(30)
                 continue 
