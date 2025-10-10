@@ -127,6 +127,7 @@ def execute_command_in_guest(guest_op_manager, vm, root_auth, admin_auth, guest_
                         file_manager.DeleteFileInGuest(vm=vm, auth=auth, filePath=fpath)
                     except (vim_fault.FileNotFound, vim_fault.GuestOperationsFault):
                         pass
+
         return exit_code, stdout_content.strip(), stderr_content.strip()
 
     # Pre: present command
