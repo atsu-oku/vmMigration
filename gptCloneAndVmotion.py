@@ -1,4 +1,3 @@
-import atexit
 import ssl
 import getpass
 import time
@@ -705,5 +704,6 @@ finally:
     except Exception:
         pass
     print("å‡¦çE‚’çµ‚äºE—ã¾ãE)
+
 
 
