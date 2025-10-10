@@ -99,7 +99,7 @@ def execute_command_in_guest(guest_op_manager, vm, root_auth, admin_auth, guest_
         escaped_cmd = cmd.replace("'", "'\\''")
         wrapped_cmd = f"'{escaped_cmd}' > {stdout_path} 2> {stderr_path}"
         spec = vim.vm.guest.ProcessManager.ProgramSpec(programPath="/bin/bash", arguments=f"-c {wrapped_cmd}")
-        pid = process_manager.StartProgramInGuest(vm=vm, auth=auth, spec=spec)
+        _process_pid = process_manager.StartProgramInGuest(vm=vm, auth=auth, spec=spec)
 
         exit_code = -1
         start_time = time.time()
@@ -129,7 +129,7 @@ def execute_command_in_guest(guest_op_manager, vm, root_auth, admin_auth, guest_
                     except (vim_fault.FileNotFound, vim_fault.GuestOperationsFault):
                         pass
 
-        return exit_code, stdout_content.strip(), stderr_content.strip()
+                return exit_code, stdout_content.strip(), stderr_content.strip(), stdout_content.strip(), stderr_content.strip()
 
     print("[GUEST-CMD] will run:")
     print(f"  {command}")
