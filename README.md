@@ -62,3 +62,57 @@ etwork 再起動で反映
 ## 開発・PR
 - リファクタ（トップレベル処理を main() に集約）: PR #1
   - https://github.com/atsu-oku/vmMigration/pull/1
+
+## インストール（推奨手順）
+- Python 仮想環境
+  - Windows: py -3 -m venv .venv && .venv\\Scripts\\activate
+  - Linux/macOS: python3 -m venv .venv && source .venv/bin/activate
+- 依存パッケージ
+  - pip install --upgrade pip
+  - pip install pyvmomi requests
+
+## 実行例
+`ash
+# Windows (PowerShell)
+py -3 gptCloneAndVmotion.py
+# Linux
+python3 gptCloneAndVmotion.py
+`
+- 実行時に以下を対話で入力します
+  - vCenter(ソース/宛先)のパスワード
+  - クローン元 VM 名
+  - ゲスト OS の root/admin パスワード
+- 主要フェーズはコンソールに逐次表示されます（NIC再作成、IP適用、vMotion 等）。
+
+## 権限と前提
+- vCenter: クローン/登録/移行が可能な権限
+- ゲスト OS: root または sudo 可能な admin
+- VMware Tools: 実行中（Guest Operations 利用のため）
+
+## 既知の制約/注意点
+- NetworkManager (RHEL/CentOS 7–9)
+  - 
+mcli が必要。該当する既存接続は UUID/ID/ifname/mac で網羅削除します
+  - キー・ファイル（nmconnection）は .YYYYmmdd_HHMM.bak で同ディレクトリにバックアップ
+- ifcfg 系 (RHEL/CentOS 5–6)
+  - ifcfg-<ifname> と oute-<ifname> を生成。既存は .YYYYmmdd_HHMM.bak でバックアップ
+  - ifdown/ifup または 
+etwork 再起動で反映
+- 永続 NIC 名/udev ルールや cloud-init が有効な環境では再起動で上書きされることがあります
+- DVS/ポートグループ名の STG→PRD 変換は命名規則に依存（STG→PRD）
+- 文字化け対策
+  - Windows ターミナル: chcp 65001 または UTF-8 設定
+
+## トラブルシュート
+- ゲスト操作エージェント未準備（GuestOperationsUnavailable）
+  - VMware Tools の起動を確認し、数十秒待って再試行
+- 認証失敗（InvalidGuestLogin）
+  - root/admin 資格情報を再確認。admin は sudo 権限が必要
+- IP/DNS が戻る
+  - 旧プロファイル/ifcfgが残存していないか確認（.bak が生成されているか、nmcli の再読み込み済みか）
+- ルートが不足
+  - nmcli 環境では ipv4.routes、ifcfg 環境では oute-<ifname> を確認し、必要な経路を追記
+
+## セキュリティ
+- 文字列やファイルにパスワードを残さない運用を推奨（対話入力）
+- リポジトリに機密情報をコミットしないでください
