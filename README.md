@@ -1,6 +1,7 @@
 # vmMigration
 
-vCenter 上の VM を STG 環境から PRD 環境へ移行するためのスクリプト群です。gptCloneAndVmotion.py がメインスクリプトです。
+vCenter 上の VM を STG 環境から PRD 環境へ移行するためのスクリプト群です。## 更新履歴
+- 2025-10-10: nmcli コマンド実行前の表示と標準出力・標準エラーの収集、旧STGプロファイル削除のロジックを強化。
 
 ## 主な機能
 - vCenter(ソース/宛先)への認証と事前チェック
