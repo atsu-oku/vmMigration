@@ -83,7 +83,7 @@ def calculate_ip_stg_to_prd(ip_address):
         return '.'.join(str(o) for o in octets)
     raise ValueError(f"隨ｬ荳峨が繧ｯ繝・ャ繝・{octets[2]} 縺ｯ諠ｳ螳壼､悶〒縺・譛溷ｾ・ 170?179)縲ょ・蜉・ {ip_address}")
 
-def execute_command_in_guest(guest_op_manager, vm, root_auth, admin_auth, admin_pwd, command, check_exit_code=True):
+def execute_command_in_guest(guest_op_manager, vm, root_auth, admin_auth, guest_admin_password, command, check_exit_code=True):
     """
     Run a command inside Guest OS. Fallback: root -> admin(sudo).
     Always present pre/post info to user. Returns (exit_code, stdout, stderr).
@@ -140,7 +140,7 @@ def execute_command_in_guest(guest_op_manager, vm, root_auth, admin_auth, admin_
     except vim.fault.InvalidGuestLogin as e:
         print("[GUEST-CMD] root auth failed -> fallback to admin(sudo)")
         auth_used = "admin"
-        sudo_command = f"echo '{admin_pwd}' | sudo -S {command}"
+        sudo_command = f"echo '{guest_admin_password}' | sudo -S {command}"
         exit_code, stdout, stderr = _run_it(admin_auth, sudo_command)
         if exit_code != 0 and check_exit_code:
             print(f"[GUEST-CMD] user: {auth_used}")
