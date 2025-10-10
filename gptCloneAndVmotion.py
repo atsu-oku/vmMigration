@@ -85,9 +85,9 @@ def calculate_ip_stg_to_prd(ip_address):
     raise ValueError(f"隨ｬ荳峨が繧ｯ繝・ャ繝・{octets[2]} 縺ｯ諠ｳ螳壼､悶〒縺・譛溷ｾ・ 170?179)縲ょ・蜉・ {ip_address}")
 
 def execute_command_in_guest(guest_op_manager, vm, root_auth, admin_auth, guest_admin_password, command, check_exit_code=True):
-    """
-    Run a command inside Guest OS. Fallback: root -> admin(sudo).
-    Always present pre/post info to user. Returns (exit_code, stdout, stderr).
+    """Run a guest command, falling back from root to admin(sudo).
+
+    Returns (exit_code, stdout, stderr) and emits verbose logs for operators.
     """
     process_manager = guest_op_manager.processManager
     file_manager = guest_op_manager.fileManager
@@ -130,16 +130,16 @@ def execute_command_in_guest(guest_op_manager, vm, root_auth, admin_auth, guest_
 
         return exit_code, stdout_content.strip(), stderr_content.strip()
 
-    # Pre: present command
     print("[GUEST-CMD] will run:")
     print(f"  {command}")
 
     exit_code, stdout, stderr = -1, "", ""
     auth_used = None
+
     try:
         auth_used = "root"
         exit_code, stdout, stderr = _run_it(root_auth, command)
-    except vim_fault.InvalidGuestLogin as e:
+    except vim_fault.InvalidGuestLogin as exc:
         print("[GUEST-CMD] root auth failed -> fallback to admin(sudo)")
         auth_used = "admin"
         sudo_command = f"echo '{guest_admin_password}' | sudo -S {command}"
@@ -150,9 +150,8 @@ def execute_command_in_guest(guest_op_manager, vm, root_auth, admin_auth, guest_
             print("[GUEST-CMD] stdout:\n---\n" + (stdout or "(none)") + "\n---")
             print("[GUEST-CMD] stderr:\n---\n" + (stderr or "(none)") + "\n---")
             print("[GUEST-CMD] result: FAIL (reason: admin execution failed)")
-            raise RuntimeError(f"admin sudo failed (exit={exit_code})") from e
+            raise RuntimeError(f"admin sudo failed (exit={exit_code})") from exc
 
-    # Post: present OS returns
     print(f"[GUEST-CMD] user: {auth_used}")
     print(f"[GUEST-CMD] exit: {exit_code}")
     print("[GUEST-CMD] stdout:\n---\n" + (stdout or "(none)") + "\n---")
