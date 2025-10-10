@@ -1,3 +1,4 @@
+# -*- coding: cp932 -*-
 import ssl
 import getpass
 import time
