@@ -1,0 +1,4 @@
+﻿# vSphere Automation Scripts
+
+- \\gptCloneAndVmotion.py\\: vSphere VM clone and storage vMotion automation script.
+
