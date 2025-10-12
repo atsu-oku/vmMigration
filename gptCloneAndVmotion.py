@@ -9,6 +9,7 @@ import ipaddress
 import urllib.request
 import re
 import shlex
+from dataclasses import dataclass
 from datetime import datetime
 from functools import partial
 from typing import Any, Dict, List
@@ -28,6 +29,18 @@ except ImportError:
 PRD_STATIC_ROUTE_SEGMENTS = {160, 161, 162, 163, 164}
 NMCLI_FIELDS_WITH_TYPE = ['UUID', 'NAME', 'DEVICE', 'TYPE']
 NMCLI_FIELDS_NO_TYPE = ['UUID', 'NAME', 'DEVICE']
+
+
+@dataclass
+class ConnectionCheckParams:
+    max_attempts: int = 5
+    wait_seconds: int = 3
+    pre_ping_wait_seconds: int = 10
+    ping_retry_count: int = 4
+    ping_retry_delay: int = 2
+    ping_timeout_seconds: int = 2
+
+DEFAULT_CONN_CHECK_PARAMS = ConnectionCheckParams()
 
 LOG_LEVEL_NAME = os.environ.get("VSPHERE_CLONE_LOG_LEVEL", "WARNING").upper()
 LOG_LEVEL = getattr(logging, LOG_LEVEL_NAME, logging.WARNING)
@@ -284,17 +297,52 @@ def parse_nmcli_connection_output(output, field_names):
         connections.append(entry)
     return connections
 
-def ensure_connection_activation(command_executor, connection_name, device_name, ping_targets=None, max_attempts=5, wait_seconds=3, pre_ping_wait_seconds=10, ping_retry_count=4, ping_retry_delay=2, ping_timeout_seconds=2):
+def ensure_connection_activation(
+    command_executor,
+    connection_name,
+    device_name,
+    ping_targets=None,
+    params: ConnectionCheckParams | None = None,
+):
     """Ensure the specified connection is active and optional ping targets respond."""
     if not connection_name:
         return
+
+    config = params or DEFAULT_CONN_CHECK_PARAMS
     targets = []
     if ping_targets:
         for item in ping_targets:
             if item and item not in targets:
                 targets.append(item)
-    for attempt in range(1, max_attempts + 1):
-        print(f"   -> Verifying connection '{connection_name}' (attempt {attempt}/{max_attempts})")
+
+    def _ping_target(target_address):
+        ping_command = (
+            "bash -c 'for i in $(seq 1 {retry}); do "
+            "ping -c 1 -W {timeout} {target} && exit 0; "
+            "sleep {delay}; "
+            "done; exit 1'"
+        ).format(
+            retry=max(1, config.ping_retry_count),
+            timeout=max(1, config.ping_timeout_seconds),
+            target=target_address,
+            delay=max(0, config.ping_retry_delay),
+        )
+        exit_code, cmd_stdout, cmd_stderr = command_executor(
+            ping_command,
+            check_exit_code=False,
+        )
+        if exit_code != 0:
+            print(f"      - Ping to {target_address} failed (exit code {exit_code})")
+            LOGGER.debug("Ping failure details: stdout=%s stderr=%s", cmd_stdout, cmd_stderr)
+            return False
+        LOGGER.debug("Ping to %s succeeded.", target_address)
+        return True
+
+    for attempt in range(1, config.max_attempts + 1):
+        print(
+            f"   -> Verifying connection '{connection_name}' "
+            f"(attempt {attempt}/{config.max_attempts})"
+        )
         _, state_output, _ = command_executor(
             f"nmcli -t -f GENERAL.STATE connection show '{connection_name}'",
             check_exit_code=False,
@@ -305,12 +353,11 @@ def ensure_connection_activation(command_executor, connection_name, device_name,
                 f"nmcli connection up '{connection_name}'",
                 check_exit_code=False,
             )
-            time.sleep(wait_seconds)
+            time.sleep(config.wait_seconds)
             continue
         if not targets:
             return
-        ping_failed = False
-        wait_before_ping = pre_ping_wait_seconds if attempt == 1 else wait_seconds
+        wait_before_ping = config.pre_ping_wait_seconds if attempt == 1 else config.wait_seconds
         if wait_before_ping > 0:
             LOGGER.debug(
                 "Waiting %s seconds before pinging targets on %s (attempt %s)",
@@ -320,38 +367,17 @@ def ensure_connection_activation(command_executor, connection_name, device_name,
             )
             time.sleep(wait_before_ping)
         for target in targets:
-            ping_script = (
-                "bash -c 'for i in $(seq 1 {retry}); do "
-                "ping -c 1 -W {timeout} {target} && exit 0; "
-                "sleep {delay}; "
-                "done; exit 1'"
-            ).format(
-                retry=max(1, ping_retry_count),
-                timeout=max(1, ping_timeout_seconds),
-                target=target,
-                delay=max(0, ping_retry_delay),
-            )
-            LOGGER.debug(
-                "Connectivity check ping -> target=%s attempt=%s/%s",
-                target,
-                attempt,
-                max_attempts,
-            )
-            exit_code, ping_stdout, ping_stderr = command_executor(
-                ping_script,
-                check_exit_code=False,
-            )
-            if exit_code != 0:
-                print(f"      - Ping to {target} failed (exit code {exit_code})")
-                LOGGER.debug("Ping failure details: stdout=%s stderr=%s", ping_stdout, ping_stderr)
-                ping_failed = True
+            if not _ping_target(target):
                 break
-            LOGGER.debug("Ping to %s succeeded.", target)
-        if not ping_failed:
+        else:
             return
-        time.sleep(wait_seconds)
+        time.sleep(config.wait_seconds)
     summary = ', '.join(targets) if targets else 'none'
-    raise RuntimeError(f"Connection '{connection_name}' failed connectivity checks (targets: {summary})")
+    message = (
+        f"Connection '{connection_name}' failed connectivity checks "
+        f"(targets: {summary})"
+    )
+    raise RuntimeError(message)
 
 
 def determine_prd_static_routes(nic_infos, default_gateway, original_routes):
