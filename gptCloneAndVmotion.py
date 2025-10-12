@@ -23,6 +23,8 @@ try:
 except ImportError:
     REQUESTS_AVAILABLE = False
 
+PRD_STATIC_ROUTE_SEGMENTS = {160, 161, 162, 163, 164}
+
 LOG_LEVEL_NAME = os.environ.get("VSPHERE_CLONE_LOG_LEVEL", "WARNING").upper()
 LOG_LEVEL = getattr(logging, LOG_LEVEL_NAME, logging.WARNING)
 logging.basicConfig(
@@ -348,6 +350,51 @@ def ensure_connection_activation(command_executor, connection_name, device_name,
     raise RuntimeError(f"Connection '{connection_name}' failed connectivity checks (targets: {summary})")
 
 
+def determine_prd_static_routes(nic_infos, default_gateway, original_routes):
+    """Return PRD static routes (network, gateway) to configure from original STG routes."""
+    routes = []
+    seen = set()
+    local_networks = set()
+    for nic in nic_infos:
+        prd_ip = nic.get("prd_ip_address") or calculate_ip_stg_to_prd(nic.get("ip_address"))
+        subnet_mask = nic.get("subnet_mask")
+        if not prd_ip or not subnet_mask:
+            continue
+        try:
+            network = ipaddress.IPv4Interface(f"{prd_ip}/{subnet_mask}").network
+            local_networks.add(str(network))
+        except (ValueError, ipaddress.AddressValueError):
+            continue
+    for route in original_routes:
+        network = route.get("network")
+        prefix = route.get("prefix")
+        gateway = route.get("gateway")
+        if not network or prefix is None:
+            continue
+        try:
+            stg_network = ipaddress.IPv4Network(f"{network}/{prefix}", strict=False)
+        except ValueError:
+            continue
+        prd_network_address = calculate_ip_stg_to_prd(str(stg_network.network_address))
+        if not prd_network_address:
+            continue
+        try:
+            prd_network = ipaddress.IPv4Network(f"{prd_network_address}/{stg_network.prefixlen}", strict=False)
+        except ValueError:
+            continue
+        if str(prd_network) in local_networks:
+            continue
+        prd_gateway = calculate_ip_stg_to_prd(gateway) if gateway else default_gateway
+        if not prd_gateway:
+            continue
+        key = (str(prd_network), prd_gateway)
+        if key in seen:
+            continue
+        seen.add(key)
+        routes.append((str(prd_network), prd_gateway))
+    return routes
+
+
 def find_vm_by_name(content, name):
     """Return a VM object by name (or None)."""
     if not name:
@@ -630,6 +677,7 @@ unregistered_from_source = False
 original_nic_info = []
 original_dns_servers = []
 original_default_gateway = None 
+original_static_routes = []
 si_source = None
 si_dest = None
 
@@ -747,7 +795,17 @@ try:
                             break
                     except (ValueError, ipaddress.AddressValueError):
                         continue
-                break
+            else:
+                network = getattr(route, 'network', None)
+                prefix = getattr(route, 'prefixLength', None)
+                gateway_obj = getattr(route, 'gateway', None)
+                gateway = getattr(gateway_obj, 'ipAddress', None) if gateway_obj else None
+                if network and prefix is not None:
+                    original_static_routes.append({
+                        'network': network,
+                        'prefix': prefix,
+                        'gateway': gateway,
+                    })
     
     if target_vm.guest.ipStack and target_vm.guest.ipStack[0].dnsConfig:
         original_dns_servers = [dns for dns in target_vm.guest.ipStack[0].dnsConfig.ipAddress if not dns.startswith('127.')]
@@ -929,8 +987,19 @@ try:
     print("VM をパワーオンし、ゲスト OS の IP アドレスを設定します。")
     if original_nic_info:
         new_default_gateway = calculate_ip_stg_to_prd(original_default_gateway)
+        prd_static_routes = determine_prd_static_routes(
+            original_nic_info,
+            new_default_gateway,
+            original_static_routes,
+        )
+        static_routes_configured = False
         for i, nic in enumerate(original_nic_info):
             new_ip = calculate_ip_stg_to_prd(nic['ip_address'])
+            nic['prd_ip_address'] = new_ip
+            try:
+                nic['prd_ip_segment'] = int(new_ip.split('.')[2]) if new_ip else None
+            except (ValueError, IndexError):
+                nic['prd_ip_segment'] = None
             print(f"\n  - NIC {i+1} ({nic['new_mac_address']})")
             print(f"    - IP Address  : {nic['ip_address']} -> {new_ip}")
         if new_default_gateway:
@@ -1032,7 +1101,10 @@ try:
         new_default_gateway = calculate_ip_stg_to_prd(original_default_gateway)
         
         for i, nic_info in enumerate(original_nic_info):
-            new_ip = calculate_ip_stg_to_prd(nic_info['ip_address'])
+            new_ip = nic_info.get('prd_ip_address')
+            if not new_ip:
+                new_ip = calculate_ip_stg_to_prd(nic_info['ip_address'])
+                nic_info['prd_ip_address'] = new_ip
             subnet_mask_parts = nic_info['subnet_mask'].split('.')
             prefix = sum([bin(int(x)).count('1') for x in subnet_mask_parts])
             new_mac = nic_info['new_mac_address']
@@ -1202,6 +1274,19 @@ try:
                 if new_dns_servers:
                     dns_str = ' '.join(new_dns_servers)
                     guest_command_executor(f"nmcli connection modify '{con_name}' ipv4.dns '{dns_str}'")
+
+            if (
+                not static_routes_configured
+                and nic_info.get('is_gateway_nic')
+                and prd_static_routes
+            ):
+                print("   -> PRD向けスタティックルートを設定します。")
+                for network_cidr, gateway in prd_static_routes:
+                    guest_command_executor(
+                        f"nmcli connection modify '{con_name}' +ipv4.routes '{network_cidr} {gateway}'"
+                    )
+                    print(f"      - 追加: {network_cidr} via {gateway}")
+                static_routes_configured = True
 
             # 4. Bring up the new connection
             guest_command_executor(f"nmcli connection up '{con_name}'")
