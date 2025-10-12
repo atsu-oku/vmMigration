@@ -974,8 +974,8 @@ try:
             migrated_vm.Reload()
         newly_added_nics = [dev for dev in migrated_vm.config.hardware.device if isinstance(dev, vim.vm.device.VirtualEthernetCard)]
         if len(newly_added_nics) == len(original_nic_info):
-            for i in range(len(original_nic_info)):
-                original_nic_info[i]['new_mac_address'] = newly_added_nics[i].macAddress
+            for nic_entry, new_nic in zip(original_nic_info, newly_added_nics):
+                nic_entry['new_mac_address'] = new_nic.macAddress
             print("   ✓ 新しい MAC アドレスを紐付けました。")
         else:
             raise RuntimeError("再作成した NIC 数が想定数と一致しません。")
