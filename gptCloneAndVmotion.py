@@ -10,6 +10,8 @@ import urllib.request
 import re
 import shlex
 from datetime import datetime
+from functools import partial
+from typing import Any, Dict, List
 try:
     from pyVim.connect import SmartConnect, Disconnect
 except ModuleNotFoundError:
@@ -24,6 +26,8 @@ except ImportError:
     REQUESTS_AVAILABLE = False
 
 PRD_STATIC_ROUTE_SEGMENTS = {160, 161, 162, 163, 164}
+NMCLI_FIELDS_WITH_TYPE = ['UUID', 'NAME', 'DEVICE', 'TYPE']
+NMCLI_FIELDS_NO_TYPE = ['UUID', 'NAME', 'DEVICE']
 
 LOG_LEVEL_NAME = os.environ.get("VSPHERE_CLONE_LOG_LEVEL", "WARNING").upper()
 LOG_LEVEL = getattr(logging, LOG_LEVEL_NAME, logging.WARNING)
@@ -674,10 +678,10 @@ new_vm_on_source = None
 migrated_vm_for_rollback = None 
 migrated_vm_name_for_rollback = None
 unregistered_from_source = False
-original_nic_info = []
-original_dns_servers = []
-original_default_gateway = None 
-original_static_routes = []
+original_nic_info: List[Dict[str, Any]] = []
+original_dns_servers: List[str] = []
+original_default_gateway: str | None = None 
+original_static_routes: List[Dict[str, Any]] = []
 si_source = None
 si_dest = None
 
@@ -1153,12 +1157,12 @@ try:
             device_name_normalized = device_name.lower()
             mac_normalized = new_mac_lower.replace('-', ':') if new_mac_lower else ""
             old_mac_normalized = original_mac_lower.replace('-', ':')
-            nmcli_fields = ["UUID", "NAME", "DEVICE", "TYPE"]
+            nmcli_fields = NMCLI_FIELDS_WITH_TYPE
             nmcli_list_cmd = f"nmcli -t -f {','.join(nmcli_fields)} connection show"
             try:
                 _, nmcli_output, _ = guest_command_executor(nmcli_list_cmd)
             except RuntimeError:
-                nmcli_fields = ["UUID", "NAME", "DEVICE"]
+                nmcli_fields = NMCLI_FIELDS_NO_TYPE
                 nmcli_list_cmd = f"nmcli -t -f {','.join(nmcli_fields)} connection show"
                 _, nmcli_output, _ = guest_command_executor(nmcli_list_cmd)
             parsed_connections = parse_nmcli_connection_output(nmcli_output, nmcli_fields)
