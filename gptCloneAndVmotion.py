@@ -836,6 +836,13 @@ try:
                         'prefix': prefix,
                         'gateway': gateway,
                     })
+    if original_static_routes:
+        print("   取得したスタティックルート(STG):")
+        for route in original_static_routes:
+            gw_disp = route['gateway'] or '(none)'
+            print(
+                f"      - {route['network']}/{route['prefix']} via {gw_disp}"
+            )
     
     if target_vm.guest.ipStack and target_vm.guest.ipStack[0].dnsConfig:
         original_dns_servers = [dns for dns in target_vm.guest.ipStack[0].dnsConfig.ipAddress if not dns.startswith('127.')]
@@ -1017,11 +1024,16 @@ try:
     print("VM をパワーオンし、ゲスト OS の IP アドレスを設定します。")
     if original_nic_info:
         new_default_gateway = calculate_ip_stg_to_prd(original_default_gateway)
+        gateway_nic_present = any(nic.get('is_gateway_nic') for nic in original_nic_info)
         prd_static_routes = determine_prd_static_routes(
             original_nic_info,
             new_default_gateway,
             original_static_routes,
         )
+        if prd_static_routes:
+            print("   -> PRD向けスタティックルート候補:")
+            for network_cidr, gateway in prd_static_routes:
+                print(f"      - {network_cidr} via {gateway}")
         static_routes_configured = False
         for i, nic in enumerate(original_nic_info):
             new_ip = calculate_ip_stg_to_prd(nic['ip_address'])
@@ -1305,9 +1317,20 @@ try:
                     dns_str = ' '.join(new_dns_servers)
                     guest_command_executor(f"nmcli connection modify '{con_name}' ipv4.dns '{dns_str}'")
 
+            should_configure_routes = nic_info.get('is_gateway_nic')
+            if not should_configure_routes and new_default_gateway and new_ip:
+                try:
+                    nic_network = ipaddress.IPv4Interface(f"{new_ip}/{prefix}").network
+                    if ipaddress.IPv4Address(new_default_gateway) in nic_network:
+                        should_configure_routes = True
+                except (ValueError, ipaddress.AddressValueError):
+                    pass
+            if not should_configure_routes and not gateway_nic_present:
+                should_configure_routes = (i == 0)
+
             if (
                 not static_routes_configured
-                and nic_info.get('is_gateway_nic')
+                and should_configure_routes
                 and prd_static_routes
             ):
                 print("   -> PRD向けスタティックルートを設定します。")
