@@ -35,7 +35,7 @@
    ```powershell
    cd G:\マイドライブ\development\py
    ```
-2. GitHub への認証情報（PAT など）を準備した上で、リポジトリをクローンします。
+2. リポジトリをクローンします（公開リポジトリのため認証情報は不要です）。
    ```powershell
    git clone https://github.com/atsu-oku/vmMigration.git
    ```
