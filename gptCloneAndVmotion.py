@@ -1,16 +1,20 @@
-# -*- coding: cp932 -*-
-import atexit
+# -*- coding: utf-8 -*-
+import os
 import ssl
 import getpass
 import time
-from datetime import datetime
-from pyVim.connect import SmartConnect, Disconnect
-from pyVmomi import vim
-import os, sys
 import json
+import logging
 import ipaddress
 import urllib.request
-
+import re
+import shlex
+from datetime import datetime
+try:
+    from pyVim.connect import SmartConnect, Disconnect
+except ModuleNotFoundError:
+    from pyVim.connect import SmartConnect, Disconnect
+from pyVmomi import vim, vmodl
 try:
     import requests
     from requests.packages.urllib3.exceptions import InsecureRequestWarning
@@ -19,30 +23,42 @@ try:
 except ImportError:
     REQUESTS_AVAILABLE = False
 
+LOG_LEVEL_NAME = os.environ.get("VSPHERE_CLONE_LOG_LEVEL", "WARNING").upper()
+LOG_LEVEL = getattr(logging, LOG_LEVEL_NAME, logging.WARNING)
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+LOGGER = logging.getLogger("gptCloneAndVmotion")
+LOGGER.setLevel(LOG_LEVEL)
+
+ROOT_LOGIN_DISABLED = False
+
 # ------------------------------------------------
-# Ú‘±î•ñ‚¨‚æ‚ÑˆÚsæİ’è
+# æ¥ç¶šæƒ…å ±ãŠã‚ˆã³ç§»è¡Œè¨­å®š
 # ------------------------------------------------
-# --- ƒ\[ƒXvCenter ---
+# --- ã‚½ãƒ¼ã‚¹ vCenter ---
 VCSA_HOST_SOURCE = 'vcsa01s.ipet.local'
 VCSA_USER = 'administrator@vsphere.local'
 VCSA_PORT = 443
 
-# --- ˆ¶ævCenter ---
+# --- å®›å…ˆ vCenter ---
 VCSA_HOST_DEST = 'vcsa01p.ipet.local'
 
-# --- ˆÚsƒŠƒ\[ƒX ---
-# ƒNƒ[ƒ“æ‚Ì‹¤—Lƒf[ƒ^ƒXƒgƒA
+# --- ç§»è¡Œãƒªã‚½ãƒ¼ã‚¹ ---
+# ã‚¯ãƒ­ãƒ¼ãƒ³å…ˆå…±æœ‰ãƒ‡ãƒ¼ã‚¿ã‚¹ãƒˆã‚¢
 TARGET_DATASTORE_NAME = 'PMAX-COM-VOL1'
-# ÅI“I‚ÈˆÚsæƒf[ƒ^ƒXƒgƒA
+# æœ€çµ‚çš„ãªç§»è¡Œãƒ‡ãƒ¼ã‚¿ã‚¹ãƒˆã‚¢
 TARGET_DATASTORE_NAME_FINAL = 'PMAX-PRD-VOL1'
-# ƒRƒ“ƒsƒ…[ƒeƒBƒ“ƒOƒŠƒ\[ƒX‚ÌˆÚsæƒNƒ‰ƒXƒ^–¼
+# ã‚³ãƒ³ãƒ”ãƒ¥ãƒ¼ãƒ†ã‚£ãƒ³ã‚°ãƒªã‚½ãƒ¼ã‚¹ã®ç§»è¡Œå…ˆã‚¯ãƒ©ã‚¹ã‚¿
 TARGET_CLUSTER_NAME = 'PRD-Cluster' 
 
-# --- ƒQƒXƒgOS”FØî•ñ ---
+# --- ã‚²ã‚¹ãƒˆ OS èªè¨¼æƒ…å ± ---
 GUEST_ROOT_USER = 'root'
-GUEST_ROOT_PWD = '' # ƒXƒNƒŠƒvƒgÀs‚É“ü—Í
-GUEST_ADMIN_USER = 'admin' # ƒtƒH[ƒ‹ƒoƒbƒN—pƒ†[ƒU[
-GUEST_ADMIN_PWD = '' # ƒXƒNƒŠƒvƒgÀs‚É“ü—Í
+GUEST_ROOT_PWD = '' # ã‚¹ã‚¯ãƒªãƒ—ãƒˆå®Ÿè¡Œæ™‚ã«å…¥åŠ›
+GUEST_ADMIN_USER = 'admin' # ãƒ•ã‚©ãƒ¼ãƒ«ãƒãƒƒã‚¯ç”¨ãƒ¦ãƒ¼ã‚¶ãƒ¼
+GUEST_ADMIN_PWD = '' # ã‚¹ã‚¯ãƒªãƒ—ãƒˆå®Ÿè¡Œæ™‚ã«å…¥åŠ›
 
 # ------------------------------------------------
 # Helper Functions
@@ -56,54 +72,328 @@ def prefix_to_subnet_mask(prefix_length):
     return '.'.join([str((netmask >> i) & 0xff) for i in (24, 16, 8, 0)])
 
 def calculate_ip_stg_to_prd(ip_address):
-    """STG¨PRDŒü‚¯‚É‘æOƒIƒNƒeƒbƒg 170?179 ‚ğ 160?169 ‚ÖÊ‘œ‚·‚éB
-
-    - “ü—Í‚ª‹ó‚È‚ç None ‚ğ•Ô‚·
-    - IPv4Œ`®‚ÆŠeƒIƒNƒeƒbƒg‚Ì”ÍˆÍ(0?255)‚ğŒŸØ
-    - ‘æOƒIƒNƒeƒbƒg‚ª 170?179 ‚È‚ç 10 Œ¸Z‚µ‚Ä•Ô‚·
-    - ‚»‚êˆÈŠO‚Í‘O’ñŠO‚Æ‚µ‚Ä ValueError ‚ğ‘—o
-    """
+    """Map STG IPv4 addresses (third octet 170-179) to PRD range by subtracting 10."""
     if not ip_address:
         return None
     parts = ip_address.split('.')
     if len(parts) != 4:
-        raise ValueError(f"IPv4Œ`®‚Å‚Í‚ ‚è‚Ü‚¹‚ñ: {ip_address}")
+        raise ValueError(f'Invalid IPv4 format: {ip_address}')
     try:
         octets = [int(x) for x in parts]
-    except ValueError as e:
-        raise ValueError(f"”’l‰»‚É¸”s‚µ‚Ü‚µ‚½: {ip_address}") from e
+    except ValueError as exc:
+        raise ValueError(f'Non-numeric value detected in IPv4 address: {ip_address}') from exc
     if any(o < 0 or o > 255 for o in octets):
-        raise ValueError(f"ŠeƒIƒNƒeƒbƒg‚Í0?255‚Ì”ÍˆÍ‚Å‚ ‚é•K—v‚ª‚ ‚è‚Ü‚·: {ip_address}")
+        raise ValueError(f'IPv4 octet out of range 0-255: {ip_address}')
     if 170 <= octets[2] <= 179:
         octets[2] = octets[2] - 10
         return '.'.join(str(o) for o in octets)
-    raise ValueError(f"‘æOƒIƒNƒeƒbƒg {octets[2]} ‚Í‘z’èŠO‚Å‚·(Šú‘Ò: 170?179)B“ü—Í: {ip_address}")
+    return ip_address
+
+
+def mask_to_prefix(netmask):
+    """Convert dotted IPv4 netmask to prefix length."""
+    if not netmask:
+        return None
+    try:
+        network = ipaddress.IPv4Network(f'0.0.0.0/{netmask}', strict=False)
+        return network.prefixlen
+    except (ipaddress.NetmaskValueError, ValueError):
+        return None
+
+STDERR_ERROR_LITERALS = ('\u30a8\u30e9\u30fc', '\u5931\u6557')
+STDERR_ERROR_REGEXES = [
+    re.compile(r'(^|\s)error\b', re.IGNORECASE),
+    re.compile(r'(^|\s)failed\b', re.IGNORECASE),
+    re.compile(r'(^|\s)fatal\b', re.IGNORECASE),
+    re.compile(r'traceback \(most recent call last\)', re.IGNORECASE),
+]
+LEGACY_INTERFACE_PATTERN = re.compile(r'^(ens|eno|enp|enx|eth|em)[0-9a-z\-]*$', re.IGNORECASE)
+
+def _compact_interface_name(name):
+    lowered = (name or "").lower()
+    return lowered.replace('-', '').replace('_', '').replace(' ', '')
+
+def _parse_ip_json_output(raw_text):
+    data = json.loads(raw_text)
+    interfaces = []
+    for entry in data:
+        ifname = entry.get("ifname")
+        if not ifname:
+            continue
+        mac = entry.get("address") or ""
+        ipv4_entries = []
+        for addr_info in entry.get("addr_info", []):
+            if addr_info.get("family") == "inet" and addr_info.get("local"):
+                ipv4_entries.append(
+                    {
+                        "address": addr_info.get("local"),
+                        "prefix_length": addr_info.get("prefixlen"),
+                    }
+                )
+        interfaces.append(
+            {
+                "ifname": ifname,
+                "mac": mac,
+                "ipv4": ipv4_entries,
+            }
+        )
+    return interfaces
+
+def _parse_ip_addr_text(raw_text):
+    interfaces = []
+    current = None
+    for raw_line in raw_text.splitlines():
+        if not raw_line:
+            continue
+        if raw_line and not raw_line[0].isspace():
+            match = re.match(r'^\d+:\s*([^:]+):', raw_line)
+            if match:
+                current = {"ifname": match.group(1), "mac": "", "ipv4": []}
+                interfaces.append(current)
+            else:
+                current = None
+            continue
+        if current is None:
+            continue
+        stripped = raw_line.strip()
+        if stripped.startswith("link/"):
+            parts = stripped.split()
+            if len(parts) >= 2:
+                mac_candidate = parts[1]
+                if mac_candidate != "00:00:00:00:00:00":
+                    current["mac"] = mac_candidate
+        elif stripped.startswith("inet "):
+            parts = stripped.split()
+            if len(parts) >= 2:
+                address_part = parts[1]
+                if '/' in address_part:
+                    ip_part, prefix_part = address_part.split('/', 1)
+                    try:
+                        prefix_len = int(prefix_part)
+                    except ValueError:
+                        prefix_len = None
+                else:
+                    ip_part = address_part
+                    prefix_len = None
+                current["ipv4"].append({"address": ip_part, "prefix_length": prefix_len})
+    return interfaces
+
+def _parse_ifconfig_output(raw_text):
+    interfaces = []
+    current = None
+    for raw_line in raw_text.splitlines():
+        if not raw_line:
+            continue
+        if not raw_line.startswith((" ", "\t")):
+            if ":" in raw_line:
+                ifname = raw_line.split(":", 1)[0].strip()
+            else:
+                ifname = raw_line.strip()
+            current = {"ifname": ifname, "mac": "", "ipv4": []}
+            interfaces.append(current)
+            continue
+        if current is None:
+            continue
+        stripped = raw_line.strip()
+        if stripped.startswith(("ether ", "HWaddr ")):
+            parts = stripped.split()
+            if len(parts) >= 2:
+                current["mac"] = parts[1]
+        elif stripped.startswith("inet "):
+            parts = stripped.split()
+            address_value = None
+            prefix_len = None
+            for idx, token in enumerate(parts):
+                if token == "inet" and idx + 1 < len(parts):
+                    address_value = parts[idx + 1]
+                elif token in ("netmask", "Mask") and idx + 1 < len(parts):
+                    prefix_len = mask_to_prefix(parts[idx + 1])
+            if address_value:
+                current["ipv4"].append({"address": address_value, "prefix_length": prefix_len})
+    return interfaces
+
+def collect_interface_inventory(command_executor):
+    """Return a list of interface metadata dictionaries for the guest OS."""
+    attempts = [
+        ("ip -j -p addr", _parse_ip_json_output),
+        ("ip -d addr", _parse_ip_addr_text),
+        ("ip addr", _parse_ip_addr_text),
+        ("ifconfig -a", _parse_ifconfig_output),
+    ]
+    for command, parser in attempts:
+        LOGGER.debug("Collecting NIC info via command: %s", command)
+        exit_code, stdout, stderr = command_executor(command, check_exit_code=False)
+        LOGGER.debug("Command '%s' exited with code %s", command, exit_code)
+        if exit_code != 0 or not stdout:
+            if stderr:
+                LOGGER.debug("Command '%s' stderr: %s", command, stderr)
+            continue
+        try:
+            inventory = parser(stdout)
+        except Exception as exc:
+            LOGGER.debug("Failed to parse output of '%s': %s", command, exc, exc_info=True)
+            continue
+        if inventory:
+            LOGGER.debug(
+                "Discovered interfaces via '%s': %s",
+                command,
+                [entry["ifname"] for entry in inventory],
+            )
+            return inventory
+    raise RuntimeError("ã‚²ã‚¹ãƒˆOSã®NICæƒ…å ±ã‚’å–å¾—ã§ãã¾ã›ã‚“ã§ã—ãŸã€‚ip/ifconfigãŒåˆ©ç”¨ã§ãã¾ã›ã‚“ã€‚")
+
+def split_nmcli_terse_line(line):
+    """Split an nmcli --terse output line taking escaped separators into account."""
+    fields = []
+    buffer = []
+    escape = False
+    for char in line:
+        if escape:
+            buffer.append(char)
+            escape = False
+        elif char == '\\':
+            escape = True
+        elif char == ':':
+            fields.append(''.join(buffer))
+            buffer = []
+        else:
+            buffer.append(char)
+    fields.append(''.join(buffer))
+    return fields
+
+def parse_nmcli_connection_output(output, field_names):
+    """Return a list of connection dicts parsed from nmcli terse output."""
+    connections = []
+    if not output:
+        return connections
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        parts = split_nmcli_terse_line(line)
+        entry = {}
+        for idx, field in enumerate(field_names):
+            value = parts[idx].strip() if idx < len(parts) else ''
+            entry[field] = value
+        connections.append(entry)
+    return connections
+
+def ensure_connection_activation(command_executor, connection_name, device_name, ping_targets=None, max_attempts=5, wait_seconds=3, pre_ping_wait_seconds=10, ping_retry_count=4, ping_retry_delay=2, ping_timeout_seconds=2):
+    """Ensure the specified connection is active and optional ping targets respond."""
+    if not connection_name:
+        return
+    targets = []
+    if ping_targets:
+        for item in ping_targets:
+            if item and item not in targets:
+                targets.append(item)
+    for attempt in range(1, max_attempts + 1):
+        print(f"   -> Verifying connection '{connection_name}' (attempt {attempt}/{max_attempts})")
+        _, state_output, _ = command_executor(
+            f"nmcli -t -f GENERAL.STATE connection show '{connection_name}'",
+            check_exit_code=False,
+        )
+        state_normalized = (state_output or '').strip().lower()
+        if 'activated' not in state_normalized:
+            command_executor(
+                f"nmcli connection up '{connection_name}'",
+                check_exit_code=False,
+            )
+            time.sleep(wait_seconds)
+            continue
+        if not targets:
+            return
+        ping_failed = False
+        wait_before_ping = pre_ping_wait_seconds if attempt == 1 else wait_seconds
+        if wait_before_ping > 0:
+            LOGGER.debug(
+                "Waiting %s seconds before pinging targets on %s (attempt %s)",
+                wait_before_ping,
+                device_name,
+                attempt,
+            )
+            time.sleep(wait_before_ping)
+        for target in targets:
+            ping_script = (
+                "bash -c 'for i in $(seq 1 {retry}); do "
+                "ping -c 1 -W {timeout} {target} && exit 0; "
+                "sleep {delay}; "
+                "done; exit 1'"
+            ).format(
+                retry=max(1, ping_retry_count),
+                timeout=max(1, ping_timeout_seconds),
+                target=target,
+                delay=max(0, ping_retry_delay),
+            )
+            LOGGER.debug(
+                "Connectivity check ping -> target=%s attempt=%s/%s",
+                target,
+                attempt,
+                max_attempts,
+            )
+            exit_code, ping_stdout, ping_stderr = command_executor(
+                ping_script,
+                check_exit_code=False,
+            )
+            if exit_code != 0:
+                print(f"      - Ping to {target} failed (exit code {exit_code})")
+                LOGGER.debug("Ping failure details: stdout=%s stderr=%s", ping_stdout, ping_stderr)
+                ping_failed = True
+                break
+            LOGGER.debug("Ping to %s succeeded.", target)
+        if not ping_failed:
+            return
+        time.sleep(wait_seconds)
+    summary = ', '.join(targets) if targets else 'none'
+    raise RuntimeError(f"Connection '{connection_name}' failed connectivity checks (targets: {summary})")
+
+
+def find_vm_by_name(content, name):
+    """Return a VM object by name (or None)."""
+    if not name:
+        return None
+    view = content.viewManager.CreateContainerView(content.rootFolder, [vim.VirtualMachine], True)
+    try:
+        for vm in view.view:
+            if vm.name == name:
+                return vm
+    finally:
+        view.Destroy()
+    return None
+
+
+def wait_for_vm_availability(content, name, retries=30, delay_seconds=2):
+    """Wait until the VM with the given name becomes available; return the VM or raise."""
+    for _ in range(max(1, retries)):
+        vm = find_vm_by_name(content, name)
+        if vm is not None:
+            return vm
+        time.sleep(max(1, delay_seconds))
+    raise RuntimeError(f"å®›å…ˆ vCenter ã« VM '{name}' ãŒè¦‹ã¤ã‹ã‚Šã¾ã›ã‚“ (ã‚¿ã‚¤ãƒ ã‚¢ã‚¦ãƒˆ)ã€‚")
+
 
 def execute_command_in_guest(guest_op_manager, vm, root_auth, admin_auth, admin_pwd, command, check_exit_code=True):
-    """
-    ƒQƒXƒgOS“à‚Å’Pˆê‚ÌƒRƒ}ƒ“ƒh‚ğÀs‚µAroot/adminƒtƒH[ƒ‹ƒoƒbƒN‚ğˆ—‚µA
-    (I—¹ƒR[ƒh, •W€o—Í, •W€ƒGƒ‰[o—Í) ‚ğ•Ô‚·B
-    """
+    """Execute a guest command, preferring root and falling back to admin without exposing passwords."""
     process_manager = guest_op_manager.processManager
     file_manager = guest_op_manager.fileManager
     stdout_path = f"/tmp/stdout_{os.urandom(4).hex()}.log"
     stderr_path = f"/tmp/stderr_{os.urandom(4).hex()}.log"
 
     def _run_it(auth, cmd):
-        escaped_cmd = cmd.replace("'", "'\\''")
+        escaped_cmd = cmd.replace("'", "'\''")
         wrapped_cmd = f"'{escaped_cmd}' > {stdout_path} 2> {stderr_path}"
         spec = vim.vm.guest.ProcessManager.ProgramSpec(programPath="/bin/bash", arguments=f"-c {wrapped_cmd}")
         pid = process_manager.StartProgramInGuest(vm=vm, auth=auth, spec=spec)
-        
+
         exit_code = -1
         start_time = time.time()
-        while time.time() - start_time < 300: # 5 min timeout
+        while time.time() - start_time < 300:
             procs = process_manager.ListProcessesInGuest(vm=vm, auth=auth, pids=[pid])
             if procs and procs[0].exitCode is not None:
                 exit_code = procs[0].exitCode
                 break
             time.sleep(2)
-        
+
         stdout_content, stderr_content = "", ""
         for fpath, content_var in [(stdout_path, "stdout_content"), (stderr_path, "stderr_content")]:
             data = ""
@@ -114,8 +404,8 @@ def execute_command_in_guest(guest_op_manager, vm, root_auth, admin_auth, admin_
                     if resp.status_code == 200:
                         data = resp.text
                 else:
-                    ctx = ssl._create_unverified_context()
-                    with urllib.request.urlopen(file_info.url, context=ctx) as resp:
+                    ctx_inner = ssl._create_unverified_context()
+                    with urllib.request.urlopen(file_info.url, context=ctx_inner) as resp:
                         data = resp.read().decode("utf-8", errors="replace")
                 if data:
                     if content_var == "stdout_content":
@@ -131,48 +421,156 @@ def execute_command_in_guest(guest_op_manager, vm, root_auth, admin_auth, admin_
                     file_manager.DeleteFileInGuest(vm=vm, auth=auth, filePath=fpath)
                 except (vim.fault.FileNotFound, vim.fault.GuestOperationsFault):
                     pass
-        
         return exit_code, stdout_content.strip(), stderr_content.strip()
 
-    # ---- Main logic of the function ----
-    # Present command before issuing
-    print("[GUEST-CMD] \u5b9f\u884c\u4e88\u5b9a\u30b3\u30de\u30f3\u30c9:")
-    print(f"  {command}")
-    exit_code, stdout, stderr = -1, "", ""
+    print("[GUEST-CMD] å®Ÿè¡Œäºˆå®šã‚³ãƒãƒ³ãƒ‰:")
+    print(f'  {command}')
+    exit_code, stdout, stderr = -1, '', ''
     auth_used = None
     fallback_error = None
-    try:
-        # Try with root first
-        auth_used = "root"
-        exit_code, stdout, stderr = _run_it(root_auth, command)
-    except vim.fault.InvalidGuestLogin as e:
-        # Fallback to admin with sudo
-        fallback_error = e
-        print("[GUEST-CMD] root\u8a8d\u8a3c\u5931\u6557 -> admin\u3078\u30d5\u30a9\u30fc\u30eb\u30d0\u30c3\u30af")
+
+    global ROOT_LOGIN_DISABLED
+
+    def _run_as_admin():
+        nonlocal exit_code, stdout, stderr, auth_used
+        temp_password = None
+        ctx_inner = ssl._create_unverified_context()
+        try:
+            temp_password = file_manager.CreateTemporaryFileInGuest(
+                vm=vm,
+                auth=admin_auth,
+                prefix="sudo_pass_",
+                suffix=".tmp",
+                directoryPath="/tmp",
+            )
+            password_bytes = (admin_pwd + "\n").encode("utf-8")
+            file_attr = vim.vm.guest.FileManager.FileAttributes()
+            upload_url = file_manager.InitiateFileTransferToGuest(
+                vm=vm,
+                auth=admin_auth,
+                guestFilePath=temp_password,
+                fileAttributes=file_attr,
+                fileSize=len(password_bytes),
+                overwrite=True,
+            )
+            password_request = urllib.request.Request(
+                upload_url,
+                data=password_bytes,
+                method="PUT",
+                headers={"Content-Type": "application/octet-stream"},
+            )
+            with urllib.request.urlopen(password_request, context=ctx_inner):
+                pass
+
+            def _sudo_command(use_script_wrapper=False):
+                quoted_command = shlex.quote(command)
+                base_cmd = f"sudo -S -p '' /bin/bash -lc {quoted_command}"
+                if use_script_wrapper:
+                    return (
+                        f"cat {shlex.quote(temp_password)} | "
+                        f"script -q -c {shlex.quote(base_cmd)} /dev/null"
+                    )
+                return f"cat {shlex.quote(temp_password)} | {base_cmd}"
+
+            result = _run_it(admin_auth, _sudo_command())
+            exit_code_candidate, _, stderr_candidate = result
+            stderr_lower = (stderr_candidate or "").lower()
+            if exit_code_candidate != 0 and (
+                "no tty present" in stderr_lower or "must have a tty" in stderr_lower
+            ):
+                print("[GUEST-CMD] sudo ãŒ TTY ã‚’è¦æ±‚ã—ãŸãŸã‚ script çµŒç”±ã§å†å®Ÿè¡Œã—ã¾ã™ã€‚")
+                result = _run_it(admin_auth, _sudo_command(use_script_wrapper=True))
+        finally:
+            for cleanup_path in (temp_password,):
+                if cleanup_path:
+                    try:
+                        file_manager.DeleteFileInGuest(vm=vm, auth=admin_auth, filePath=cleanup_path)
+                    except vim.fault.FileNotFound:
+                        pass
+                    except Exception as cleanup_error:
+                        try:
+                            rm_spec = vim.vm.guest.ProcessManager.ProgramSpec(
+                                programPath="/bin/rm",
+                                arguments=f"-f {shlex.quote(cleanup_path)}",
+                            )
+                            process_manager.StartProgramInGuest(vm=vm, auth=admin_auth, spec=rm_spec)
+                        except Exception as rm_error:
+                            print(
+                                f"[GUEST-CMD] æ³¨æ„: ä¸€æ™‚ãƒ•ã‚¡ã‚¤ãƒ« '{cleanup_path}' ã®å‰Šé™¤ã«å¤±æ•—ã—ã¾ã—ãŸ: "
+                                f"{cleanup_error}; rmçµæœ: {rm_error}"
+                            )
+        exit_code, stdout, stderr = result
         auth_used = "admin"
-        sudo_command = f"echo '{admin_pwd}' | sudo -S {command}"
-        exit_code, stdout, stderr = _run_it(admin_auth, sudo_command)
+        stderr_lower = (stderr or "").lower()
+        if exit_code != 0 and "sudo:" in stderr_lower:
+            raise RuntimeError(
+                "sudo å®Ÿè¡Œã«å¤±æ•—ã—ã¾ã—ãŸã€‚è©³ç´°: "
+                f"{(stderr or '').strip() or 'æ¨™æº–ã‚¨ãƒ©ãƒ¼å‡ºåŠ›ãªã—'}"
+            )
+        return result
 
-    # After issuing: always show OS returns
-    print(f"[GUEST-CMD] \u5b9f\u884c\u30e6\u30fc\u30b6: {auth_used}")
-    print(f"[GUEST-CMD] \u7d42\u4e86\u30b3\u30fc\u30c9: {exit_code}")
-    print("[GUEST-CMD] \u6a19\u6e96\u51fa\u529b:\n---\n" + (stdout or "(\u306a\u3057)") + "\n---")
-    print("[GUEST-CMD] \u6a19\u6e96\u30a8\u30e9\u30fc:\n---\n" + (stderr or "(\u306a\u3057)") + "\n---")
+    if not ROOT_LOGIN_DISABLED:
+        try:
+            auth_used = 'root'
+            exit_code, stdout, stderr = _run_it(root_auth, command)
+        except vim.fault.InvalidGuestLogin as error:
+            fallback_error = error
+            ROOT_LOGIN_DISABLED = True
+            print("[GUEST-CMD] rootèªè¨¼ã«å¤±æ•—ã—ã¾ã—ãŸ -> adminã§å†è©¦è¡Œã—ã¾ã™ã€‚")
+            print("[GUEST-CMD] ä»Šå¾Œã®ã‚³ãƒãƒ³ãƒ‰ã¯ admin ãƒ¦ãƒ¼ã‚¶ãƒ¼ã§å®Ÿè¡Œã—ã¾ã™ã€‚")
+            _run_as_admin()
+        except vim.fault.GuestOperationsFault as error:
+            message = (getattr(error, 'msg', '') or '').lower()
+            if 'auth' in message or 'permission' in message:
+                fallback_error = error
+                ROOT_LOGIN_DISABLED = True
+                print("[GUEST-CMD] rootèªè¨¼ã«å¤±æ•—ã—ã¾ã—ãŸ -> adminã§å†è©¦è¡Œã—ã¾ã™ã€‚")
+                print("[GUEST-CMD] ä»Šå¾Œã®ã‚³ãƒãƒ³ãƒ‰ã¯ admin ãƒ¦ãƒ¼ã‚¶ãƒ¼ã§å®Ÿè¡Œã—ã¾ã™ã€‚")
+                _run_as_admin()
+            else:
+                raise
 
-    # Success/Failure summary
-    if exit_code == 0:
-        print("[GUEST-CMD] \u7d50\u679c: \u6210\u529f")
+    if ROOT_LOGIN_DISABLED and auth_used != 'admin':
+        print("[GUEST-CMD] rootèªè¨¼ã¯ç„¡åŠ¹ã¨åˆ¤å®šã—ã¾ã—ãŸã€‚adminã§ã‚³ãƒãƒ³ãƒ‰ã‚’å®Ÿè¡Œã—ã¾ã™ã€‚")
+        _run_as_admin()
+
+    print(f"[GUEST-CMD] å®Ÿè¡Œãƒ¦ãƒ¼ã‚¶ãƒ¼: {auth_used}")
+    print(f"[GUEST-CMD] çµ‚äº†ã‚³ãƒ¼ãƒ‰: {exit_code}")
+    print("[GUEST-CMD] æ¨™æº–å‡ºåŠ›:\n---\n" + (stdout or "(ãªã—)") + "\n---")
+    print("[GUEST-CMD] æ¨™æº–ã‚¨ãƒ©ãƒ¼:\n---\n" + (stderr or "(ãªã—)") + "\n---")
+
+    stderr_indicates_error = False
+    if stderr:
+        if any(literal in stderr for literal in STDERR_ERROR_LITERALS):
+            stderr_indicates_error = True
+        else:
+            for regex in STDERR_ERROR_REGEXES:
+                if regex.search(stderr):
+                    stderr_indicates_error = True
+                    break
+    command_success = (exit_code == 0) and not stderr_indicates_error
+    if command_success:
+        print("[GUEST-CMD] çµæœ: æˆåŠŸ")
     else:
-        print("[GUEST-CMD] \u7d50\u679c: \u5931\u6557")
+        print("[GUEST-CMD] çµæœ: å¤±æ•—")
         if check_exit_code:
-            reason = (stderr or '').strip() or '\u7d42\u4e86\u30b3\u30fc\u30c9\u304c\u975e\u30bc\u30ed'
+            if exit_code != 0:
+                reason = (stderr or "").strip() or "çµ‚äº†ã‚³ãƒ¼ãƒ‰ãŒ 0 ã§ã¯ã‚ã‚Šã¾ã›ã‚“"
+            elif stderr_indicates_error:
+                reason = (stderr or "").strip() or "æ¨™æº–ã‚¨ãƒ©ãƒ¼å‡ºåŠ›ã«ã‚¨ãƒ©ãƒ¼ãŒå«ã¾ã‚Œã¦ã„ã¾ã—ãŸ"
+            else:
+                reason = "åŸå› ä¸æ˜ã®ã‚¨ãƒ©ãƒ¼"
             if fallback_error is not None and auth_used == "admin":
-                raise RuntimeError(f"admin\u3068\u3057\u3066\u306e\u30b3\u30de\u30f3\u30c9\u5b9f\u884c\u306b\u5931\u6557 (Exit Code: {exit_code}, Reason: {reason})") from fallback_error
-            raise RuntimeError(f"\u30b3\u30de\u30f3\u30c9\u5b9f\u884c\u306b\u5931\u6557 (Exit Code: {exit_code}, Reason: {reason})")
+                raise RuntimeError(
+                    f"admin ãƒ¦ãƒ¼ã‚¶ãƒ¼ã§ã®ã‚³ãƒãƒ³ãƒ‰å®Ÿè¡Œã«å¤±æ•—ã—ã¾ã—ãŸ (çµ‚äº†ã‚³ãƒ¼ãƒ‰ {exit_code}, ç†ç”±: {reason})"
+                ) from fallback_error
+            raise RuntimeError(
+                f"ã‚³ãƒãƒ³ãƒ‰å®Ÿè¡Œã«å¤±æ•—ã—ã¾ã—ãŸ (çµ‚äº†ã‚³ãƒ¼ãƒ‰ {exit_code}, ç†ç”±: {reason})"
+            )
     return exit_code, stdout, stderr
 
 # ------------------------------------------------
-# 1. ƒpƒXƒ[ƒh“ü—Í
+# 1. ãƒ‘ã‚¹ãƒ¯ãƒ¼ãƒ‰å…¥åŠ›
 # ------------------------------------------------
 try:
     VCSA_PWD_SOURCE = getpass.getpass(f"Password for {VCSA_USER} on {VCSA_HOST_SOURCE}: ")
@@ -181,19 +579,21 @@ except Exception as error:
     print('ERROR:', error)
     exit(1)
 
+ROOT_LOGIN_DISABLED = False
+
 # ------------------------------------------------
-# 2. SSLƒRƒ“ƒeƒLƒXƒg‚Ìİ’è
+# 2. SSL ã‚³ãƒ³ãƒ†ã‚­ã‚¹ãƒˆè¨­å®š
 # ------------------------------------------------
 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
 ctx.check_hostname = False
 ctx.verify_mode = ssl.CERT_NONE
 
 # ------------------------------------------------
-# 3. ‘€ì‘ÎÛ‚ÌVM–¼‚ÆƒQƒXƒgOS”FØî•ñ‚ğ“ü—Í
+# 3. æ“ä½œå¯¾è±¡ã® VM åã¨ã‚²ã‚¹ãƒˆèªè¨¼æƒ…å ±ã‚’å–å¾—
 # ------------------------------------------------
-target_vm_name = input("ƒNƒ[ƒ“‚ğì¬‚µ‚½‚¢VM‚Ì–¼‘O‚ğ“ü—Í‚µ‚Ä‚­‚¾‚³‚¢: ")
+target_vm_name = input("ã‚¯ãƒ­ãƒ¼ãƒ³ã‚’ä½œæˆã—ãŸã„ VM ã®åå‰ã‚’å…¥åŠ›ã—ã¦ãã ã•ã„: ")
 if not target_vm_name:
-    print("VM–¼‚ª“ü—Í‚³‚ê‚Ü‚¹‚ñ‚Å‚µ‚½Bˆ—‚ğI—¹‚µ‚Ü‚·B")
+    print("VMåãŒå…¥åŠ›ã•ã‚Œã¾ã›ã‚“ã§ã—ãŸã€‚å‡¦ç†ã‚’çµ‚äº†ã—ã¾ã™ã€‚")
     exit(0)
 try:
     GUEST_ROOT_PWD = getpass.getpass(f"Password for Guest OS user '{GUEST_ROOT_USER}': ")
@@ -204,12 +604,13 @@ except Exception as error:
 
 
 # ------------------------------------------------
-# ƒƒCƒ“ˆ—
+# ãƒ¡ã‚¤ãƒ³å‡¦çE
 # ------------------------------------------------
 clone_name = None
 vmx_path = None
 new_vm_on_source = None
 migrated_vm_for_rollback = None 
+migrated_vm_name_for_rollback = None
 unregistered_from_source = False
 original_nic_info = []
 original_dns_servers = []
@@ -220,75 +621,114 @@ si_dest = None
 try:
     # --- [Phase 0/7] Pre-flight Check: Authenticating to vCenters ---
     print("\n--- [Phase 0/7] Pre-flight Check: Authenticating to vCenters ---")
-    print(f"   ƒ\[ƒXvCenter ({VCSA_HOST_SOURCE}) ‚ÉÚ‘±‚ğ‚İ‚Ä‚¢‚Ü‚·...")
+    print(f"   ã‚½ãƒ¼ã‚¹ vCenter ({VCSA_HOST_SOURCE}) ã«æ¥ç¶šã‚’è©¦ã¿ã¦ã„ã¾ã™...")
     si_source = SmartConnect(host=VCSA_HOST_SOURCE, user=VCSA_USER, pwd=VCSA_PWD_SOURCE, port=VCSA_PORT, sslContext=ctx)
-    if not si_source: raise ConnectionError(f"ƒ\[ƒXvCenter ({VCSA_HOST_SOURCE}) ‚Ö‚Ì”FØ‚É¸”s‚µ‚Ü‚µ‚½B")
-    print("   ? ƒ\[ƒXvCenter”FØ¬Œ÷B")
+    if not si_source:
+        raise ConnectionError(f"ã‚½ãƒ¼ã‚¹ vCenter ({VCSA_HOST_SOURCE}) ã¸ã®èªè¨¼ã«å¤±æ•—ã—ã¾ã—ãŸã€‚")
+    print("   âœ“ ã‚½ãƒ¼ã‚¹ vCenter èªè¨¼ã«æˆåŠŸã—ã¾ã—ãŸã€‚")
     Disconnect(si_source)
     si_source = None
 
-    print(f"   ˆ¶ævCenter ({VCSA_HOST_DEST}) ‚ÉÚ‘±‚ğ‚İ‚Ä‚¢‚Ü‚·...")
+    print(f"   å®›å…ˆ vCenter ({VCSA_HOST_DEST}) ã«æ¥ç¶šã‚’è©¦ã¿ã¦ã„ã¾ã™...")
     si_dest = SmartConnect(host=VCSA_HOST_DEST, user=VCSA_USER, pwd=VCSA_PWD_DEST, port=VCSA_PORT, sslContext=ctx)
-    if not si_dest: raise ConnectionError(f"ˆ¶ævCenter ({VCSA_HOST_DEST}) ‚Ö‚Ì”FØ‚É¸”s‚µ‚Ü‚µ‚½B")
-    print("   ? ˆ¶ævCenter”FØ¬Œ÷B")
+    if not si_dest:
+        raise ConnectionError(f"å®›å…ˆ vCenter ({VCSA_HOST_DEST}) ã¸ã®èªè¨¼ã«å¤±æ•—ã—ã¾ã—ãŸã€‚")
+    print("   âœ“ å®›å…ˆ vCenter èªè¨¼ã«æˆåŠŸã—ã¾ã—ãŸã€‚")
     Disconnect(si_dest)
     si_dest = None
     
     # --- [Phase 1/7] Source vCenter: Collect Info & Prepare ---
-    print(f"\n--- [Phase 1/7] Source vCenter: Collect Info & Prepare ---")
+    print("\n--- [Phase 1/7] Source vCenter: Collect Info & Prepare ---")
     si_source = SmartConnect(host=VCSA_HOST_SOURCE, user=VCSA_USER, pwd=VCSA_PWD_SOURCE, port=VCSA_PORT, sslContext=ctx)
-    if not si_source: raise ConnectionError(f"ƒ\[ƒXvCenter ({VCSA_HOST_SOURCE}) ‚ÉÚ‘±‚Å‚«‚Ü‚¹‚ñ‚Å‚µ‚½B")
-    print("? Ú‘±¬Œ÷")
+    if not si_source:
+        raise ConnectionError(f"ã‚½ãƒ¼ã‚¹ vCenter ({VCSA_HOST_SOURCE}) ã«æ¥ç¶šã§ãã¾ã›ã‚“ã§ã—ãŸã€‚")
+    print("âœ“ ã‚½ãƒ¼ã‚¹ vCenter ã¸ã®æ¥ç¶šã«æˆåŠŸã—ã¾ã—ãŸã€‚")
     
     content_source = si_source.RetrieveContent()
     
-    target_vm = next((vm for vm in content_source.viewManager.CreateContainerView(content_source.rootFolder, [vim.VirtualMachine], True).view if vm.name == target_vm_name), None)
-    if not target_vm: raise FileNotFoundError(f"VM '{target_vm_name}' ‚ÍŒ©‚Â‚©‚è‚Ü‚¹‚ñ‚Å‚µ‚½B")
-    print(f"? VM '{target_vm.name}' ‚ªŒ©‚Â‚©‚è‚Ü‚µ‚½B")
+    target_vm = next(
+        (
+            vm
+            for vm in content_source.viewManager.CreateContainerView(
+                content_source.rootFolder, [vim.VirtualMachine], True
+            ).view
+            if vm.name == target_vm_name
+        ),
+        None,
+    )
+    if not target_vm:
+        raise FileNotFoundError(f"VM '{target_vm_name}' ã¯è¦‹ã¤ã‹ã‚Šã¾ã›ã‚“ã§ã—ãŸã€‚")
+    print(f"âœ“ VM '{target_vm.name}' ã‚’ç¢ºèªã—ã¾ã—ãŸã€‚")
 
-    if not target_vm.guest.toolsRunningStatus == 'guestToolsRunning':
-        raise SystemError("IPƒAƒhƒŒƒXæ“¾‚Ì‚½‚ßAƒ\[ƒXVM‚Ì“dŒ¹‚ªON‚Å‚ ‚èAVMware Tools‚ªÀs’†‚Å‚ ‚é•K—v‚ª‚ ‚è‚Ü‚·B")
-    print("   VMware ToolsÀs’†‚ğŠm”F‚µ‚Ü‚µ‚½B")
+    if target_vm.guest.toolsRunningStatus != "guestToolsRunning":
+        raise SystemError(
+            "IP ã‚¢ãƒ‰ãƒ¬ã‚¹ã‚’å–å¾—ã™ã‚‹ãŸã‚ã€ã‚½ãƒ¼ã‚¹ VM ã®é›»æºãŒ ON ã§ VMware Tools ãŒå®Ÿè¡Œä¸­ã§ã‚ã‚‹å¿…è¦ãŒã‚ã‚Šã¾ã™ã€‚"
+        )
+    print("   VMware Tools ãŒç¨¼åƒä¸­ã§ã‚ã‚‹ã“ã¨ã‚’ç¢ºèªã—ã¾ã—ãŸã€‚")
 
-    print("   ƒNƒ[ƒ“Œ³‚ÌNICî•ñ‚ğûW’†...")
+    print("   ã‚¯ãƒ­ãƒ¼ãƒ³å…ƒ VM ã® NIC æƒ…å ±ã‚’åé›†ã—ã¦ã„ã¾ã™...")
     guest_net_map = {nic.macAddress: nic for nic in target_vm.guest.net if nic.macAddress}
+    missing_ipv4_messages = []
     for device in target_vm.config.hardware.device:
-        if isinstance(device, vim.vm.device.VirtualEthernetCard):
-            mac = device.macAddress
-            guest_nic = guest_net_map.get(mac)
-            if guest_nic and guest_nic.ipConfig:
-                ip_v4_info = next((ip for ip in guest_nic.ipConfig.ipAddress if '.' in ip.ipAddress), None)
-                if ip_v4_info:
-                    subnet_mask = prefix_to_subnet_mask(ip_v4_info.prefixLength)
-                    network_name = None
-                    if isinstance(device.backing, vim.vm.device.VirtualEthernetCard.NetworkBackingInfo):
-                        network_name = device.backing.network.name
-                    elif isinstance(device.backing, vim.vm.device.VirtualEthernetCard.DistributedVirtualPortBackingInfo):
-                        network_name = guest_nic.network
-                    
-                    if network_name:
-                        original_nic_info.append({
-                            'device_type': type(device),
-                            'mac_address': mac,
-                            'network_name': network_name,
-                            'ip_address': ip_v4_info.ipAddress,
-                            'subnet_mask': subnet_mask,
-                            'is_gateway_nic': False # ƒfƒtƒHƒ‹ƒg‚ÍFalse
-                        })
+        if not isinstance(device, vim.vm.device.VirtualEthernetCard):
+            continue
+        mac = device.macAddress
+        guest_nic = guest_net_map.get(mac)
+        network_name = None
+        if isinstance(device.backing, vim.vm.device.VirtualEthernetCard.NetworkBackingInfo):
+            network_name = device.backing.network.name
+        elif isinstance(device.backing, vim.vm.device.VirtualEthernetCard.DistributedVirtualPortBackingInfo):
+            if guest_nic and getattr(guest_nic, 'network', None):
+                network_name = guest_nic.network
+        if not network_name and guest_nic and getattr(guest_nic, 'network', None):
+            network_name = guest_nic.network
+        if not network_name:
+            device_info = getattr(device, 'deviceInfo', None)
+            label = getattr(device_info, 'label', None) if device_info else None
+            summary = getattr(device_info, 'summary', None) if device_info else None
+            network_name = label or summary or 'Unknown Network'
+
+        if not guest_nic:
+            missing_ipv4_messages.append(f'NIC {mac} ({network_name}) data could not be retrieved from VMware Tools.')
+            continue
+        if not guest_nic.ipConfig or not getattr(guest_nic.ipConfig, 'ipAddress', None):
+            missing_ipv4_messages.append(f'NIC {mac} ({network_name}) reported no IP addresses via VMware Tools.')
+            continue
+
+        ip_v4_info = next((ip for ip in guest_nic.ipConfig.ipAddress if '.' in ip.ipAddress), None)
+        if not ip_v4_info or not getattr(ip_v4_info, 'ipAddress', None):
+            missing_ipv4_messages.append(f'NIC {mac} ({network_name}) did not report an IPv4 address.')
+            continue
+
+        subnet_mask = prefix_to_subnet_mask(ip_v4_info.prefixLength)
+        original_nic_info.append({
+            'device_type': type(device),
+            'mac_address': mac,
+            'network_name': network_name,
+            'ip_address': ip_v4_info.ipAddress,
+            'subnet_mask': subnet_mask,
+            'is_gateway_nic': False  # default False
+        })
+
+    if missing_ipv4_messages:
+        print("\n[ERROR] 1ã¤ä»¥ä¸Šã®NICã§IPv4ã‚¢ãƒ‰ãƒ¬ã‚¹ã®å–å¾—ã«å¤±æ•—ã—ã¾ã—ãŸã€‚")
+        for message in missing_ipv4_messages:
+            print(f"   - {message}")
+        raise RuntimeError("å°‘ãªãã¨ã‚‚1ã¤ã®NICã§IPv4ã‚¢ãƒ‰ãƒ¬ã‚¹ãŒå–å¾—ã§ããªã‹ã£ãŸãŸã‚å‡¦ç†ã‚’ç¶šè¡Œã§ãã¾ã›ã‚“ã€‚")
 
     if target_vm.guest.ipStack and target_vm.guest.ipStack[0].ipRouteConfig:
         for route in target_vm.guest.ipStack[0].ipRouteConfig.ipRoute:
             if route.network == '0.0.0.0' and route.prefixLength == 0:
                 original_default_gateway = route.gateway.ipAddress
-                print(f"   ƒfƒtƒHƒ‹ƒgƒQ[ƒgƒEƒFƒC '{original_default_gateway}' ‚ğæ“¾‚µ‚Ü‚µ‚½B")
-                # ƒQ[ƒgƒEƒFƒC‚ª‚Ç‚ÌNIC‚É‘®‚·‚é‚©‚ğ”»’è
+                print(f"   ãƒ‡ãƒ•ã‚©ãƒ«ãƒˆã‚²ãƒ¼ãƒˆã‚¦ã‚§ã‚¤ '{original_default_gateway}' ã‚’å–å¾—ã—ã¾ã—ãŸã€‚")
+                # ã‚²ãƒ¼ãƒˆã‚¦ã‚§ã‚¤ãŒã©ã®NICã«å±ã™ã‚‹ã‹ã‚’åˆ¤å®š
                 for nic in original_nic_info:
                     try:
                         nic_iface = ipaddress.IPv4Interface(f"{nic['ip_address']}/{nic['subnet_mask']}")
                         gw_addr = ipaddress.IPv4Address(original_default_gateway)
                         if gw_addr in nic_iface.network:
                             nic['is_gateway_nic'] = True
-                            print(f"   -> NIC with IP {nic['ip_address']} ‚ªƒQ[ƒgƒEƒFƒCNIC‚Æ”»’è‚³‚ê‚Ü‚µ‚½B")
+                            print(f"   -> IP {nic['ip_address']} ã®NICã‚’ã‚²ãƒ¼ãƒˆã‚¦ã‚§ã‚¤NICã¨åˆ¤å®šã—ã¾ã—ãŸã€‚")
                             break
                     except (ValueError, ipaddress.AddressValueError):
                         continue
@@ -297,102 +737,116 @@ try:
     if target_vm.guest.ipStack and target_vm.guest.ipStack[0].dnsConfig:
         original_dns_servers = [dns for dns in target_vm.guest.ipStack[0].dnsConfig.ipAddress if not dns.startswith('127.')]
 
-    print(f"   ? {len(original_nic_info)}ŒÂ‚ÌNIC‚©‚çIP\¬î•ñ‚ğûW‚µ‚Ü‚µ‚½B")
+    print(f"   âœ“ {len(original_nic_info)}ä»¶ã®NICæ§‹æˆã‚’å–å¾—ã—ã¾ã—ãŸã€‚")
 
     target_datastore = next((ds for ds in content_source.viewManager.CreateContainerView(content_source.rootFolder, [vim.Datastore], True).view if ds.name == TARGET_DATASTORE_NAME), None)
-    if not target_datastore: raise FileNotFoundError(f"ƒf[ƒ^ƒXƒgƒA '{TARGET_DATASTORE_NAME}' ‚ªŒ©‚Â‚©‚è‚Ü‚¹‚ñ‚Å‚µ‚½B")
-    print(f"? ƒf[ƒ^ƒXƒgƒA '{target_datastore.name}' ‚ªŒ©‚Â‚©‚è‚Ü‚µ‚½B")
+    if not target_datastore:
+        raise FileNotFoundError(f"ãƒ‡ãƒ¼ã‚¿ã‚¹ãƒˆã‚¢ '{TARGET_DATASTORE_NAME}' ãŒè¦‹ã¤ã‹ã‚Šã¾ã›ã‚“ã§ã—ãŸã€‚")
+    print(f"   âœ“ ãƒ‡ãƒ¼ã‚¿ã‚¹ãƒˆã‚¢ '{target_datastore.name}' ã‚’ç¢ºèªã—ã¾ã—ãŸã€‚")
 
     date_suffix = datetime.now().strftime('%Y%m%d')
     clone_name = f"{target_vm.name}-{date_suffix}"
     
-    # --- ƒNƒ[ƒ“‘€ì‚Ì³”F (1/4) ---
-    print("\n" + "="*25 + " ‘€ ì Šm ”F (1/4) " + "="*25)
-    print("ˆÈ‰º‚ÌVM‚ÌƒNƒ[ƒ“‚ğì¬‚µAˆÚs‚ğŠJn‚µ‚Ü‚·B“à—e‚ğ‚æ‚­‚²Šm”F‚­‚¾‚³‚¢B")
-    print(f"\n  [ƒNƒ[ƒ“Œ³VM‚Ìî•ñ]")
-    print(f"    - VM–¼          : {target_vm.name}")
-    print(f"    - OS–¼          : {target_vm.summary.config.guestFullName}")
-    print("\n  [ƒNƒ[ƒ“Œ³NIC‚Ìî•ñ]")
+    # --- ã‚¯ãƒ­ãƒ¼ãƒ³æ“ä½œã®æ‰¿èª (1/4) ---
+    print("\n" + "=" * 25 + " å®Ÿè¡Œå‰ç¢ºèª (1/4) " + "=" * 25)
+    print("ä»¥ä¸‹ã®å†…å®¹ã§ã‚¯ãƒ­ãƒ¼ãƒ³ã‚’ä½œæˆã—ã€ç§»è¡Œã‚’é–‹å§‹ã—ã¾ã™ã€‚å†…å®¹ã‚’ã”ç¢ºèªãã ã•ã„ã€‚")
+    print(f"\n  [ã‚¯ãƒ­ãƒ¼ãƒ³å…ƒ VM æƒ…å ±]")
+    print(f"    - VMå          : {target_vm.name}")
+    print(f"    - OS            : {target_vm.summary.config.guestFullName}")
+    print("\n  [ã‚¯ãƒ­ãƒ¼ãƒ³å…ƒ NIC æƒ…å ±]")
     if original_nic_info:
         for i, nic in enumerate(original_nic_info):
             print(f"    - NIC {i+1} ({nic['mac_address']})")
             print(f"      - Network     : {nic['network_name']}")
             print(f"      - IP Address  : {nic['ip_address']}")
             print(f"      - Subnet Mask : {nic['subnet_mask']}")
-    else: print("    - NICî•ñ‚ªŒ©‚Â‚©‚è‚Ü‚¹‚ñ‚Å‚µ‚½B")
+    else:
+        print("    - NICæƒ…å ±ãŒè¦‹ã¤ã‹ã‚Šã¾ã›ã‚“ã§ã—ãŸã€‚")
     if original_default_gateway:
         print(f"    - Gateway     : {original_default_gateway}")
     else:
-        print("    - ƒfƒtƒHƒ‹ƒgƒQ[ƒgƒEƒFƒC‚ªŒ©‚Â‚©‚è‚Ü‚¹‚ñ‚Å‚µ‚½B")
+        print("    - ãƒ‡ãƒ•ã‚©ãƒ«ãƒˆã‚²ãƒ¼ãƒˆã‚¦ã‚§ã‚¤ãŒè¦‹ã¤ã‹ã‚Šã¾ã›ã‚“ã§ã—ãŸã€‚")
 
-    print("\n  [ƒNƒ[ƒ“æVM‚Ìd—l]")
-    print(f"    - V‚µ‚¢VM–¼    : {clone_name}")
-    print(f"    - ”z’uƒf[ƒ^ƒXƒgƒA: {TARGET_DATASTORE_NAME}")
+    print("\n  [ã‚¯ãƒ­ãƒ¼ãƒ³å…ˆ VM ã®ä»•æ§˜]")
+    print(f"    - æ–°ã—ã„ VM å  : {clone_name}")
+    print(f"    - é…ç½®ãƒ‡ãƒ¼ã‚¿ã‚¹ãƒˆã‚¢: {TARGET_DATASTORE_NAME}")
     print("=" * 64)
 
-    user_approval = input(f"\n‚±‚ÌƒNƒ[ƒ“‘€ì‚ğÀs‚µ‚Ä‚à‚æ‚ë‚µ‚¢‚Å‚·‚©H (y/n): ")
-    if user_approval.lower() != 'y': raise InterruptedError("ƒ†[ƒU[‚É‚æ‚Á‚Ä‘€ì‚ªƒLƒƒƒ“ƒZƒ‹‚³‚ê‚Ü‚µ‚½B")
+    user_approval = input("\nã“ã®ã‚¯ãƒ­ãƒ¼ãƒ³æ“ä½œã‚’å®Ÿè¡Œã—ã¦ã‚‚ã‚ˆã‚ã—ã„ã§ã™ã‹ï¼Ÿ (y/n): ")
+    if user_approval.lower() != 'y':
+        raise InterruptedError("ãƒ¦ãƒ¼ã‚¶ãƒ¼ã«ã‚ˆã£ã¦æ“ä½œãŒã‚­ãƒ£ãƒ³ã‚»ãƒ«ã•ã‚Œã¾ã—ãŸã€‚")
     
-    # --- ƒNƒ[ƒ“ANICíœA“o˜^‰ğœ ---
+    # --- ã‚¯ãƒ­ãƒ¼ãƒ³ã€NICå‰Šé™¤ã€ç™»éŒ²è§£é™¤ ---
     relocate_spec = vim.vm.RelocateSpec(datastore=target_datastore)
     clone_spec = vim.vm.CloneSpec(location=relocate_spec, powerOn=False, template=False)
-    print("\nƒNƒ[ƒ“ì¬ƒ^ƒXƒN‚ğŠJn‚µ‚Ü‚µ‚½...")
+    print("\nã‚¯ãƒ­ãƒ¼ãƒ³ã‚¿ã‚¹ã‚¯ã‚’é–‹å§‹ã—ã¾ã™...")
     task = target_vm.Clone(folder=target_vm.parent, name=clone_name, spec=clone_spec)
-    while task.info.state not in [vim.TaskInfo.State.success, vim.TaskInfo.State.error]: progress = task.info.progress or 0; print(f"   ƒNƒ[ƒ“ì¬‚Ìi’»: {progress}%", end='\r'); time.sleep(5)
+    while task.info.state not in [vim.TaskInfo.State.success, vim.TaskInfo.State.error]:
+        progress = task.info.progress or 0
+        print(f"   ã‚¯ãƒ­ãƒ¼ãƒ³é€²æ—: {progress}%", end='\r')
+        time.sleep(5)
     print(" " * 40, end='\r')
-    if task.info.state != vim.TaskInfo.State.success: raise RuntimeError(f"ƒNƒ[ƒ“ì¬ƒGƒ‰[: {task.info.error.msg}")
-    print(f"\n? ƒNƒ[ƒ“ì¬¬Œ÷: '{clone_name}'")
+    if task.info.state != vim.TaskInfo.State.success:
+        raise RuntimeError(f"ã‚¯ãƒ­ãƒ¼ãƒ³ä½œæˆã‚¨ãƒ©ãƒ¼: {task.info.error.msg}")
+    print(f"\nâœ“ ã‚¯ãƒ­ãƒ¼ãƒ³ä½œæˆæˆåŠŸ: '{clone_name}'")
     
     new_vm_on_source = task.info.result
-    # NICíœˆ—
-    print(f"   ƒNƒ[ƒ“‚µ‚½VM '{new_vm_on_source.name}' ‚ÌNIC‚ğíœ‚µ‚Ü‚·...")
+    # NICå‰Šé™¤å‡¦çE
+    print(f"   ã‚¯ãƒ­ãƒ¼ãƒ³ã—ãŸ VM '{new_vm_on_source.name}' ã® NIC ã‚’å‰Šé™¤ã—ã¾ã™...")
     nic_devices_to_remove = [dev for dev in new_vm_on_source.config.hardware.device if isinstance(dev, vim.vm.device.VirtualEthernetCard)]
     if nic_devices_to_remove:
         nic_change_spec = [vim.vm.device.VirtualDeviceSpec(operation='remove', device=nic) for nic in nic_devices_to_remove]
         config_spec = vim.vm.ConfigSpec(deviceChange=nic_change_spec)
         task = new_vm_on_source.ReconfigVM_Task(spec=config_spec)
-        while task.info.state not in [vim.TaskInfo.State.success, vim.TaskInfo.State.error]: time.sleep(2)
-        if task.info.state != vim.TaskInfo.State.success: raise RuntimeError(f"NICíœƒGƒ‰[: {task.info.error.msg}")
-        print("   ? NICíœ¬Œ÷")
+        while task.info.state not in [vim.TaskInfo.State.success, vim.TaskInfo.State.error]:
+            time.sleep(2)
+        if task.info.state != vim.TaskInfo.State.success:
+            raise RuntimeError(f"NICå‰Šé™¤ã‚¨ãƒ©ãƒ¼: {task.info.error.msg}")
+        print("   âœ“ NIC ã‚’å‰Šé™¤ã—ã¾ã—ãŸã€‚")
     
     vmx_path = new_vm_on_source.config.files.vmPathName
-    print(f"   VM '{clone_name}' ‚ğƒ\[ƒXvCenter‚©‚ç“o˜^‰ğœ‚µ‚Ü‚·...")
+    print(f"   VM '{clone_name}' ã‚’ã‚½ãƒ¼ã‚¹ vCenter ã‹ã‚‰ç™»éŒ²è§£é™¤ã—ã¾ã™...")
     new_vm_on_source.UnregisterVM()
     unregistered_from_source = True
-    print("   ? “o˜^‰ğœ¬Œ÷")
+    print("   âœ“ ç™»éŒ²è§£é™¤å®Œäº†ã€‚")
     Disconnect(si_source)
     si_source = None
     new_vm_on_source = None 
 
-    # --- [Phase 2/7] ~ [Phase 7/7]: ˆ¶ævCenter‚Å‚Ìˆ— ---
-    print(f"\n--- [Phase 2/7] Destination vCenter: Connect & Pre-check ---")
+    # --- [Phase 2/7] ~ [Phase 7/7]: å®›å…ˆ vCenter ã§ã®å‡¦ç† ---
+    print("\n--- [Phase 2/7] Destination vCenter: Connect & Pre-check ---")
     si_dest = SmartConnect(host=VCSA_HOST_DEST, user=VCSA_USER, pwd=VCSA_PWD_DEST, port=VCSA_PORT, sslContext=ctx)
-    if not si_dest: raise ConnectionError(f"ˆ¶ævCenter ({VCSA_HOST_DEST}) ‚ÉÚ‘±‚Å‚«‚Ü‚¹‚ñ‚Å‚µ‚½B")
-    print("? Ú‘±¬Œ÷")
+    if not si_dest:
+        raise ConnectionError(f"å®›å…ˆ vCenter ({VCSA_HOST_DEST}) ã«æ¥ç¶šã§ãã¾ã›ã‚“ã§ã—ãŸã€‚")
+    print("âœ“ å®›å…ˆ vCenter ã¸ã®æ¥ç¶šã«æˆåŠŸã—ã¾ã—ãŸã€‚")
     content_dest = si_dest.RetrieveContent()
     if any(vm for vm in content_dest.viewManager.CreateContainerView(content_dest.rootFolder, [vim.VirtualMachine], True).view if vm.name == clone_name):
-        raise FileExistsError(f"“¯–¼‚ÌVM '{clone_name}' ‚ªˆ¶ævCenter‚ÉŠù‚É‘¶İ‚µ‚Ü‚·B")
-    print(f"? ˆ¶ævCenter‚É“¯–¼‚ÌVM‚Í‘¶İ‚µ‚Ü‚¹‚ñB")
+        raise FileExistsError(f"åŒåã® VM '{clone_name}' ãŒå®›å…ˆ vCenter ã«æ—¢ã«å­˜åœ¨ã—ã¾ã™ã€‚")
+    print("âœ“ å®›å…ˆ vCenter ã«åŒåã® VM ã¯å­˜åœ¨ã—ã¾ã›ã‚“ã€‚")
 
-    print(f"\n--- [Phase 3/7] Destination vCenter: Register VM ---")
+    print("\n--- [Phase 3/7] Destination vCenter: Register VM ---")
     dest_cluster = next((c for c in content_dest.viewManager.CreateContainerView(content_dest.rootFolder, [vim.ClusterComputeResource], True).view if c.name == TARGET_CLUSTER_NAME), None)
-    if not dest_cluster: raise FileNotFoundError(f"ˆ¶æƒNƒ‰ƒXƒ^ '{TARGET_CLUSTER_NAME}' ‚ªŒ©‚Â‚©‚è‚Ü‚¹‚ñ‚Å‚µ‚½B")
+    if not dest_cluster:
+        raise FileNotFoundError(f"å®›å…ˆã‚¯ãƒ©ã‚¹ã‚¿ '{TARGET_CLUSTER_NAME}' ãŒè¦‹ã¤ã‹ã‚Šã¾ã›ã‚“ã§ã—ãŸã€‚")
     task = dest_cluster.parent.parent.vmFolder.RegisterVM_Task(path=vmx_path, name=clone_name, asTemplate=False, pool=dest_cluster.resourcePool)
-    while task.info.state not in [vim.TaskInfo.State.success, vim.TaskInfo.State.error]: time.sleep(5)
-    if task.info.state != vim.TaskInfo.State.success: raise RuntimeError(f"ˆ¶ævCenter‚Å‚ÌVM“o˜^ƒGƒ‰[: {task.info.error.msg}")
-    migrated_vm = task.info.result
-    migrated_vm_for_rollback = migrated_vm # ƒ[ƒ‹ƒoƒbƒN—p‚É•Û
-    print(f"? VM“o˜^¬Œ÷B")
+    while task.info.state not in [vim.TaskInfo.State.success, vim.TaskInfo.State.error]:
+        time.sleep(5)
+    if task.info.state != vim.TaskInfo.State.success:
+        raise RuntimeError(f"å®›å…ˆ vCenter ã§ã® VM ç™»éŒ²ã‚¨ãƒ©ãƒ¼: {task.info.error.msg}")
+    migrated_vm = wait_for_vm_availability(content_dest, clone_name, retries=60, delay_seconds=2)
+    migrated_vm_for_rollback = migrated_vm  # ãƒ­ãƒ¼ãƒ«ãƒãƒƒã‚¯ç”¨ã«ä¿æŒ
+    migrated_vm_name_for_rollback = clone_name
+    print("âœ“ VM ã®ç™»éŒ²ãŒå®Œäº†ã—ã¾ã—ãŸã€‚")
 
-    print(f"\n--- [Phase 4/7] Destination vCenter: Reconfigure NICs ---")
+    print("\n--- [Phase 4/7] Destination vCenter: Reconfigure NICs ---")
     if original_nic_info:
-        print("\n" + "="*25 + " ‘€ ì Šm ”F (2/4) " + "="*25)
-        print("ˆÚs‚µ‚½VM‚ÉNIC‚ğÄì¬‚µAˆÈ‰º‚Ì’Ê‚èƒlƒbƒgƒ[ƒN‚ÉÚ‘±‚µ‚Ü‚·B")
+        print("\n" + "=" * 25 + " å®Ÿè¡Œå‰ç¢ºèª (2/4) " + "=" * 25)
+        print("ç§»è¡Œã—ãŸ VM ã« NIC ã‚’å†ä½œæˆã—ã€æ¬¡ã®ãƒãƒƒãƒˆãƒ¯ãƒ¼ã‚¯ã«æ¥ç¶šã—ã¾ã™ã€‚")
         device_change_spec = []
         for i, nic in enumerate(original_nic_info):
             original_network_name = nic['network_name']
             dest_network_name = original_network_name.replace('STG', 'PRD', 1)
-            print(f"  - NIC {i+1}: '{original_network_name}' ¨ '{dest_network_name}'")
+            print(f"  - NIC {i+1}: '{original_network_name}' -> '{dest_network_name}'")
 
             dest_network = next((net for net in content_dest.viewManager.CreateContainerView(content_dest.rootFolder, [vim.Network], True).view if net.name == dest_network_name), None)
             
@@ -412,83 +866,110 @@ try:
                 nic_spec.device.backing.network = dest_network
                 nic_spec.device.backing.deviceName = dest_network_name
             else:
-                raise FileNotFoundError(f"ˆ¶æƒlƒbƒgƒ[ƒN '{dest_network_name}' ‚ªŒ©‚Â‚©‚è‚Ü‚¹‚ñ‚Å‚µ‚½B")
+                raise FileNotFoundError(f"å®›å…ˆãƒãƒƒãƒˆãƒ¯ãƒ¼ã‚¯ '{dest_network_name}' ãŒè¦‹ã¤ã‹ã‚Šã¾ã›ã‚“ã§ã—ãŸã€‚")
 
             nic_spec.device.connectable = vim.vm.device.VirtualDevice.ConnectInfo(startConnected=True, allowGuestControl=True)
             device_change_spec.append(nic_spec)
         
         print("=" * 64)
-        user_approval_nic = input("\n‚±‚ÌNICİ’è‚ğÀs‚µ‚Ä‚à‚æ‚ë‚µ‚¢‚Å‚·‚©H (y/n): ")
+        user_approval_nic = input("\nã“ã® NIC è¨­å®šã‚’å®Ÿè¡Œã—ã¦ã‚‚ã‚ˆã‚ã—ã„ã§ã™ã‹ï¼Ÿ (y/n): ")
         if user_approval_nic.lower() != 'y':
-            raise InterruptedError("ƒ†[ƒU[‚É‚æ‚Á‚ÄNICİ’è‚ªƒLƒƒƒ“ƒZƒ‹‚³‚ê‚Ü‚µ‚½B")
+            raise InterruptedError("ãƒ¦ãƒ¼ã‚¶ãƒ¼ã«ã‚ˆã£ã¦NICè¨­å®šãŒã‚­ãƒ£ãƒ³ã‚»ãƒ«ã•ã‚Œã¾ã—ãŸã€‚")
 
-        print("\n³”F‚³‚ê‚Ü‚µ‚½BNIC‚ÌÄİ’èƒ^ƒXƒN‚ğŠJn‚µ‚Ü‚·...")
+        print("\næ‰¿èªã•ã‚Œã¾ã—ãŸã€‚NIC å†è¨­å®šã‚¿ã‚¹ã‚¯ã‚’é–‹å§‹ã—ã¾ã™...")
         config_spec = vim.vm.ConfigSpec(deviceChange=device_change_spec)
-        task = migrated_vm.ReconfigVM_Task(spec=config_spec)
-        while task.info.state not in [vim.TaskInfo.State.success, vim.TaskInfo.State.error]: time.sleep(2)
+        try:
+            task = migrated_vm.ReconfigVM_Task(spec=config_spec)
+        except vmodl.fault.ManagedObjectNotFound:
+            migrated_vm = wait_for_vm_availability(content_dest, clone_name, retries=30, delay_seconds=2)
+            migrated_vm_for_rollback = migrated_vm
+            migrated_vm_name_for_rollback = clone_name
+            task = migrated_vm.ReconfigVM_Task(spec=config_spec)
+        while task.info.state not in [vim.TaskInfo.State.success, vim.TaskInfo.State.error]:
+            time.sleep(2)
         if task.info.state != vim.TaskInfo.State.success:
-            raise RuntimeError(f"NIC‚ÌÄİ’è‚É¸”s‚µ‚Ü‚µ‚½: {task.info.error.msg}")
-        print("   ? NIC‚ÌÄİ’è‚ª³í‚ÉŠ®—¹‚µ‚Ü‚µ‚½B")
+            raise RuntimeError(f"NICã®å†è¨­å®šã«å¤±æ•—ã—ã¾ã—ãŸ: {task.info.error.msg}")
+        print("   âœ“ NIC ã®å†è¨­å®šãŒå®Œäº†ã—ã¾ã—ãŸã€‚")
         
-        print("   V‚µ‚¢NIC‚Ìî•ñ‚ğæ“¾’†...")
-        migrated_vm.Reload()
+        print("   æ–°ã—ã„ NIC æƒ…å ±ã‚’å–å¾—ä¸­...")
+        try:
+            migrated_vm.Reload()
+        except vmodl.fault.ManagedObjectNotFound:
+            migrated_vm = wait_for_vm_availability(content_dest, clone_name, retries=30, delay_seconds=2)
+            migrated_vm_for_rollback = migrated_vm
+            migrated_vm_name_for_rollback = clone_name
+            migrated_vm.Reload()
         newly_added_nics = [dev for dev in migrated_vm.config.hardware.device if isinstance(dev, vim.vm.device.VirtualEthernetCard)]
         if len(newly_added_nics) == len(original_nic_info):
             for i in range(len(original_nic_info)):
-                 original_nic_info[i]['new_mac_address'] = newly_added_nics[i].macAddress
-            print("   ? V‚µ‚¢MACƒAƒhƒŒƒX‚ÌŠÖ˜A•t‚¯‚ªŠ®—¹‚µ‚Ü‚µ‚½B")
+                original_nic_info[i]['new_mac_address'] = newly_added_nics[i].macAddress
+            print("   âœ“ æ–°ã—ã„ MAC ã‚¢ãƒ‰ãƒ¬ã‚¹ã‚’ç´ä»˜ã‘ã¾ã—ãŸã€‚")
         else:
-            raise RuntimeError("NIC‚ÌÄì¬”‚ÆŒ³‚ÌNIC”‚ªˆê’v‚µ‚Ü‚¹‚ñB")
+            raise RuntimeError("å†ä½œæˆã—ãŸ NIC æ•°ãŒæƒ³å®šæ•°ã¨ä¸€è‡´ã—ã¾ã›ã‚“ã€‚")
     else:
-        print("   - Œ³‚ÌVM‚ÉNIC‚ª‚È‚©‚Á‚½‚½‚ßANIC‚ÌÄİ’è‚ÍƒXƒLƒbƒv‚³‚ê‚Ü‚µ‚½B")
+        print("   - å…ƒã® VM ã« NIC ãŒãªã‹ã£ãŸãŸã‚ã€NIC ã®å†è¨­å®šã¯ã‚¹ã‚­ãƒƒãƒ—ã•ã‚Œã¾ã—ãŸã€‚")
 
-    print(f"\n--- [Phase 5/7] Destination vCenter: Power On ---")
-    print("\n" + "="*25 + " ‘€ ì Šm ”F (3/4) " + "="*25)
-    print("VM‚ğƒpƒ[ƒIƒ“‚µAƒQƒXƒgOS‚ÌIPƒAƒhƒŒƒX‚ğİ’è‚µ‚Ü‚·B")
+    print("\n--- [Phase 5/7] Destination vCenter: Power On ---")
+    print("\n" + "=" * 25 + " å®Ÿè¡Œå‰ç¢ºèª (3/4) " + "=" * 25)
+    print("VM ã‚’ãƒ‘ãƒ¯ãƒ¼ã‚ªãƒ³ã—ã€ã‚²ã‚¹ãƒˆ OS ã® IP ã‚¢ãƒ‰ãƒ¬ã‚¹ã‚’è¨­å®šã—ã¾ã™ã€‚")
     if original_nic_info:
         new_default_gateway = calculate_ip_stg_to_prd(original_default_gateway)
         for i, nic in enumerate(original_nic_info):
             new_ip = calculate_ip_stg_to_prd(nic['ip_address'])
             print(f"\n  - NIC {i+1} ({nic['new_mac_address']})")
-            print(f"    - IP Address  : {nic['ip_address']} ¨ {new_ip}")
+            print(f"    - IP Address  : {nic['ip_address']} -> {new_ip}")
         if new_default_gateway:
-            print(f"\n  [ƒfƒtƒHƒ‹ƒgƒQ[ƒgƒEƒFƒC‚Ìİ’è]")
-            print(f"    - Gateway     : {original_default_gateway} ¨ {new_default_gateway}")
+            print("\n  [ãƒ‡ãƒ•ã‚©ãƒ«ãƒˆã‚²ãƒ¼ãƒˆã‚¦ã‚§ã‚¤ã®è¨­å®š]")
+            print(f"    - Gateway     : {original_default_gateway} -> {new_default_gateway}")
         
         if original_dns_servers:
-            print("\n  [DNSƒT[ƒo[‚Ìİ’è]")
+            print("\n  [DNSã‚µãƒ¼ãƒãƒ¼ã®è¨­å®š]")
             new_dns_servers = [calculate_ip_stg_to_prd(dns) for dns in original_dns_servers if dns]
             for old_dns, new_dns in zip(original_dns_servers, new_dns_servers):
-                print(f"    - {old_dns} ¨ {new_dns}")
+                print(f"    - {old_dns} -> {new_dns}")
     else:
-        print("  - NICî•ñ‚ª‚È‚¢‚½‚ßAIPİ’è‚Ís‚í‚ê‚Ü‚¹‚ñB")
+        print("  - NIC æƒ…å ±ãŒãªã„ãŸã‚ã€IP è¨­å®šã¯è¡Œã‚ã‚Œã¾ã›ã‚“ã€‚")
     print("=" * 64)
     
-    user_approval_ip = input("\n‚±‚ÌIPİ’è‚ğÀs‚µAVM‚ğƒpƒ[ƒIƒ“‚µ‚Ü‚·‚©H (y/n): ")
-    if user_approval_ip.lower() != 'y': raise InterruptedError("ƒ†[ƒU[‚É‚æ‚Á‚ÄIPİ’è‚Æƒpƒ[ƒIƒ“‚ªƒLƒƒƒ“ƒZƒ‹‚³‚ê‚Ü‚µ‚½B")
+    user_approval_ip = input("\nã“ã® IP è¨­å®šã‚’å®Ÿæ–½ã—ã€VM ã‚’ãƒ‘ãƒ¯ãƒ¼ã‚ªãƒ³ã—ã¾ã™ã‹ï¼Ÿ (y/n): ")
+    if user_approval_ip.lower() != 'y':
+        raise InterruptedError("ãƒ¦ãƒ¼ã‚¶ãƒ¼ã«ã‚ˆã£ã¦ IP è¨­å®šã¨ãƒ‘ãƒ¯ãƒ¼ã‚ªãƒ³ãŒã‚­ãƒ£ãƒ³ã‚»ãƒ«ã•ã‚Œã¾ã—ãŸã€‚")
 
-    print("\n³”F‚³‚ê‚Ü‚µ‚½BVM‚ğƒpƒ[ƒIƒ“‚µ‚Ü‚·...")
-    task = migrated_vm.PowerOnVM_Task()
-    while task.info.state not in [vim.TaskInfo.State.success, vim.TaskInfo.State.error]: time.sleep(2)
-    if task.info.state != vim.TaskInfo.State.success: raise RuntimeError(f"VM‚Ìƒpƒ[ƒIƒ“‚É¸”s‚µ‚Ü‚µ‚½: {task.info.error.msg}")
-    print("   ? VM‚Í³í‚Éƒpƒ[ƒIƒ“‚³‚ê‚Ü‚µ‚½B")
+    print("\næ‰¿èªã•ã‚Œã¾ã—ãŸã€‚VM ã‚’ãƒ‘ãƒ¯ãƒ¼ã‚ªãƒ³ã—ã¾ã™...")
+    try:
+        task = migrated_vm.PowerOnVM_Task()
+    except vmodl.fault.ManagedObjectNotFound:
+        migrated_vm = wait_for_vm_availability(content_dest, clone_name, retries=30, delay_seconds=2)
+        migrated_vm_for_rollback = migrated_vm
+        migrated_vm_name_for_rollback = clone_name
+        task = migrated_vm.PowerOnVM_Task()
+    while task.info.state not in [vim.TaskInfo.State.success, vim.TaskInfo.State.error]:
+        time.sleep(2)
+    if task.info.state != vim.TaskInfo.State.success:
+        raise RuntimeError(f"VM ã®ãƒ‘ãƒ¯ãƒ¼ã‚ªãƒ³ã«å¤±æ•—ã—ã¾ã—ãŸ: {task.info.error.msg}")
+    print("   âœ“ VM ã‚’æ­£å¸¸ã«ãƒ‘ãƒ¯ãƒ¼ã‚ªãƒ³ã—ã¾ã—ãŸã€‚")
 
-    print("   ƒQƒXƒgOS‘€ìƒG[ƒWƒFƒ“ƒg‚Ì€”õ‚ğ‘Ò‚Á‚Ä‚¢‚Ü‚· (Å‘å5•ª)...")
-    guest_op_manager = content_dest.guestOperationsManager
+    print("   ã‚²ã‚¹ãƒˆ OS æ“ä½œã‚¨ãƒ¼ã‚¸ã‚§ãƒ³ãƒˆã®æº–å‚™ã‚’ç¢ºèªã—ã¦ã„ã¾ã™ (æœ€å¤§5åˆ†)...")
+    guest_operations_manager = content_dest.guestOperationsManager
     agent_ready = False
     for i in range(10): 
-        print(f"    - s {i+1}/10...")
+        print(f"    - è©¦è¡Œ {i+1}/10...")
         try:
             creds_check = vim.vm.guest.NamePasswordAuthentication(username=GUEST_ROOT_USER, password=GUEST_ROOT_PWD)
-            process_manager = guest_op_manager.processManager
+            process_manager = guest_operations_manager.processManager
             spec_check = vim.vm.guest.ProcessManager.ProgramSpec(programPath="/bin/echo", arguments="ready")
             pid = process_manager.StartProgramInGuest(vm=migrated_vm, auth=creds_check, spec=spec_check)
             if pid >= 0:
                 agent_ready = True
                 break
         except vim.fault.InvalidGuestLogin:
-             agent_ready = True 
+             agent_ready = True
              break
+        except vmodl.fault.ManagedObjectNotFound:
+            migrated_vm = wait_for_vm_availability(content_dest, clone_name, retries=30, delay_seconds=2)
+            migrated_vm_for_rollback = migrated_vm
+            migrated_vm_name_for_rollback = clone_name
+            continue
         except vim.fault.GuestOperationsUnavailable:
             if i < 9: 
                 time.sleep(30)
@@ -499,14 +980,40 @@ try:
             continue
     
     if not agent_ready:
-        raise SystemError("ƒ^ƒCƒ€ƒAƒEƒg: ƒQƒXƒgOS‘€ìƒG[ƒWƒFƒ“ƒg‚ª—˜—p‰Â”\‚É‚È‚è‚Ü‚¹‚ñ‚Å‚µ‚½B")
-    print("   ? ƒQƒXƒgOS‘€ìƒG[ƒWƒFƒ“ƒg€”õŠ®—¹B")
+        raise SystemError("ã‚¿ã‚¤ãƒ ã‚¢ã‚¦ãƒˆ: ã‚²ã‚¹ãƒˆ OS æ“ä½œã‚¨ãƒ¼ã‚¸ã‚§ãƒ³ãƒˆãŒåˆ©ç”¨å¯èƒ½ã«ãªã‚Šã¾ã›ã‚“ã§ã—ãŸã€‚")
+    print("   âœ“ ã‚²ã‚¹ãƒˆ OS æ“ä½œã‚¨ãƒ¼ã‚¸ã‚§ãƒ³ãƒˆã®æº–å‚™ãŒæ•´ã„ã¾ã—ãŸã€‚")
 
     print(f"\n--- [Phase 6/7] Destination vCenter: Set IP Address ---")
     
     if original_nic_info:
-        root_auth = vim.vm.guest.NamePasswordAuthentication(username=GUEST_ROOT_USER, password=GUEST_ROOT_PWD)
-        admin_auth = vim.vm.guest.NamePasswordAuthentication(username=GUEST_ADMIN_USER, password=GUEST_ADMIN_PWD)
+        root_credentials = vim.vm.guest.NamePasswordAuthentication(username=GUEST_ROOT_USER, password=GUEST_ROOT_PWD)
+        admin_credentials = vim.vm.guest.NamePasswordAuthentication(username=GUEST_ADMIN_USER, password=GUEST_ADMIN_PWD)
+
+        def guest_command_executor(command, check_exit_code=True):
+            global migrated_vm, migrated_vm_for_rollback, migrated_vm_name_for_rollback
+            try:
+                return execute_command_in_guest(
+                    guest_operations_manager,
+                    migrated_vm,
+                    root_credentials,
+                    admin_credentials,
+                    GUEST_ADMIN_PWD,
+                    command,
+                    check_exit_code=check_exit_code,
+                )
+            except vmodl.fault.ManagedObjectNotFound:
+                migrated_vm = wait_for_vm_availability(content_dest, clone_name, retries=30, delay_seconds=2)
+                migrated_vm_for_rollback = migrated_vm
+                migrated_vm_name_for_rollback = clone_name
+                return execute_command_in_guest(
+                    guest_operations_manager,
+                    migrated_vm,
+                    root_credentials,
+                    admin_credentials,
+                    GUEST_ADMIN_PWD,
+                    command,
+                    check_exit_code=check_exit_code,
+                )
         new_default_gateway = calculate_ip_stg_to_prd(original_default_gateway)
         
         for i, nic_info in enumerate(original_nic_info):
@@ -515,206 +1022,384 @@ try:
             prefix = sum([bin(int(x)).count('1') for x in subnet_mask_parts])
             new_mac = nic_info['new_mac_address']
             
-            con_name = f"prd-nic-{i}"
+            print("\n" + "=" * 20 + f" NIC {i+1} ã®è¨­å®š " + "=" * 20)
             
-            print("\n" + "="*20 + f" NIC {i+1} ‚Ìİ’è " + "="*20)
-            
-            # 1. Find device name using 'ip' command
-            find_device_cmd = "ip -j -p addr"
-            _, json_output, _ = execute_command_in_guest(guest_op_manager, migrated_vm, root_auth, admin_auth, GUEST_ADMIN_PWD, find_device_cmd, check_exit_code=False)
-            
+            # 1. Discover device name within the guest
+            interface_inventory = collect_interface_inventory(guest_command_executor)
             device_name = ""
-            if json_output:
-                try:
-                    addr_data = json.loads(json_output)
-                    for iface in addr_data:
-                        if iface.get('address', '').lower() == new_mac.lower():
-                            device_name = iface.get('ifname')
-                            break
-                except json.JSONDecodeError as e:
-                    raise RuntimeError(f"ƒQƒXƒgOS‚©‚ç‚ÌJSONo—Í‚Ì‰ğÍ‚É¸”s‚µ‚Ü‚µ‚½: {e}") from e
+            available_interfaces = set()
+            available_interfaces_compact = set()
+            interfaces_by_mac = {}
+            new_mac_lower = (new_mac or "").lower()
+            original_mac_lower = (nic_info.get('mac_address') or "").lower()
+            for entry in interface_inventory:
+                ifname = entry.get("ifname")
+                if not ifname:
+                    continue
+                lowered_ifname = ifname.lower()
+                available_interfaces.add(lowered_ifname)
+                available_interfaces_compact.add(_compact_interface_name(ifname))
+                mac_candidate = (entry.get("mac") or "").lower()
+                if mac_candidate:
+                    interfaces_by_mac[mac_candidate] = entry
+                    if new_mac_lower and mac_candidate == new_mac_lower:
+                        device_name = ifname
+            if not device_name and original_mac_lower:
+                match_entry = interfaces_by_mac.get(original_mac_lower)
+                if match_entry:
+                    device_name = match_entry.get("ifname", "")
 
             if not device_name:
-                raise RuntimeError(f"MACƒAƒhƒŒƒX {new_mac} ‚É‘Î‰‚·‚éƒfƒoƒCƒX‚ªŒ©‚Â‚©‚è‚Ü‚¹‚ñ‚Å‚µ‚½B")
-            print(f"   -> ƒfƒoƒCƒX '{device_name}' ‚ğ“Á’è‚µ‚Ü‚µ‚½B")
-            
-            # 2. Disconnect and delete existing connections
-            execute_command_in_guest(guest_op_manager, migrated_vm, root_auth, admin_auth, GUEST_ADMIN_PWD, f"nmcli device disconnect {device_name} || true", check_exit_code=False)
-            device_name_normalized = device_name.lower()
-            mac_normalized = new_mac.lower() if new_mac else ""
-            existing_conns_cmd = (
-                "nmcli -t --separator '|' -f UUID,NAME,DEVICE,connection.interface-name,802-3-ethernet.mac-address "
-                "connection show | awk -F'|' "
-                f"-v target='{device_name_normalized}' -v target_mac='{mac_normalized}' "
-                "'{name=tolower($2); dev=tolower($3); iface=tolower($4); mac=tolower($5); "
-                "if ((target != \"\" && (name == target || dev == target || iface == target)) || "
-                "(target_mac != \"\" && mac == target_mac)) print $1}'"
+                target_mac = new_mac or nic_info.get('mac_address') or '?'
+                raise RuntimeError(f"Unable to locate guest interface matching MAC {target_mac}")
+            LOGGER.debug(
+                "Interface match: ifname=%s, new_mac=%s, original_mac=%s",
+                device_name,
+                new_mac,
+                nic_info.get('mac_address'),
             )
-            _, existing_conns, _ = execute_command_in_guest(guest_op_manager, migrated_vm, root_auth, admin_auth, GUEST_ADMIN_PWD, existing_conns_cmd, check_exit_code=False)
-            if existing_conns.strip():
-                for uuid in existing_conns.splitlines():
-                    uuid = uuid.strip()
-                    if not uuid:
+            con_name = device_name
+            print(f"   -> ã‚²ã‚¹ãƒˆå´ã‚¤ãƒ³ã‚¿ãƒ¼ãƒ•ã‚§ãƒ¼ã‚¹: '{device_name}' ã‚’æ¤œå‡ºã—ã¾ã—ãŸã€‚")
+
+            # 2. Disconnect and delete existing connections
+            guest_command_executor(f"nmcli device disconnect {device_name} || true", check_exit_code=False)
+            device_name_normalized = device_name.lower()
+            mac_normalized = new_mac_lower.replace('-', ':') if new_mac_lower else ""
+            old_mac_normalized = original_mac_lower.replace('-', ':')
+            nmcli_fields = ["UUID", "NAME", "DEVICE", "TYPE"]
+            nmcli_list_cmd = f"nmcli -t -f {','.join(nmcli_fields)} connection show"
+            try:
+                _, nmcli_output, _ = guest_command_executor(nmcli_list_cmd)
+            except RuntimeError:
+                nmcli_fields = ["UUID", "NAME", "DEVICE"]
+                nmcli_list_cmd = f"nmcli -t -f {','.join(nmcli_fields)} connection show"
+                _, nmcli_output, _ = guest_command_executor(nmcli_list_cmd)
+            parsed_connections = parse_nmcli_connection_output(nmcli_output, nmcli_fields)
+            existing_connections = []
+            for entry in parsed_connections:
+                normalized_entry = {}
+                for field in nmcli_fields:
+                    normalized_entry[field.lower()] = entry.get(field, "")
+                existing_connections.append(normalized_entry)
+            alias_targets = {value for value in (device_name_normalized, con_name.lower()) if value}
+            alias_targets_compact = {value.replace('-', '').replace('_', '').replace(' ', '') for value in alias_targets}
+            mac_targets = set()
+            for value in (mac_normalized, old_mac_normalized):
+                if value:
+                    mac_targets.add(value)
+                    mac_targets.add(value.replace(':', ''))
+                    mac_targets.add(value.replace(':', '-'))
+            stale_connection_uuids = set()
+            connection_detail_cache = {}
+
+            def get_connection_details(uuid_value):
+                if uuid_value in connection_detail_cache:
+                    return connection_detail_cache[uuid_value]
+                detail_cmd = f"nmcli connection show {uuid_value}"
+                detail_exit, detail_stdout, _ = guest_command_executor(detail_cmd, check_exit_code=False)
+                connection_detail_cache[uuid_value] = (detail_exit, detail_stdout)
+                return connection_detail_cache[uuid_value]
+
+            for conn in existing_connections:
+                uuid = (conn.get('uuid') or "").strip()
+                if not uuid:
+                    continue
+                name_norm = (conn.get('name') or "").strip().lower()
+                device_norm = (conn.get('device') or "").strip().lower()
+                type_norm = (conn.get('type') or "").strip().lower()
+                name_compact = name_norm.replace('-', '').replace('_', '').replace(' ', '')
+                device_compact = device_norm.replace('-', '').replace('_', '').replace(' ', '')
+                alias_match = False
+                if alias_targets:
+                    if device_norm in alias_targets or name_norm in alias_targets:
+                        alias_match = True
+                    elif device_compact and any(target in device_compact for target in alias_targets_compact):
+                        alias_match = True
+                    elif name_compact and any(target in name_compact for target in alias_targets_compact):
+                        alias_match = True
+                orphaned_interface = False
+                if not device_norm:
+                    if name_norm and LEGACY_INTERFACE_PATTERN.match(name_norm):
+                        if available_interfaces and name_norm not in available_interfaces and name_compact not in available_interfaces_compact:
+                            orphaned_interface = True
+                    elif alias_targets and name_compact and any(target in name_compact for target in alias_targets_compact):
+                        orphaned_interface = True
+                mac_match = False
+                if mac_targets and not (alias_match or orphaned_interface):
+                    detail_exit, detail_stdout = get_connection_details(uuid)
+                    if detail_exit == 0 and detail_stdout:
+                        detail_lower = detail_stdout.lower()
+                        for target_mac in mac_targets:
+                            if target_mac and target_mac in detail_lower:
+                                mac_match = True
+                                break
+                if type_norm and type_norm not in ('802-3-ethernet', 'ethernet'):
+                    if not mac_match:
                         continue
-                    execute_command_in_guest(guest_op_manager, migrated_vm, root_auth, admin_auth, GUEST_ADMIN_PWD, f"nmcli connection delete uuid {uuid}")
-            
+                if alias_match or orphaned_interface or mac_match:
+                    stale_connection_uuids.add(uuid)
+            if stale_connection_uuids:
+                print(f"   -> å¤ã„ nmcli æ¥ç¶šã‚’å‰Šé™¤ã—ã¾ã™ ({len(stale_connection_uuids)} ä»¶)ã€‚")
+                for uuid in sorted(stale_connection_uuids):
+                    guest_command_executor(f"nmcli connection delete uuid {uuid}")
             # 3. Add new connection and configure it
-            execute_command_in_guest(guest_op_manager, migrated_vm, root_auth, admin_auth, GUEST_ADMIN_PWD, f"nmcli connection add type ethernet con-name '{con_name}' ifname '{device_name}'")
-            execute_command_in_guest(guest_op_manager, migrated_vm, root_auth, admin_auth, GUEST_ADMIN_PWD, f"nmcli connection modify '{con_name}' ipv4.method manual ipv4.addresses '{new_ip}/{prefix}'")
+            guest_command_executor(f"nmcli connection add type ethernet con-name '{con_name}' ifname '{device_name}'")
+            guest_command_executor(f"nmcli connection modify '{con_name}' ipv4.method manual ipv4.addresses '{new_ip}/{prefix}'")
             if nic_info.get('is_gateway_nic') and new_default_gateway:
-                execute_command_in_guest(guest_op_manager, migrated_vm, root_auth, admin_auth, GUEST_ADMIN_PWD, f"nmcli connection modify '{con_name}' ipv4.gateway '{new_default_gateway}'")
+                guest_command_executor(f"nmcli connection modify '{con_name}' ipv4.gateway '{new_default_gateway}'")
+            
+            duplicate_detected = False
+            duplicate_exit = None
+            duplicate_stdout = ""
+            duplicate_stderr = ""
+            if new_ip:
+                duplicate_cmd = f"arping -D -c 3 -I {device_name} {new_ip}"
+                duplicate_exit, duplicate_stdout, duplicate_stderr = guest_command_executor(duplicate_cmd, check_exit_code=False)
+                LOGGER.debug(
+                    "Duplicate IP check for %s on %s returned exit=%s",
+                    new_ip,
+                    device_name,
+                    duplicate_exit,
+                )
+                if duplicate_exit != 0:
+                    duplicate_detected = True
+                    print("\n[WARN] é‡è¤‡IPã‚¢ãƒ‰ãƒ¬ã‚¹ãŒæ¤œå‡ºã•ã‚Œã¾ã—ãŸã€‚")
+                    print(f"    - å¯¾è±¡NIC : {device_name}")
+                    print(f"    - IP      : {new_ip}")
+                    if duplicate_stdout:
+                        print("    - arping æ¨™æº–å‡ºåŠ›")
+                        for line in duplicate_stdout.splitlines():
+                            print(f"        {line}")
+                    if duplicate_stderr:
+                        print("    - arpingæ¨™æº–ã‚¨ãƒ©ãƒ¼:")
+                        for line in duplicate_stderr.splitlines():
+                            print(f"        {line}")
+                    guest_command_executor(f"nmcli connection delete '{con_name}'", check_exit_code=False)
+                    guest_command_executor(f"ip addr del {new_ip}/{prefix} dev {device_name}", check_exit_code=False)
+                    decision = input("\nã“ã® NIC ã®è¨­å®šã‚’ã‚¹ã‚­ãƒƒãƒ—ã—ã¦ç¶šè¡Œã—ã¾ã™ã‹ï¼Ÿ (c=ç¶šè¡Œ / a=ä¸­æ–­): ").strip().lower()
+                    if decision == 'c':
+                        print("   -> ãƒ¦ãƒ¼ã‚¶ãƒ¼æŒ‡ç¤ºã«ã‚ˆã‚Šå½“è©² NIC ã®è¨­å®šã‚’ã‚¹ã‚­ãƒƒãƒ—ã—ã¾ã—ãŸã€‚")
+                        continue
+                    raise InterruptedError(f"IPã‚¢ãƒ‰ãƒ¬ã‚¹ {new_ip} ã®é‡è¤‡ãŒæ¤œå‡ºã•ã‚ŒãŸãŸã‚å‡¦ç†ã‚’ä¸­æ–­ã—ã¾ã—ãŸã€‚")
             
             if i == 0 and original_dns_servers: # Typically DNS is set on the primary NIC
                 new_dns_servers = [calculate_ip_stg_to_prd(dns) for dns in original_dns_servers if dns]
                 if new_dns_servers:
                     dns_str = ' '.join(new_dns_servers)
-                    execute_command_in_guest(guest_op_manager, migrated_vm, root_auth, admin_auth, GUEST_ADMIN_PWD, f"nmcli connection modify '{con_name}' ipv4.dns '{dns_str}'")
+                    guest_command_executor(f"nmcli connection modify '{con_name}' ipv4.dns '{dns_str}'")
 
             # 4. Bring up the new connection
-            execute_command_in_guest(guest_op_manager, migrated_vm, root_auth, admin_auth, GUEST_ADMIN_PWD, f"nmcli connection up '{con_name}'")
+            guest_command_executor(f"nmcli connection up '{con_name}'")
+            
+            # 4.5. Broadcast gratuitous ARP to refresh neighbor caches
+            if new_ip:
+                arping_commands = [
+                    f"arping -c 3 -A -I {device_name} {new_ip}",
+                    f"arping -c 3 -U -I {device_name} {new_ip}",
+                ]
+                for arping_cmd in arping_commands:
+                    guest_command_executor(arping_cmd, check_exit_code=False)
             
             # 5. Final verification
             time.sleep(5)
-            execute_command_in_guest(guest_op_manager, migrated_vm, root_auth, admin_auth, GUEST_ADMIN_PWD, f"ip addr show {device_name} | grep -q '{new_ip}'")
+            guest_command_executor(f"ip addr show {device_name} | grep -q '{new_ip}'")
+            ping_targets = []
+            candidate_gateways = []
+            if new_default_gateway:
+                candidate_gateways.append(new_default_gateway)
+            if new_ip and prefix:
+                try:
+                    iface = ipaddress.IPv4Interface(f"{new_ip}/{prefix}")
+                    first_host = next(iface.network.hosts(), None)
+                    if first_host:
+                        candidate_gateways.append(str(first_host))
+                except ValueError:
+                    LOGGER.debug("Failed to derive fallback gateway from %s/%s", new_ip, prefix, exc_info=True)
+            for candidate in candidate_gateways:
+                if candidate and candidate != new_ip and candidate not in ping_targets:
+                    ping_targets.append(candidate)
+            LOGGER.debug("Connectivity targets for %s (%s): %s", device_name, new_ip, ping_targets or "[none]")
+            try:
+                ensure_connection_activation(
+                    guest_command_executor,
+                    con_name,
+                    device_name,
+                    ping_targets=ping_targets,
+                )
+            except RuntimeError as activation_error:
+                print(f"\n[WARN] æ¥ç¶š '{con_name}' ã®ç–é€šç¢ºèªã«å¤±æ•—ã—ã¾ã—ãŸ: {activation_error}")
+                decision = input("ç–é€šå¤±æ•—ã®ã¾ã¾ç¶šè¡Œã—ã¾ã™ã‹ï¼Ÿ (c=ç¶šè¡Œ / a=ä¸­æ–­): ").strip().lower()
+                if decision == 'c':
+                    print("   -> ãƒ¦ãƒ¼ã‚¶ãƒ¼æŒ‡ç¤ºã«ã‚ˆã‚Šç–é€šæ¤œè¨¼å¤±æ•—ã‚’ç„¡è¦–ã—ã¦ç¶šè¡Œã—ã¾ã™ã€‚")
+                else:
+                    raise
         
-        print("   ? ‘S‚Ä‚ÌNIC‚ÌIPİ’è‚ªŠ®—¹‚µ‚Ü‚µ‚½B")
+        print("   âœ“ å…¨ã¦ã® NIC ã® IP è¨­å®šãŒå®Œäº†ã—ã¾ã—ãŸã€‚")
 
-    print(f"\n--- [Phase 7/7] Destination vCenter: Final Storage vMotion ---")
-    print(f"ÅI“I‚Èƒf[ƒ^ƒXƒgƒA '{TARGET_DATASTORE_NAME_FINAL}' ‚ğŒŸõ’†...")
+    print("\n--- [Phase 7/7] Destination vCenter: Final Storage vMotion ---")
+    print(f"æœ€çµ‚ãƒ‡ãƒ¼ã‚¿ã‚¹ãƒˆã‚¢ '{TARGET_DATASTORE_NAME_FINAL}' ã‚’æ¤œç´¢ä¸­...")
     final_datastore = next((ds for ds in content_dest.viewManager.CreateContainerView(content_dest.rootFolder, [vim.Datastore], True).view if ds.name == TARGET_DATASTORE_NAME_FINAL), None)
-    if not final_datastore: raise FileNotFoundError(f"ÅIƒf[ƒ^ƒXƒgƒA '{TARGET_DATASTORE_NAME_FINAL}' ‚ªŒ©‚Â‚©‚è‚Ü‚¹‚ñ‚Å‚µ‚½B")
-    print(f"? ÅIƒf[ƒ^ƒXƒgƒA '{final_datastore.name}' ‚ªŒ©‚Â‚©‚è‚Ü‚µ‚½B")
+    if not final_datastore:
+        raise FileNotFoundError(f"æœ€çµ‚ãƒ‡ãƒ¼ã‚¿ã‚¹ãƒˆã‚¢ '{TARGET_DATASTORE_NAME_FINAL}' ãŒè¦‹ã¤ã‹ã‚Šã¾ã›ã‚“ã§ã—ãŸã€‚")
+    print(f"âœ“ æœ€çµ‚ãƒ‡ãƒ¼ã‚¿ã‚¹ãƒˆã‚¢ '{final_datastore.name}' ã‚’ç¢ºèªã—ã¾ã—ãŸã€‚")
 
-    print("\n" + "="*25 + " ‘€ ì Šm ”F (4/4) " + "="*25)
-    print("VM‚ÌƒXƒgƒŒ[ƒW‚ğÅI“I‚ÈPRDƒf[ƒ^ƒXƒgƒA‚ÉˆÚ“®‚µ‚Ü‚·B")
-    print(f"  - ‘ÎÛVM: {migrated_vm.name}")
-    print(f"  - Œ»İ‚Ìƒf[ƒ^ƒXƒgƒA: {', '.join([ds.name for ds in migrated_vm.datastore])}")
-    print(f"  - šˆÚsæƒf[ƒ^ƒXƒgƒA: {TARGET_DATASTORE_NAME_FINAL} š")
+    print("\n" + "=" * 25 + " å®Ÿè¡Œå‰ç¢ºèª (4/4) " + "=" * 25)
+    print("VM ã®ã‚¹ãƒˆãƒ¬ãƒ¼ã‚¸ã‚’æœ€çµ‚çš„ãª PRD ãƒ‡ãƒ¼ã‚¿ã‚¹ãƒˆã‚¢ã«ç§»å‹•ã—ã¾ã™ã€‚")
+    print(f"  - å¯¾è±¡VM: {clone_name}")
+    try:
+        current_datastores = ', '.join([ds.name for ds in migrated_vm.datastore])
+    except vmodl.fault.ManagedObjectNotFound:
+        migrated_vm = wait_for_vm_availability(content_dest, clone_name, retries=30, delay_seconds=2)
+        migrated_vm_for_rollback = migrated_vm
+        migrated_vm_name_for_rollback = clone_name
+        current_datastores = ', '.join([ds.name for ds in migrated_vm.datastore])
+    print(f"  - ç¾åœ¨ã®ãƒ‡ãƒ¼ã‚¿ã‚¹ãƒˆã‚¢: {current_datastores}")
+    print(f"  - ç§»è¡Œå…ˆãƒ‡ãƒ¼ã‚¿ã‚¹ãƒˆã‚¢: {TARGET_DATASTORE_NAME_FINAL}")
     print("=" * 64)
     
-    user_approval_svmotion = input("\n‚±‚ÌƒXƒgƒŒ[ƒWvMotion‘€ì‚ğÀs‚µ‚Ä‚à‚æ‚ë‚µ‚¢‚Å‚·‚©H (y/n): ")
-    if user_approval_svmotion.lower() != 'y': raise InterruptedError("ƒ†[ƒU[‚É‚æ‚Á‚ÄƒXƒgƒŒ[ƒWvMotion‚ªƒLƒƒƒ“ƒZƒ‹‚³‚ê‚Ü‚µ‚½B")
+    user_approval_svmotion = input("\nã“ã®ã‚¹ãƒˆãƒ¬ãƒ¼ã‚¸ vMotion ã‚’å®Ÿè¡Œã—ã¦ã‚‚ã‚ˆã‚ã—ã„ã§ã™ã‹ï¼Ÿ (y/n): ")
+    if user_approval_svmotion.lower() != 'y':
+        raise InterruptedError("ãƒ¦ãƒ¼ã‚¶ãƒ¼ã«ã‚ˆã£ã¦ã‚¹ãƒˆãƒ¬ãƒ¼ã‚¸ vMotion ãŒã‚­ãƒ£ãƒ³ã‚»ãƒ«ã•ã‚Œã¾ã—ãŸã€‚")
 
-    print("\n³”F‚³‚ê‚Ü‚µ‚½BƒXƒgƒŒ[ƒWvMotionƒ^ƒXƒN‚ğŠJn‚µ‚Ü‚·...")
+    print("\næ‰¿èªã•ã‚Œã¾ã—ãŸã€‚ã‚¹ãƒˆãƒ¬ãƒ¼ã‚¸ vMotion ã‚¿ã‚¹ã‚¯ã‚’é–‹å§‹ã—ã¾ã™...")
     relocate_spec_final = vim.vm.RelocateSpec(datastore=final_datastore)
-    task = migrated_vm.RelocateVM_Task(spec=relocate_spec_final)
+    try:
+        task = migrated_vm.RelocateVM_Task(spec=relocate_spec_final)
+    except vmodl.fault.ManagedObjectNotFound:
+        migrated_vm = wait_for_vm_availability(content_dest, clone_name, retries=30, delay_seconds=2)
+        migrated_vm_for_rollback = migrated_vm
+        migrated_vm_name_for_rollback = clone_name
+        task = migrated_vm.RelocateVM_Task(spec=relocate_spec_final)
     
     while task.info.state not in [vim.TaskInfo.State.success, vim.TaskInfo.State.error]:
         progress = task.info.progress or 0
-        print(f"   ƒXƒgƒŒ[ƒWvMotion‚Ìi’»: {progress}%", end='\r')
+        print(f"   ã‚¹ãƒˆãƒ¬ãƒ¼ã‚¸ vMotion ã®é€²æ—: {progress}%", end='\r')
         time.sleep(5)
     print(" " * 40, end='\r')
     
     if task.info.state != vim.TaskInfo.State.success:
-        raise RuntimeError(f"ÅI“I‚ÈƒXƒgƒŒ[ƒWvMotion‚É¸”s‚µ‚Ü‚µ‚½: {task.info.error.msg}")
+        raise RuntimeError(f"æœ€çµ‚çš„ãªã‚¹ãƒˆãƒ¬ãƒ¼ã‚¸vMotionã«å¤±æ•—ã—ã¾ã—ãŸ: {task.info.error.msg}")
     
-    print(f"\n? ƒXƒgƒŒ[ƒWvMotion‚ª³í‚ÉŠ®—¹‚µ‚Ü‚µ‚½B")
-    print(f"\n? ‘S‚Ä‚ÌˆÚsƒvƒƒZƒX‚ª³í‚ÉŠ®—¹‚µ‚Ü‚µ‚½B")
+    print("\nâœ“ ã‚¹ãƒˆãƒ¬ãƒ¼ã‚¸ vMotion ãŒæ­£å¸¸ã«å®Œäº†ã—ã¾ã—ãŸã€‚")
+    print("\nâœ“ ã™ã¹ã¦ã®ç§»è¡Œãƒ—ãƒ­ã‚»ã‚¹ãŒæ­£å¸¸ã«å®Œäº†ã—ã¾ã—ãŸã€‚")
     Disconnect(si_dest)
     si_dest = None
 
 
 except Exception as e:
-    print(f"\n? ˆ—’†‚ÉƒGƒ‰[‚ª”­¶‚µ‚Ü‚µ‚½: {e}")
+    print(f"\n[ERROR] å‡¦ç†ä¸­ã«ã‚¨ãƒ©ãƒ¼ãŒç™ºç”Ÿã—ã¾ã—ãŸ: {e}")
     if migrated_vm_for_rollback:
-        print("\n" + "="*20 + " ƒ[ƒ‹ƒoƒbƒNŠm”F (ˆ¶æVMíœ) " + "="*20)
-        print("ˆ—‚ª’†’f‚³‚ê‚½‚½‚ßAˆ¶ævCenter‚Éì¬“r’†‚ÌVM‚ªc‚Á‚Ä‚¢‚Ü‚·B")
-        print(f"  - ‘ÎÛVM: {migrated_vm_for_rollback.name}")
+        print("\n" + "=" * 20 + " ãƒ­ãƒ¼ãƒ«ãƒãƒƒã‚¯ç¢ºèª (å®›å…ˆ VM å‰Šé™¤) " + "=" * 20)
+        print("å‡¦ç†ãŒä¸­æ–­ã•ã‚ŒãŸãŸã‚ã€å®›å…ˆ vCenter ã«ä½œæ¥­é€”ä¸­ã® VM ãŒæ®‹ã£ã¦ã„ã¾ã™ã€‚")
+        vm_name_display = migrated_vm_name_for_rollback or clone_name or "(ä¸æ˜)"
+        print(f"  - å¯¾è±¡VM: {vm_name_display}")
         
-        rollback_approval = input("\n‚±‚ÌVM‚ğíœ‚µ‚ÄA‘€ì‚ğŒ³‚É–ß‚µ‚Ü‚·‚©H (y/n): ")
+        rollback_approval = input("\nã“ã® VM ã‚’å‰Šé™¤ã—ã¦æ“ä½œå‰ã®çŠ¶æ…‹ã«æˆ»ã—ã¾ã™ã‹ï¼Ÿ (y/n): ")
         if rollback_approval.lower() == 'y':
             try:
-                if si_dest is None or not si_dest.CurrentTime(): # Ú‘±‚ªØ‚ê‚Ä‚¢‚éê‡‚ÍÄÚ‘±
-                    print("   ƒNƒŠ[ƒ“ƒAƒbƒv‚Ì‚½‚ßˆ¶ævCenter‚ÉÄÚ‘±‚µ‚Ü‚·...")
+                if si_dest is None or not si_dest.CurrentTime(): # æ¥ç¶šãŒåˆ‡ã‚Œã¦ã„ã‚‹å ´åˆã¯å†æ¥ç¶š
+                    print("   ã‚¯ãƒªãƒ¼ãƒ³ã‚¢ãƒƒãƒ—ã®ãŸã‚å®›å…ˆ vCenter ã«å†æ¥ç¶šã—ã¾ã™...")
                     si_dest = SmartConnect(host=VCSA_HOST_DEST, user=VCSA_USER, pwd=VCSA_PWD_DEST, port=VCSA_PORT, sslContext=ctx)
                     if not si_dest:
-                        raise ConnectionError("ˆ¶ævCenter‚Ö‚ÌÄÚ‘±‚É¸”s‚µ‚Ü‚µ‚½B") from None
-                    print("   ? ÄÚ‘±¬Œ÷B")
+                        raise ConnectionError("å®›å…ˆ vCenter ã¸ã®å†æ¥ç¶šã«å¤±æ•—ã—ã¾ã—ãŸã€‚") from None
+                    print("   âœ“ å†æ¥ç¶šã«æˆåŠŸã—ã¾ã—ãŸã€‚")
 
                 content_dest_cleanup = si_dest.RetrieveContent()
-                vm_to_delete = next((vm for vm in content_dest_cleanup.viewManager.CreateContainerView(content_dest_cleanup.rootFolder, [vim.VirtualMachine], True).view if vm.name == clone_name), None)
+                vm_to_delete = find_vm_by_name(content_dest_cleanup, clone_name)
                 if not vm_to_delete:
-                    print("   ?? ƒ[ƒ‹ƒoƒbƒN‘ÎÛ‚ÌVM‚ªŒ©‚Â‚©‚è‚Ü‚¹‚ñ‚Å‚µ‚½B‚¨‚»‚ç‚­Šù‚Éíœ‚³‚ê‚Ä‚¢‚Ü‚·B")
+                    print("   âš  ãƒ­ãƒ¼ãƒ«ãƒãƒƒã‚¯å¯¾è±¡ã® VM ãŒè¦‹ã¤ã‹ã‚Šã¾ã›ã‚“ã€‚æ—¢ã«å‰Šé™¤æ¸ˆã¿ã®å¯èƒ½æ€§ãŒã‚ã‚Šã¾ã™ã€‚")
                     unregistered_from_source = True 
                 else:
                     if vm_to_delete.runtime.powerState == 'poweredOn':
-                        print(f"   VM '{vm_to_delete.name}' ‚ğƒpƒ[ƒIƒt‚µ‚Ä‚¢‚Ü‚·...")
+                        print(f"   VM '{vm_to_delete.name}' ã‚’ãƒ‘ãƒ¯ãƒ¼ã‚ªãƒ•ã—ã¾ã™...")
                         task = vm_to_delete.PowerOffVM_Task()
-                        while task.info.state not in [vim.TaskInfo.State.success, vim.TaskInfo.State.error]: time.sleep(2)
+                        while task.info.state not in [vim.TaskInfo.State.success, vim.TaskInfo.State.error]:
+                            time.sleep(2)
                         if task.info.state == vim.TaskInfo.State.success:
-                            print("   ? ƒpƒ[ƒIƒt¬Œ÷B")
+                            print("   âœ“ ãƒ‘ãƒ¯ãƒ¼ã‚ªãƒ•å®Œäº†ã€‚")
                         else:
-                            print(f"   ?? ƒpƒ[ƒIƒt‚É¸”s‚µ‚Ü‚µ‚½: {task.info.error.msg}Bíœ‚ğ‚İ‚Ü‚·B")
+                            print(f"   âš  ãƒ‘ãƒ¯ãƒ¼ã‚ªãƒ•ã«å¤±æ•—ã—ã¾ã—ãŸ: {task.info.error.msg}ã€‚å‰Šé™¤ã‚’ç¶™ç¶šã—ã¾ã™ã€‚")
 
-                    print(f"   VM '{vm_to_delete.name}' ‚ğíœ‚µ‚Ä‚¢‚Ü‚·...")
+                    print(f"   VM '{vm_to_delete.name}' ã‚’å‰Šé™¤ã—ã¾ã™...")
                     destroy_task = vm_to_delete.Destroy_Task()
-                    while destroy_task.info.state not in [vim.TaskInfo.State.success, vim.TaskInfo.State.error]: time.sleep(2)
+                    while destroy_task.info.state not in [vim.TaskInfo.State.success, vim.TaskInfo.State.error]:
+                        time.sleep(2)
                     
                     if destroy_task.info.state == vim.TaskInfo.State.success:
-                        print("? ƒ[ƒ‹ƒoƒbƒNŠ®—¹: ˆ¶æVM‚Í³í‚Éíœ‚³‚ê‚Ü‚µ‚½B")
+                        print("âœ“ ãƒ­ãƒ¼ãƒ«ãƒãƒƒã‚¯å®Œäº†: å®›å…ˆ VM ã‚’å‰Šé™¤ã—ã¾ã—ãŸã€‚")
                         unregistered_from_source = False
                     else:
                         unregistered_from_source = True
-                        raise RuntimeError(f"VM‚Ìíœ‚É¸”s‚µ‚Ü‚µ‚½: {destroy_task.info.error.msg}") from None
+                        raise RuntimeError(f"VMã®å‰Šé™¤ã«å¤±æ•—ã—ã¾ã—ãŸ: {destroy_task.info.error.msg}") from None
 
             except Exception as cleanup_error:
-                print(f"? ˆ¶æVM‚Ìƒ[ƒ‹ƒoƒbƒNˆ—’†‚ÉƒGƒ‰[‚ª”­¶‚µ‚Ü‚µ‚½: {cleanup_error}")
+                print(f"âš  å®›å…ˆ VM ã®ãƒ­ãƒ¼ãƒ«ãƒãƒƒã‚¯ä¸­ã«ã‚¨ãƒ©ãƒ¼ãŒç™ºç”Ÿã—ã¾ã—ãŸ: {cleanup_error}")
                 unregistered_from_source = True 
 
     if unregistered_from_source:
-        print("\n" + "="*20 + " ƒ[ƒ‹ƒoƒbƒNŠm”F (ƒtƒ@ƒCƒ‹íœ) " + "="*20)
-        print("   ƒ\[ƒXvCenter‚Å‚ÌƒNƒ[ƒ“ƒtƒ@ƒCƒ‹‚ÌƒNƒŠ[ƒ“ƒAƒbƒv‚ª•K—v‚Å‚·B")
-        print(f"   ‘ÎÛVM‚Ìƒtƒ@ƒCƒ‹‚ªƒf[ƒ^ƒXƒgƒA '{TARGET_DATASTORE_NAME}' ‚Éc‚Á‚Ä‚¢‚é‰Â”\«‚ª‚ ‚è‚Ü‚·B")
+        print("\n" + "=" * 20 + " ãƒ­ãƒ¼ãƒ«ãƒãƒƒã‚¯ç¢ºèª (ãƒ•ã‚¡ã‚¤ãƒ«å‰Šé™¤) " + "=" * 20)
+        print("   ã‚½ãƒ¼ã‚¹ vCenter å´ã®ã‚¯ãƒ­ãƒ¼ãƒ³ãƒ•ã‚¡ã‚¤ãƒ«ã‚’ã‚¯ãƒªãƒ¼ãƒ³ã‚¢ãƒƒãƒ—ã™ã‚‹å¿…è¦ãŒã‚ã‚Šã¾ã™ã€‚")
+        print(f"   å¯¾è±¡ VM ã®ãƒ•ã‚¡ã‚¤ãƒ«ãŒãƒ‡ãƒ¼ã‚¿ã‚¹ãƒˆã‚¢ '{TARGET_DATASTORE_NAME}' ã«æ®‹ã£ã¦ã„ã‚‹å¯èƒ½æ€§ãŒã‚ã‚Šã¾ã™ã€‚")
         
-        rollback_approval_files = input("\nƒ\[ƒXvCenter‚ÉÚ‘±‚µ‚ÄA‚±‚ê‚ç‚Ìƒtƒ@ƒCƒ‹‚ğíœ‚µ‚Ü‚·‚©H (y/n): ")
+        rollback_approval_files = input("\nã‚½ãƒ¼ã‚¹ vCenter ã«æ¥ç¶šã—ã¦ã“ã‚Œã‚‰ã®ãƒ•ã‚¡ã‚¤ãƒ«ã‚’å‰Šé™¤ã—ã¾ã™ã‹ï¼Ÿ (y/n): ")
         if rollback_approval_files.lower() == 'y':
             si_source_cleanup = None
             try:
-                print("\n³”F‚³‚ê‚Ü‚µ‚½BƒNƒŠ[ƒ“ƒAƒbƒv‚Ì‚½‚ßƒ\[ƒXvCenter‚ÉÄÚ‘±‚µ‚Ü‚·...")
+                print("\næ‰¿èªã•ã‚Œã¾ã—ãŸã€‚ã‚¯ãƒªãƒ¼ãƒ³ã‚¢ãƒƒãƒ—ã®ãŸã‚ã‚½ãƒ¼ã‚¹ vCenter ã«å†æ¥ç¶šã—ã¾ã™...")
                 si_source_cleanup = SmartConnect(
                     host=VCSA_HOST_SOURCE, user=VCSA_USER, pwd=VCSA_PWD_SOURCE, port=VCSA_PORT, sslContext=ctx)
                 if not si_source_cleanup:
-                    raise ConnectionError("ƒ\[ƒXvCenter‚Ö‚ÌÄÚ‘±‚É¸”s‚µ‚Ü‚µ‚½B") from None
-                print("   ? ÄÚ‘±¬Œ÷")
+                    raise ConnectionError("ã‚½ãƒ¼ã‚¹ vCenter ã¸ã®å†æ¥ç¶šã«å¤±æ•—ã—ã¾ã—ãŸã€‚") from None
+                print("   âœ“ å†æ¥ç¶šã«æˆåŠŸã—ã¾ã—ãŸã€‚")
                 
                 content_cleanup = si_source_cleanup.RetrieveContent()
                 file_manager = content_cleanup.fileManager
-                
+
                 vm_dir_path = os.path.dirname(vmx_path)
-                
-                print(f"   ƒf[ƒ^ƒXƒgƒA‚©‚çƒfƒBƒŒƒNƒgƒŠ '{vm_dir_path}' ‚ğíœ‚µ‚Ü‚·...")
+
+                print(f"   ãƒ‡ãƒ¼ã‚¿ã‚¹ãƒˆã‚¢ã‹ã‚‰ãƒ‡ã‚£ãƒ¬ã‚¯ãƒˆãƒª '{vm_dir_path}' ã‚’å‰Šé™¤ã—ã¾ã™...")
                 datacenter = content_cleanup.rootFolder.childEntity[0]
                 delete_task = file_manager.DeleteDatastoreFile_Task(name=vm_dir_path, datacenter=datacenter)
-                
+
                 while delete_task.info.state not in [vim.TaskInfo.State.success, vim.TaskInfo.State.error]:
                     time.sleep(2)
-                
+
                 if delete_task.info.state == vim.TaskInfo.State.success:
-                    print("? ƒ[ƒ‹ƒoƒbƒNŠ®—¹: ƒf[ƒ^ƒXƒgƒAã‚Ìƒtƒ@ƒCƒ‹‚Í³í‚Éíœ‚³‚ê‚Ü‚µ‚½B")
+                    print("âœ“ ãƒ­ãƒ¼ãƒ«ãƒãƒƒã‚¯å®Œäº†: ãƒ‡ãƒ¼ã‚¿ã‚¹ãƒˆã‚¢ä¸Šã®ãƒ•ã‚¡ã‚¤ãƒ«ã‚’å‰Šé™¤ã—ã¾ã—ãŸã€‚")
                 else:
-                    raise RuntimeError(f"ƒf[ƒ^ƒXƒgƒA‚Ìƒtƒ@ƒCƒ‹íœ‚É¸”s‚µ‚Ü‚µ‚½: {delete_task.info.error.msg}") from None
+                    raise RuntimeError(f"ãƒ‡ãƒ¼ã‚¿ã‚¹ãƒˆã‚¢ã®ãƒ•ã‚¡ã‚¤ãƒ«å‰Šé™¤ã«å¤±æ•—ã—ã¾ã—ãŸ: {delete_task.info.error.msg}") from None
 
             except Exception as cleanup_error:
-                print(f"? ƒ[ƒ‹ƒoƒbƒNˆ—’†‚ÉƒGƒ‰[‚ª”­¶‚µ‚Ü‚µ‚½: {cleanup_error}")
-                print("   ‚¨è”‚Å‚·‚ªAƒf[ƒ^ƒXƒgƒAƒuƒ‰ƒEƒU‚©‚çè“®‚ÅƒNƒŠ[ƒ“ƒAƒbƒv‚µ‚Ä‚­‚¾‚³‚¢B")
+                print(f"âš  ãƒ­ãƒ¼ãƒ«ãƒãƒƒã‚¯å‡¦ç†ä¸­ã«ã‚¨ãƒ©ãƒ¼ãŒç™ºç”Ÿã—ã¾ã—ãŸ: {cleanup_error}")
+                print("   ãŠæ‰‹æ•°ã§ã™ãŒã€ãƒ‡ãƒ¼ã‚¿ã‚¹ãƒˆã‚¢ ãƒ–ãƒ©ã‚¦ã‚¶ã‹ã‚‰æ‰‹å‹•ã§ã‚¯ãƒªãƒ¼ãƒ³ã‚¢ãƒƒãƒ—ã—ã¦ãã ã•ã„ã€‚")
             finally:
                 if si_source_cleanup:
                     Disconnect(si_source_cleanup)
         else:
-            print("ƒ†[ƒU[‚É‚æ‚Á‚Äƒtƒ@ƒCƒ‹ƒNƒŠ[ƒ“ƒAƒbƒv‚ªƒLƒƒƒ“ƒZƒ‹‚³‚ê‚Ü‚µ‚½Bƒtƒ@ƒCƒ‹‚Íƒf[ƒ^ƒXƒgƒAã‚Éc‚Á‚Ä‚¢‚Ü‚·B")
+            print("ãƒ¦ãƒ¼ã‚¶ãƒ¼ã«ã‚ˆã£ã¦ãƒ•ã‚¡ã‚¤ãƒ«ã‚¯ãƒªãƒ¼ãƒ³ã‚¢ãƒƒãƒ—ãŒã‚­ãƒ£ãƒ³ã‚»ãƒ«ã•ã‚Œã¾ã—ãŸã€‚ãƒ•ã‚¡ã‚¤ãƒ«ã¯ãƒ‡ãƒ¼ã‚¿ã‚¹ãƒˆã‚¢ä¸Šã«æ®‹ã£ã¦ã„ã¾ã™ã€‚")
     elif new_vm_on_source:
-        print("\n" + "="*20 + " ƒ[ƒ‹ƒoƒbƒNŠm”F (ƒ\[ƒXVMíœ) " + "="*20)
-        print(f"ì¬“r’†‚¾‚Á‚½VM '{new_vm_on_source.name}' ‚ªƒ\[ƒXvCenter‚Éc‚Á‚Ä‚¢‚Ü‚·B")
-        rollback_approval = input("\n‚±‚ÌVM‚ğíœ‚µ‚Ä‘€ì‘O‚Ìó‘Ô‚É–ß‚µ‚Ü‚·‚©H (y/n): ")
+        print("\n" + "=" * 20 + " ãƒ­ãƒ¼ãƒ«ãƒãƒƒã‚¯ç¢ºèª (ã‚½ãƒ¼ã‚¹ VM å‰Šé™¤) " + "=" * 20)
+        print(f"ä½œæ¥­é€”ä¸­ã ã£ãŸ VM '{new_vm_on_source.name}' ãŒã‚½ãƒ¼ã‚¹ vCenter ã«æ®‹ã£ã¦ã„ã¾ã™ã€‚")
+        rollback_approval = input("\nã“ã® VM ã‚’å‰Šé™¤ã—ã¦æ“ä½œå‰ã®çŠ¶æ…‹ã«æˆ»ã—ã¾ã™ã‹ï¼Ÿ (y/n): ")
         if rollback_approval.lower() == 'y':
+            if new_vm_on_source.runtime.powerState == 'poweredOn':
+                print(f"   VM '{new_vm_on_source.name}' ã‚’ãƒ‘ãƒ¯ãƒ¼ã‚ªãƒ•ã—ã¾ã™...")
+                poweroff_task = new_vm_on_source.PowerOffVM_Task()
+                while poweroff_task.info.state not in [vim.TaskInfo.State.success, vim.TaskInfo.State.error]:
+                    time.sleep(2)
+                if poweroff_task.info.state == vim.TaskInfo.State.success:
+                    print("   âœ“ ãƒ‘ãƒ¯ãƒ¼ã‚ªãƒ•å®Œäº†ã€‚")
+                else:
+                    print(f"   âš  ãƒ‘ãƒ¯ãƒ¼ã‚ªãƒ•ã«å¤±æ•—ã—ã¾ã—ãŸ: {poweroff_task.info.error.msg}ã€‚å‰Šé™¤ã‚’ç¶™ç¶šã—ã¾ã™ã€‚")
             task = new_vm_on_source.Destroy_Task()
-            while task.info.state not in [vim.TaskInfo.State.success, vim.TaskInfo.State.error]: time.sleep(2)
+            while task.info.state not in [vim.TaskInfo.State.success, vim.TaskInfo.State.error]:
+                time.sleep(2)
             if task.info.state == vim.TaskInfo.State.success:
-                print("? ƒ[ƒ‹ƒoƒbƒNŠ®—¹: VM‚Í³í‚Éíœ‚³‚ê‚Ü‚µ‚½B")
+                print("âœ“ ãƒ­ãƒ¼ãƒ«ãƒãƒƒã‚¯å®Œäº†: ã‚½ãƒ¼ã‚¹ VM ã‚’å‰Šé™¤ã—ã¾ã—ãŸã€‚")
             else:
-                print(f"? ƒ[ƒ‹ƒoƒbƒN¸”s: {task.info.error.msg}")
+                print(f"âš  ãƒ­ãƒ¼ãƒ«ãƒãƒƒã‚¯å¤±æ•—: {task.info.error.msg}")
         else:
-            print("ƒ[ƒ‹ƒoƒbƒN‚ÍƒLƒƒƒ“ƒZƒ‹‚³‚ê‚Ü‚µ‚½BVM‚Íƒ\[ƒXvCenter‚Éc‚Á‚Ä‚¢‚Ü‚·B")
+            print("ãƒ­ãƒ¼ãƒ«ãƒãƒƒã‚¯ã¯ã‚­ãƒ£ãƒ³ã‚»ãƒ«ã•ã‚Œã¾ã—ãŸã€‚VM ã¯ã‚½ãƒ¼ã‚¹ vCenter ã«æ®‹ã‚Šã¾ã™ã€‚")
 
 finally:
     try:
@@ -727,4 +1412,4 @@ finally:
             Disconnect(si_source)
     except Exception:
         pass
-    print("ˆ—‚ğI—¹‚µ‚Ü‚·B")
+    print("å‡¦ç†ã‚’çµ‚äº†ã—ã¾ã™ã€‚")
