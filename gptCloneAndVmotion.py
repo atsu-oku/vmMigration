@@ -1051,8 +1051,8 @@ try:
                 agent_ready = True
                 break
         except vim.fault.InvalidGuestLogin:
-             agent_ready = True
-             break
+            agent_ready = True
+            break
         except vmodl.fault.ManagedObjectNotFound:
             migrated_vm = wait_for_vm_availability(content_dest, clone_name, retries=30, delay_seconds=2)
             migrated_vm_for_rollback = migrated_vm
