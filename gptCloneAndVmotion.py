@@ -29,6 +29,7 @@ except ImportError:
 PRD_STATIC_ROUTE_SEGMENTS = {160, 161, 162, 163, 164}
 NMCLI_FIELDS_WITH_TYPE = ['UUID', 'NAME', 'DEVICE', 'TYPE']
 NMCLI_FIELDS_NO_TYPE = ['UUID', 'NAME', 'DEVICE']
+SSH_ALLOWED_SOURCE_IP = "172.16.164.7"
 
 
 @dataclass
@@ -378,6 +379,58 @@ def ensure_connection_activation(
         f"(targets: {summary})"
     )
     raise RuntimeError(message)
+
+
+def ensure_firewall_allows_ssh(command_executor, source_ip):
+    """Ensure iptables/firewalld accepts SSH from the given source."""
+    print("   -> ファイアウォール設定を確認します...")
+    if not source_ip:
+        return
+    exit_code, firewalld_status, _ = command_executor(
+        "systemctl is-active firewalld",
+        check_exit_code=False,
+    )
+    firewalld_active = exit_code == 0 and (firewalld_status or '').strip() == 'active'
+    if firewalld_active:
+        _, default_zone, _ = command_executor(
+            "firewall-cmd --get-default-zone",
+            check_exit_code=False,
+        )
+        zone = (default_zone or 'public').splitlines()[0].strip() or 'public'
+        rich_rule = (
+            f"firewall-cmd --permanent --zone={zone} "
+            f"--add-rich-rule='rule family=\"ipv4\" source address=\"{source_ip}\" "
+            "service name=\"ssh\" accept'"
+        )
+        exit_code, _, cmd_err = command_executor(rich_rule, check_exit_code=False)
+        if exit_code == 0:
+            command_executor("firewall-cmd --reload", check_exit_code=False)
+            print(f"      - firewalld: {zone} に SSH 許可ルールを追加しました ({source_ip})")
+            return
+        LOGGER.debug("Failed to add firewalld rich rule: %s", cmd_err)
+    exit_code, _, _ = command_executor("command -v iptables", check_exit_code=False)
+    if exit_code == 0:
+        check_rule_cmd = (
+            f"iptables -C INPUT -p tcp -s {source_ip} --dport 22 -j ACCEPT"
+        )
+        exit_code, _, _ = command_executor(check_rule_cmd, check_exit_code=False)
+        if exit_code != 0:
+            add_rule_cmd = (
+                f"iptables -I INPUT 1 -p tcp -s {source_ip} --dport 22 -j ACCEPT"
+            )
+            command_executor(add_rule_cmd, check_exit_code=False)
+            print(f"      - iptables: SSH 許可ルールを追加しました ({source_ip})")
+            persist_cmds = [
+                "service iptables save",
+                "systemctl save iptables",
+                "iptables-save > /etc/sysconfig/iptables",
+            ]
+            for cmd in persist_cmds:
+                command_executor(cmd, check_exit_code=False)
+            return
+        print(f"      - iptables: 既に SSH 許可ルールが存在します ({source_ip})")
+        return
+    print("      - firewalld / iptables が有効ではないため、追加設定は行いません。")
 
 
 def determine_prd_static_routes(nic_infos, default_gateway, original_routes):
@@ -1387,6 +1440,7 @@ try:
                 else:
                     raise
         
+        ensure_firewall_allows_ssh(guest_command_executor, SSH_ALLOWED_SOURCE_IP)
         print("   ✓ 全ての NIC の IP 設定が完了しました。")
 
     print("\n--- [Phase 7/7] Destination vCenter: Final Storage vMotion ---")
