@@ -1,7 +1,6 @@
 ﻿# vSphere 自動化スクリプト集
 
-このリポジトリには、vCenter 環境上でステージング (STG) から本番 (PRD) への VM 移行を自動化する Python スクリプト gptCloneAndVmotion.py が含まれています。
-以下では、スクリプトの機能概要と使用手順を説明します。
+このリポジトリには、vCenter 環境上でステージング (STG) から本番 (PRD) への VM 移行を自動化する Python スクリプト gptCloneAndVmotion.py が含まれています。以下では、スクリプトの機能概要と使用手順を説明します。
 
 ---
 
@@ -42,9 +41,10 @@ python gptCloneAndVmotion.py
 
 ---
 
-## 今後の拡張予定
+## 今後の拡張
 - ログファイル出力や通知機能の追加
 - 複数 VM のバッチ処理対応
 - 追加の正常性チェック（アプリケーションレベル疎通など）の実装
 
-ご不明な点や改善案があれば、Issue や Pull Request でお知らせください。
+ご不明点や改善案があれば、Issue や Pull Request にてお知らせください。
+
