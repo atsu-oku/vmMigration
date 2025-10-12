@@ -30,6 +30,21 @@
 
 > **補足:** Linux / macOS 環境で作業する場合も、社内が配布しているパッケージまたは承認済みリポジトリを利用してください。`pyenv` や `brew` を使う場合は、情報システム部の指示に従ってください。
 
+### リポジトリの取得 (git clone)
+1. 作業場所とするフォルダを決め（例: `G:\マイドライブ\development\py`）、PowerShell で移動します。
+   ```powershell
+   cd G:\マイドライブ\development\py
+   ```
+2. GitHub への認証情報（PAT など）を準備した上で、リポジトリをクローンします。
+   ```powershell
+   git clone https://github.com/atsu-oku/vmMigration.git
+   ```
+   社内プロキシ越しにアクセスする場合は、必要に応じて `git config --global http.proxy http://proxy.example.com:8080` などを設定してください。
+3. クローン後、作業フォルダに移動します。
+   ```powershell
+   cd vmMigration
+   ```
+
 ---
 
 ## 2. 仮想環境の作成 (推奨)
