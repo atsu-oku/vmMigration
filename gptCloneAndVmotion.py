@@ -380,7 +380,16 @@ def execute_command_in_guest(guest_op_manager, vm, root_auth, admin_auth, admin_
     stderr_path = f"/tmp/stderr_{os.urandom(4).hex()}.log"
 
     def _run_it(auth, cmd):
-        redirected_cmd = f"{cmd} > {stdout_path} 2> {stderr_path}"
+        locale_wrapped_cmd = (
+            "{ orig_lang=${LANG:-}; orig_lc_all=${LC_ALL:-}; "
+            "export LC_ALL=C; "
+            f"{cmd}; "
+            "cmd_status=$?; "
+            "if [ -n \"$orig_lc_all\" ]; then export LC_ALL=\"$orig_lc_all\"; else unset LC_ALL; fi; "
+            "if [ -n \"$orig_lang\" ]; then export LANG=\"$orig_lang\"; else unset LANG; fi; "
+            "exit $cmd_status; }"
+        )
+        redirected_cmd = f"{locale_wrapped_cmd} > {stdout_path} 2> {stderr_path}"
         spec = vim.vm.guest.ProcessManager.ProgramSpec(
             programPath="/bin/bash",
             arguments=f"-lc {shlex.quote(redirected_cmd)}",
