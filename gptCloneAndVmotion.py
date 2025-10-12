@@ -434,7 +434,6 @@ def execute_command_in_guest(guest_op_manager, vm, root_auth, admin_auth, admin_
     def _run_as_admin():
         nonlocal exit_code, stdout, stderr, auth_used
         temp_password = None
-        temp_script = None
         ctx_inner = ssl._create_unverified_context()
         try:
             temp_password = file_manager.CreateTemporaryFileInGuest(
@@ -463,33 +462,9 @@ def execute_command_in_guest(guest_op_manager, vm, root_auth, admin_auth, admin_
             with urllib.request.urlopen(password_request, context=ctx_inner):
                 pass
 
-            temp_script = file_manager.CreateTemporaryFileInGuest(
-                vm=vm,
-                auth=admin_auth,
-                prefix="sudo_cmd_",
-                suffix=".sh",
-                directoryPath="/tmp",
-            )
-            script_body = f"#!/bin/bash\n{command}\n".encode("utf-8")
-            upload_url = file_manager.InitiateFileTransferToGuest(
-                vm=vm,
-                auth=admin_auth,
-                guestFilePath=temp_script,
-                fileAttributes=file_attr,
-                fileSize=len(script_body),
-                overwrite=True,
-            )
-            script_request = urllib.request.Request(
-                upload_url,
-                data=script_body,
-                method="PUT",
-                headers={"Content-Type": "application/octet-stream"},
-            )
-            with urllib.request.urlopen(script_request, context=ctx_inner):
-                pass
-
             def _sudo_command(use_script_wrapper=False):
-                base_cmd = f"sudo -S -p '' /bin/bash {shlex.quote(temp_script)}"
+                quoted_command = shlex.quote(command)
+                base_cmd = f"sudo -S -p '' /bin/bash -lc {quoted_command}"
                 if use_script_wrapper:
                     return (
                         f"cat {shlex.quote(temp_password)} | "
@@ -506,7 +481,7 @@ def execute_command_in_guest(guest_op_manager, vm, root_auth, admin_auth, admin_
                 print("[GUEST-CMD] sudo が TTY を要求したため script 経由で再実行します。")
                 result = _run_it(admin_auth, _sudo_command(use_script_wrapper=True))
         finally:
-            for cleanup_path in (temp_script, temp_password):
+            for cleanup_path in (temp_password,):
                 if cleanup_path:
                     try:
                         file_manager.DeleteFileInGuest(vm=vm, auth=admin_auth, filePath=cleanup_path)
