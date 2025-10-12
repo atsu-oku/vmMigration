@@ -380,9 +380,11 @@ def execute_command_in_guest(guest_op_manager, vm, root_auth, admin_auth, admin_
     stderr_path = f"/tmp/stderr_{os.urandom(4).hex()}.log"
 
     def _run_it(auth, cmd):
-        escaped_cmd = cmd.replace("'", "'\''")
-        wrapped_cmd = f"'{escaped_cmd}' > {stdout_path} 2> {stderr_path}"
-        spec = vim.vm.guest.ProcessManager.ProgramSpec(programPath="/bin/bash", arguments=f"-c {wrapped_cmd}")
+        redirected_cmd = f"{cmd} > {stdout_path} 2> {stderr_path}"
+        spec = vim.vm.guest.ProcessManager.ProgramSpec(
+            programPath="/bin/bash",
+            arguments=f"-lc {shlex.quote(redirected_cmd)}",
+        )
         pid = process_manager.StartProgramInGuest(vm=vm, auth=auth, spec=spec)
 
         exit_code = -1
