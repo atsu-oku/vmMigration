@@ -381,12 +381,16 @@ def execute_command_in_guest(guest_op_manager, vm, root_auth, admin_auth, admin_
 
     def _run_it(auth, cmd):
         locale_wrapped_cmd = (
-            "{ orig_lang=${LANG:-}; orig_lc_all=${LC_ALL:-}; "
+            "{ orig_lang=${LANG-}; orig_lc_all=${LC_ALL-}; "
+            "restore_locale() { "
+            "if [ -n \"$orig_lc_all\" ]; then export LC_ALL=\"$orig_lc_all\"; else unset LC_ALL; fi; "
+            "if [ -n \"$orig_lang\" ]; then export LANG=\"$orig_lang\"; else unset LANG; fi; "
+            "}; "
+            "trap restore_locale EXIT; "
             "export LC_ALL=C; "
             f"{cmd}; "
             "cmd_status=$?; "
-            "if [ -n \"$orig_lc_all\" ]; then export LC_ALL=\"$orig_lc_all\"; else unset LC_ALL; fi; "
-            "if [ -n \"$orig_lang\" ]; then export LANG=\"$orig_lang\"; else unset LANG; fi; "
+            "trap - EXIT; restore_locale; "
             "exit $cmd_status; }"
         )
         redirected_cmd = f"{locale_wrapped_cmd} > {stdout_path} 2> {stderr_path}"
