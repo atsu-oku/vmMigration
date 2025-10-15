@@ -13,14 +13,16 @@
    - 対象 VM を指定のデータストアにクローンし、クローン側の NIC を削除します。
 3. **宛先 vCenter への登録と NIC 再設定**
    - クローンした VM を宛先 vCenter に登録し、PRD 向けのネットワークに合わせて NIC を再構成します。
-4. **IP アドレス再設定とゲートウェイ疎通確認**
-   - ゲスト OS に対して 
-mcli や ping を用い、管理用アカウント (root/admin) で IP 設定と疎通確認を実施します。
+4. **IP address configuration and verification**
+   - Configures the Guest OS IP addresses using nmcli under sudo/root contexts.
+   - Maps PRD static routes to the NIC that owns the corresponding gateway segment before applying them.
+   - Runs a post-change nmcli validation to confirm IP/gateway/DNS/routes for each connection and prompts if a mismatch is detected.
 5. **ストレージ vMotion**
    - 一時的に配置したデータストアから最終的な PRD 用データストアへ Storage vMotion を行い、移行を完了させます。
 
 ### 事前準備
-- Python 3.11 以上、および pyVmomi・equests 等の依存ライブラリをインストールしておいてください。
+- Python 3.11 以上、および pyVmomi・
+equests 等の依存ライブラリをインストールしておいてください。
 - vCenter API へアクセス可能なネットワーク環境で実行してください。
 - 対象 VM で VMware Tools が稼働し、Guest Operations が利用できる状態であることを確認します。
 - root（または sudo 権限を持つ admin）アカウントの認証情報を、実行前に準備してください。

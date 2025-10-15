@@ -1,5 +1,9 @@
 ﻿# Version History
 
+## 2025-10-16
+- Added PRD static-route ownership tracking so each route is bound to the correct NIC during migration.
+- Added nmcli post-configuration validation to confirm IP/gateway/routes/DNS after vMotion.
+
 ## 2025-10-12
 - locale の強制・復元ロジックを追加し、nmcli/ping の判定がロケールに依存しないよう改善。
 - sudo 実行まわりのフォールバック処理を再実装し、補助コマンド(script) 併用を含めた安定化を実施。
