@@ -5,13 +5,13 @@
 - Added nmcli post-configuration validation to confirm IP/gateway/routes/DNS after vMotion.
 
 ## 2025-10-12
-- locale の強制・復元ロジックを追加し、nmcli/ping の判定がロケールに依存しないよう改善。
-- sudo 実行まわりのフォールバック処理を再実装し、補助コマンド(script) 併用を含めた安定化を実施。
-- README.md / SETUP.md を日本語で詳細化し、セットアップ手順と使用方法を明文化。
+- ロケール固定と出力の一貫性を改善。nmcli/ping の挙動が想定どおりになるよう調整。
+- sudo 実行時のフォールバック処理を強化し、主要コマンドの再実行性を改善。
+- README.md / SETUP.md を再構成して、セットアップ手順と使い方を明確化。
 
 ## 2025-10-11
-- クローン～登録～IP 再設定～Storage vMotion までのフローを全面改修。
-- ゲスト OS での nmcli / ping を用いた疎通確認とロールバック処理を実装。
+- クローン → IP 設定 → Storage vMotion までのフローを整備。
+- ゲスト OS で nmcli / ping を用いた疎通確認とロールバック処理を追加。
 
 ## 2025-10-10
-- リポジトリ初期化。ソース vCenter から宛先 vCenter への手動移行スクリプトを取り込み。
+- プロジェクト初期化。ソース vCenter と宛先 vCenter を跨ぐ移行スクリプトの土台を作成。
