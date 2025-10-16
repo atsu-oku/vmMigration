@@ -4,6 +4,11 @@
 
 ---
 
+## 0. リポジトリ取得 (git clone)
+- HTTPS: `git clone https://github.com/atsu-oku/vmMigration.git`
+- SSH: `git clone git@github.com:atsu-oku/vmMigration.git`
+- ディレクトリへ移動: `cd vmMigration`
+
 **特長**
 - クローン作成 → 宛先 vCenter 登録 → NIC 再構成 → IP/GW/DNS/ルート適用 → Storage vMotion までの流れを自動化
 - 設定後は `nmcli` で検証し、齟齬があれば警告
@@ -86,4 +91,3 @@
 - 依存は `requirements.txt` に記載（`pip install -r requirements.txt`）
 - 詳細なセットアップは `SETUP.md` を参照
 - Issue/PR による改善提案を歓迎します
-
