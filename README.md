@@ -1,52 +1,48 @@
-﻿# vSphere 自動化スクリプト集
+# vSphere Automation Scripts
 
-このリポジトリには、vCenter 環境上でステージング (STG) から本番 (PRD) への VM 移行を自動化する Python スクリプト gptCloneAndVmotion.py が含まれています。以下では、スクリプトの機能概要と使用手順を説明します。
-
----
-
-## gptCloneAndVmotion.py
-
-### 概要
-1. **ソース vCenter からの情報収集**
-   - 対象 VM の NIC 情報、デフォルトゲートウェイ、DNS サーバーなどを取得します。
-2. **クローン作成とソース側での NIC 無効化**
-   - 対象 VM を指定のデータストアにクローンし、クローン側の NIC を削除します。
-3. **宛先 vCenter への登録と NIC 再設定**
-   - クローンした VM を宛先 vCenter に登録し、PRD 向けのネットワークに合わせて NIC を再構成します。
-4. **IP address configuration and verification**
-   - Configures the Guest OS IP addresses using nmcli under sudo/root contexts.
-   - Maps PRD static routes to the NIC that owns the corresponding gateway segment before applying them.
-   - Runs a post-change nmcli validation to confirm IP/gateway/DNS/routes for each connection and prompts if a mismatch is detected.
-5. **ストレージ vMotion**
-   - 一時的に配置したデータストアから最終的な PRD 用データストアへ Storage vMotion を行い、移行を完了させます。
-
-### 事前準備
-- Python 3.11 以上、および pyVmomi・
-equests 等の依存ライブラリをインストールしておいてください。
-- vCenter API へアクセス可能なネットワーク環境で実行してください。
-- 対象 VM で VMware Tools が稼働し、Guest Operations が利用できる状態であることを確認します。
-- root（または sudo 権限を持つ admin）アカウントの認証情報を、実行前に準備してください。
-
-### 使用方法
-`
-python gptCloneAndVmotion.py
-`
-1. ソース／宛先 vCenter のアカウント情報を順に入力します。
-2. 移行対象 VM 名、ゲスト OS の認証情報 (root / admin) を入力します。
-3. 各フェーズで確認メッセージが表示されるので、内容を確認して y を入力すると処理が進みます。
-4. エラー発生時は、ロールバック処理（クローン VM の削除、データストア上の不要ファイル削除）を案内します。
-
-### ログとトラブルシュート
-- 実行ログは標準出力に詳細が出力されます。VSPHERE_CLONE_LOG_LEVEL=DEBUG を設定すると、ゲスト OS 上で実行したコマンドの stdout/stderr など、より詳細な情報が確認できます。
-- 疎通確認で失敗する場合、ネットワークポリシーやファイアウォールにより ping が遮断されていないか確認してください。
-- ゲスト OS の認証に失敗する場合は、VMware Tools 側で該当アカウントの Guest Operations へのアクセスが許可されているかご確認ください。
+- `gptCloneAndVmotion.py`: vSphere VM clone and Storage vMotion を自動化するスクリプト
 
 ---
 
-## 今後の拡張
-- ログファイル出力や通知機能の追加
-- 複数 VM のバッチ処理対応
-- 追加の正常性チェック（アプリケーションレベル疎通など）の実装
+**概要**
+- STG 環境の VM をクローンし、宛先 vCenter/ネットワークへ登録・再構成後、PRD 用データストアへ Storage vMotion で移行します。
+- ゲスト OS の IP/GW/DNS/ルート設定は `nmcli` を用いて自動適用し、検証まで行います。
 
-ご不明点や改善案があれば、Issue や Pull Request にてお知らせください。
+**要件**
+- `Python 3.11+`
+- 依存モジュール: `pyvmomi`, `requests`（`requirements.txt` 参照）
 
+**クイックスタート**
+- 依存関係のインストール（PowerShell）
+  - `python -m venv .venv`
+  - `.\\.venv\\Scripts\\Activate`
+  - `python -m pip install --upgrade pip`
+  - `pip install -r requirements.txt`
+- 実行
+  - `python gptCloneAndVmotion.py`
+
+より詳しいセットアップやトラブルシュートは `SETUP.md` を参照してください。
+# vSphere 自動化スクリプト
+
+- `gptCloneAndVmotion.py`: vSphere 上で VM のクローン作成から宛先 vCenter への登録、ネットワーク再設定、Storage vMotion までを自動化するスクリプト。
+
+---
+
+**概要**
+- STG 環境の VM をクローンし、宛先 vCenter/ネットワークへ登録・再構成後、PRD 用データストアへ Storage vMotion で移行します。
+- ゲスト OS の IP/GW/DNS/ルート設定は `nmcli` で自動適用し、検証まで行います。
+
+**要件**
+- Python 3.11 以上
+- 依存モジュール: `pyvmomi`, `requests`（`requirements.txt` を参照）
+
+**クイックスタート**
+- 依存関係のインストール（Windows/PowerShell）
+  - `python -m venv .venv`
+  - `.\\.venv\\Scripts\\Activate`
+  - `python -m pip install --upgrade pip`
+  - `pip install -r requirements.txt`
+- 実行
+  - `python gptCloneAndVmotion.py`
+
+詳細な手順やトラブルシューティングは `SETUP.md` を参照してください。
