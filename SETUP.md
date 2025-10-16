@@ -1,131 +1,57 @@
-# SETUP
-
-このドキュメントでは、`gptCloneAndVmotion.py` を実行するための環境構築手順を説明します。主に Windows (PowerShell) を想定していますが、Linux/macOS 向けの参考情報も記載しています。
+# セットアップガイド
 
 ---
 
-## 1. 事前準備 (Python / Git)
+**前提条件**
+- `Python 3.11+`
+- vCenter API へ到達可能なネットワーク環境
+- 対象 VM に VMware Tools が導入・稼働し、Guest Operations が利用可能
+- ゲスト OS の管理者資格情報（`root` または `sudo` 可能な `admin`）
 
-### 社内配布サイトからのインストール
-- Python や Git は **社内の情シス用インストーラー** (例: `\\fileserver\it-tools\installer`) からダウンロードしてください。
-- インターネット上の公式サイトから取得したインストーラーの利用は禁止されています。
+**インストール（推奨: 仮想環境）**
+- 依存モジュールは `requirements.txt` で管理します。
+- PowerShell (Windows)
+  - `python -m venv .venv`
+  - `.\\.venv\\Scripts\\Activate`
+  - `python -m pip install --upgrade pip`
+  - `pip install -r requirements.txt`
+- bash (macOS/Linux)
+  - `python3 -m venv .venv`
+  - `source .venv/bin/activate`
+  - `python -m pip install --upgrade pip`
+  - `pip install -r requirements.txt`
 
-#### Python 3.11 以上の導入
-1. 情シス用インストーラポータルで「Python 3.11」以上の Windows 64bit インストーラ (`python-3.11.x-amd64.exe`) を入手します。
-2. インストール時に **「Add Python to PATH」(環境変数に追加)** にチェックを付けてからインストールしてください。
-3. インストール後、PowerShell で以下を実行しバージョンを確認します。
-   ```powershell
-   python --version
-   ```
-   `Python 3.11.x` と表示されれば完了です。
+**グローバル環境でのセットアップ（venv を使わない場合）**
+- 既に Python をグローバルインストールしている場合でも、可能ならユーザー領域にインストールしてください（権限衝突や他プロジェクトへの影響を避けるため）。
+- Windows（PowerShell）
+  - Python 確認: `python --version` または `py -3.11 --version`
+  - ユーザー領域へ導入: `python -m pip install --user -r requirements.txt`
+  - `--user` で入れたスクリプトは通常 `%USERPROFILE%\AppData\Roaming\Python\Python311\Scripts` に配置されます。必要に応じて PATH に追加してください。
+  - システム全体に導入が必要な場合は管理者権限の PowerShell で実行しますが、推奨はしません。
+- macOS/Linux（bash）
+  - Python 確認: `python3 --version`
+  - ユーザー領域へ導入: `python3 -m pip install --user -r requirements.txt`
+  - ユーザー領域の実行ファイルは通常 `~/.local/bin` に配置されます。PATH に `~/.local/bin` を追加してください。
+- 動作確認
+  - `python -c "import pyVmomi, requests; print('deps ok')"`
+- 注意点
+  - `sudo pip install` は極力避けてください（OS 管理領域を汚染しやすいため）。必要なら明確な理由のもとで実施し、影響を把握してください。
+  - 依存衝突が発生した場合は仮想環境の使用に切り替えることを推奨します。
 
-#### Git の導入
-1. 同じく情シス用ポータルから Git for Windows のインストーラ (`Git-2.x.x-64-bit.exe`) を取得します。
-2. インストール時の「Adjusting your PATH environment」は **「Git from the command line and also from 3rd-party software」** を選択してください。
-3. インストール後、PowerShell で以下を実行し、バージョンを確認します。
-   ```powershell
-   git --version
-   ```
-   `git version 2.x.x` と表示されれば準備完了です。
+**設定（任意）**
+- ログ詳細度: `VSPHERE_CLONE_LOG_LEVEL`
+  - 例: `setx VSPHERE_CLONE_LOG_LEVEL DEBUG` (PowerShell、新しいシェルで有効)
+  - 実行中のみ: `set VSPHERE_CLONE_LOG_LEVEL=DEBUG` (PowerShell) / `export VSPHERE_CLONE_LOG_LEVEL=DEBUG` (bash)
 
-> **補足:** Linux / macOS 環境で作業する場合も、社内が配布しているパッケージまたは承認済みリポジトリを利用してください。`pyenv` や `brew` を使う場合は、情報システム部の指示に従ってください。
+**実行**
+- `python gptCloneAndVmotion.py`
+- スクリプト実行中に、ソース/宛先 vCenter の認証情報、対象 VM 名、ゲスト OS 認証情報を順に入力
+- 各フェーズで確認プロンプトが表示され、`y` で続行
 
-### リポジトリの取得 (git clone)
-1. 作業場所とするフォルダを決め（例: `G:\マイドライブ\development\py`）、PowerShell で移動します。
-   ```powershell
-   cd G:\マイドライブ\development\py
-   ```
-2. リポジトリをクローンします（公開リポジトリのため認証情報は不要です）。
-   ```powershell
-   git clone https://github.com/atsu-oku/vmMigration.git
-   ```
-   社内プロキシ越しにアクセスする場合は、必要に応じて `git config --global http.proxy http://proxy.example.com:8080` などを設定してください。
-3. クローン後、作業フォルダに移動します。
-   ```powershell
-   cd vmMigration
-   ```
+**トラブルシューティング**
+- 疎通失敗: ネットワークポリシー/ファイアウォールで ICMP が遮断されていないか確認
+- 認証失敗: VMware Tools 側で対象アカウントの Guest Operations 許可を確認
+- 詳細ログ: `VSPHERE_CLONE_LOG_LEVEL=DEBUG` を設定
 
----
-
-## 2. 仮想環境の作成 (推奨)
-
-作業ディレクトリ (`gptCloneAndVmotion.py` が存在するフォルダ) で以下を実行します。
-
-```powershell
-# 仮想環境を作成
-python -m venv .venv
-
-# 仮想環境を有効化
-. .\.venv\Scripts\Activate.ps1
-```
-
-- Linux/macOS の場合は `source .venv/bin/activate` で有効化します。
-- 仮想環境を終了するには `deactivate` を実行します。
-
----
-
-## 3. 必要な Python モジュールのインストール
-
-仮想環境が有効になっている状態で、以下を実行して依存ライブラリをインストールします。
-
-```powershell
-pip install --upgrade pip setuptools wheel
-pip install pyVmomi requests
-```
-
-- `pyVmomi`: vSphere API へアクセスするための公式 SDK ライブラリです。
-- `requests`: ゲスト OS からファイルを取得する際などに利用します。
-
-インストール後、以下のコマンドで確認できます。
-
-```powershell
-pip show pyVmomi
-pip show requests
-```
-
-> **補足:** オフライン環境や認証が必要なネットワークの場合は、社内で許可された Python パッケージミラーやプロキシを利用してください。
-
----
-
-## 4. vCenter 接続に必要な情報
-
-実行時に以下の情報が必要です。
-
-- ソース / 宛先 vCenter のホスト名または IP アドレス
-- vCenter にアクセス可能なアカウント (例: `administrator@vsphere.local`) のユーザー名とパスワード
-- ゲスト OS (対象 VM) の root および sudo 可能な admin アカウントのパスワード
-- ステージング → 本番移行に利用するデータストア名、ネットワーク名、クラスタ名
-
----
-
-## 5. スクリプトの実行
-
-1. PowerShell で作業ディレクトリへ移動し、仮想環境を有効化します。
-   ```powershell
-   cd G:\マイドライブ\development\py\vSphere
-   . .\.venv\Scripts\Activate.ps1
-   ```
-2. スクリプトを実行します。
-   ```powershell
-   python gptCloneAndVmotion.py
-   ```
-3. プロンプトに従って情報を入力し、各フェーズで `y` を入力すると処理が進みます。
-
----
-
-## 6. よくあるトラブルと対策
-
-- **ゲスト認証に失敗する**: VMware Tools が稼働しているか、Guest Operations が許可されているか確認してください。
-- **疎通確認 (ping) が失敗する**: ネットワークポリシーやファイアウォールの設定を確認し、必要に応じて `VSPHERE_CLONE_LOG_LEVEL=DEBUG` を設定して詳細ログを確認します。
-- **証明書エラーで vCenter に接続できない**: 社内の証明書ストアにルート証明書を追加するなど、情報システム部の手順に従って対応してください。
-
----
-
-## 7. 補足
-
-- スクリプトの詳細なフローや今後の拡張計画は `README.md` を参照してください。
-- 複数 VM を連続で処理する場合は、入力値を環境変数や設定ファイルで管理するなどの拡張を検討してください。
-
----
-
-以上でセットアップは完了です。問題や改善案があれば Issue や Pull Request でお知らせください。
+**補足**
+- `requirement.txt` も同梱しています（`-r requirements.txt` を参照）。通常は `requirements.txt` の使用を推奨します。
