@@ -2,6 +2,11 @@
 
 ---
 
+## リポジトリ取得 (git clone)
+- HTTPS: `git clone https://github.com/atsu-oku/vmMigration.git`
+- SSH: `git clone git@github.com:atsu-oku/vmMigration.git`
+- ディレクトリへ移動: `cd vmMigration`
+
 **前提条件**
 - `Python 3.11+`
 - vCenter API へ到達可能なネットワーク環境
