@@ -3,9 +3,26 @@
 ---
 
 ## リポジトリ取得 (git clone)
+このリポジトリは、仮想環境（venv）の作成順序により2通りの進め方があります。組織ポリシーで「venv を先に作成」が求められる場合はパターンBを使用してください。
+
+パターンA: 先に clone（一般的な流れ）
 - HTTPS: `git clone https://github.com/atsu-oku/vmMigration.git`
 - SSH: `git clone git@github.com:atsu-oku/vmMigration.git`
 - ディレクトリへ移動: `cd vmMigration`
+
+パターンB: 先に venv を作成・有効化してから clone（ポリシー準拠）
+- Windows/PowerShell（例）
+  - `python -m venv .venv`
+  - `.\\.venv\\Scripts\\Activate`
+  - `git clone https://github.com/atsu-oku/vmMigration.git`
+  - `cd vmMigration`
+  - `pip install -r requirements.txt`
+- macOS/Linux（bash）
+  - `python3 -m venv .venv`
+  - `source .venv/bin/activate`
+  - `git clone https://github.com/atsu-oku/vmMigration.git`
+  - `cd vmMigration`
+  - `pip install -r requirements.txt`
 
 **前提条件**
 - Python 3.11 以上
@@ -60,4 +77,3 @@
 
 **補足**
 - `requirement.txt` も同梱していますが、通常は `requirements.txt` の使用を推奨します。
-
