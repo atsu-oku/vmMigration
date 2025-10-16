@@ -1,17 +1,17 @@
-﻿# Version History
+?# Version History
 
 ## 2025-10-16
 - Added PRD static-route ownership tracking so each route is bound to the correct NIC during migration.
 - Added nmcli post-configuration validation to confirm IP/gateway/routes/DNS after vMotion.
 
 ## 2025-10-12
-- ロケール固定と出力の一貫性を改善。nmcli/ping の挙動が想定どおりになるよう調整。
-- sudo 実行時のフォールバック処理を強化し、主要コマンドの再実行性を改善。
-- README.md / SETUP.md を再構成して、セットアップ手順と使い方を明確化。
+- ���P�[���Œ�Əo�͂̈�ѐ������P�Bnmcli/ping �̋������z��ǂ���ɂȂ�悤�����B
+- sudo ���s���̃t�H�[���o�b�N�������������A��v�R�}���h�̍Ď��s�������P�B
+- README.md / SETUP.md ���č\�����āA�Z�b�g�A�b�v�菇�Ǝg�����𖾊m���B
 
 ## 2025-10-11
-- クローン → IP 設定 → Storage vMotion までのフローを整備。
-- ゲスト OS で nmcli / ping を用いた疎通確認とロールバック処理を追加。
+- �N���[�� �� IP �ݒ� �� Storage vMotion �܂ł̃t���[�𐮔��B
+- �Q�X�g OS �� nmcli / ping ��p�����a�ʊm�F�ƃ��[���o�b�N������ǉ��B
 
 ## 2025-10-10
-- プロジェクト初期化。ソース vCenter と宛先 vCenter を跨ぐ移行スクリプトの土台を作成。
+- �v���W�F�N�g�������B�\�[�X vCenter �ƈ��� vCenter ���ׂ��ڍs�X�N���v�g�̓y����쐬�B
