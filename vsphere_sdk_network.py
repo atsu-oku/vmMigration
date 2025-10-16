@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+import logging
 from typing import Iterable, List, Mapping, Optional
 
 import requests
@@ -77,10 +78,12 @@ class VsphereGuestNetworkSDK:
         if base.startswith("https://"):
             base = base[len("https://") :]
         self._host = base.rstrip("/")
+        self._logger = logging.getLogger(__name__)
         self._rest_base_url = f"https://{self._host}/rest"
         self._api_base_url = f"https://{self._host}/api"
         self._session: Session = requests.Session()
         self._session.verify = verify_ssl
+        self._session.headers.update({"Accept": "application/json"})
         if not verify_ssl:
             requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
         self._authenticate(username, password)
@@ -111,6 +114,7 @@ class VsphereGuestNetworkSDK:
             response = self._session.get(rest_url)
         self._raise_for_status(response, f"Failed to list guest interfaces for {vm_id}")
         payload = response.json()
+        self._logger.debug("Guest networking API response: %s", payload)
         if isinstance(payload, list):
             return payload
         if isinstance(payload, dict):
