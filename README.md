@@ -1,9 +1,11 @@
-﻿# vSphere 閾ｪ蜍募喧繧ｹ繧ｯ繝ｪ繝励ヨ
+# vSphere 自動化スクリプト
 
-`cloneAndVmotion.py` 縺ｯ縲」Sphere 荳翫〒 STG 迺ｰ蠅・・ VM 繧偵け繝ｭ繝ｼ繝ｳ縺励∝ｮ帛・ vCenter/繝阪ャ繝医Ρ繝ｼ繧ｯ縺ｸ逋ｻ骭ｲ繝ｻ蜀肴ｧ区・縺励◆縺・∴縺ｧ縲￣RD 逕ｨ繝・・繧ｿ繧ｹ繝医い縺ｸ Storage vMotion 縺ｧ遘ｻ陦後☆繧倶ｽ懈･ｭ繧定・蜍募喧縺吶ｋ繧ｹ繧ｯ繝ｪ繝励ヨ縺ｧ縺吶ゅご繧ｹ繝・OS 縺ｮ繝阪ャ繝医Ρ繝ｼ繧ｯ險ｭ螳壹・ `nmcli` 繧堤畑縺・※閾ｪ蜍暮←逕ｨ繝ｻ讀懆ｨｼ縺励∪縺吶・
+`cloneAndVmotion.py` は、vSphere 上で STG 環境の VM をクローンし、宛先 vCenter/ネットワークへ登録・再構成したうえで、PRD 用データストアへ Storage vMotion で移行する作業を自動化するスクリプトです。ゲスト OS のネットワーク設定は `nmcli` を用いて自動適用・検証します。
+
 ---
 
-## 繧ｯ繧､繝・け繧ｹ繧ｿ繝ｼ繝茨ｼ域耳螂ｨ: venv 竊・clone・・- Windows/PowerShell
+## クイックスタート（推奨: venv → clone）
+- Windows/PowerShell
   - `python -m venv .venv`
   - `.\\.venv\\Scripts\\Activate`
   - `git clone https://github.com/atsu-oku/vmMigration.git`
@@ -11,7 +13,8 @@
   - `python -m pip install --upgrade pip`
   - `pip install -r requirements.txt`
   - `python cloneAndVmotion.py`
-- macOS/Linux・・ash・・  - `python3 -m venv .venv`
+- macOS/Linux（bash）
+  - `python3 -m venv .venv`
   - `source .venv/bin/activate`
   - `git clone https://github.com/atsu-oku/vmMigration.git`
   - `cd vmMigration`
@@ -19,30 +22,48 @@
   - `pip install -r requirements.txt`
   - `python cloneAndVmotion.py`
 
-莉｣譖ｿ縺ｮ謇矩・ｼ・lone 竊・venv・峨・ `SETUP.md` 縺ｫ險倩ｼ峨＠縺ｦ縺・∪縺吶・
+代替の手順（clone → venv）は `SETUP.md` を参照してください。
+
 ---
 
-## 迚ｹ髟ｷ
-- 繧ｯ繝ｭ繝ｼ繝ｳ 竊・螳帛・ vCenter 逋ｻ骭ｲ 竊・NIC 蜀肴ｧ区・ 竊・IP/GW/DNS/繝ｫ繝ｼ繝磯←逕ｨ 竊・Storage vMotion 縺ｾ縺ｧ閾ｪ蜍募喧
-- 險ｭ螳壼ｾ後・ `nmcli` 縺ｧ讀懆ｨｼ縺励∽ｸ肴紛蜷医′縺ゅｌ縺ｰ隴ｦ蜻・- 繧ｨ繝ｩ繝ｼ譎ゅ・繝ｭ繝ｼ繝ｫ繝舌ャ繧ｯ・医け繝ｭ繝ｼ繝ｳ蜑企勁繝ｻ荳崎ｦ√ヵ繧｡繧､繝ｫ蜑企勁 縺ｪ縺ｩ・峨ｒ謠先｡・
-## 蟇ｾ蠢懃腸蠅・・蜑肴署
-- vCenter 縺ｫ API 蛻ｰ驕斐〒縺阪ｋ縺薙→
-- 蟇ｾ雎｡ VM 縺ｫ VMware Tools 縺悟ｰ主・繝ｻ遞ｼ蜒阪＠縲；uest Operations 縺悟茜逕ｨ蜿ｯ閭ｽ
-- 繧ｲ繧ｹ繝・OS 蛛ｴ縺ｧ `nmcli`・・etworkManager・峨′蛻ｩ逕ｨ蜿ｯ閭ｽ・井ｸｻ縺ｫ Linux・・- Python 3.11 莉･髯・
-## 萓晏ｭ倥Δ繧ｸ繝･繝ｼ繝ｫ
+## 特長
+- クローン → 宛先 vCenter 登録 → NIC 再構成 → IP/GW/DNS/ルート適用 → Storage vMotion まで自動化
+- 設定後は `nmcli` で検証し、不整合があれば警告
+- エラー時はロールバック（クローン削除・不要ファイル削除 など）を提案
+
+## 対応環境・前提
+- vCenter に API 到達できること
+- 対象 VM に VMware Tools が導入・稼働し、Guest Operations が利用可能
+- ゲスト OS 側で `nmcli`（NetworkManager）が利用可能（主に Linux）
+- Python 3.11 以降
+
+## 依存モジュール
 - pyvmomi
 - requests
-- 隧ｳ邏ｰ縺ｯ `requirements.txt` 縺ｨ `SETUP.md` 繧貞盾辣ｧ
+- 詳細は `requirements.txt` と `SETUP.md` を参照
 
-## 螳溯｡後ヵ繝ｭ繝ｼ・域ｦりｦ・ｼ・1. 繧ｽ繝ｼ繧ｹ vCenter 縺九ｉ蟇ｾ雎｡ VM 縺ｮ NIC 諠・ｱ縲；W縲．NS 縺ｪ縺ｩ繧貞叙蠕・2. 荳譎ゅョ繝ｼ繧ｿ繧ｹ繝医い縺ｸ繧ｯ繝ｭ繝ｼ繝ｳ菴懈・・医け繝ｭ繝ｼ繝ｳ蛛ｴ NIC 繧貞・譛溷喧/隱ｿ謨ｴ・・3. 螳帛・ vCenter 縺ｸ逋ｻ骭ｲ縺励￣RD 繝阪ャ繝医Ρ繝ｼ繧ｯ縺ｫ蜷医ｏ縺帙※ NIC 蜀肴ｧ区・
-4. 繧ｲ繧ｹ繝・OS 蛛ｴ縺ｧ `nmcli` 縺ｫ繧医ｊ IP/GW/DNS/繝ｫ繝ｼ繝医ｒ驕ｩ逕ｨ繝ｻ讀懆ｨｼ
-5. 荳譎る・鄂ｮ縺九ｉ譛邨・PRD 逕ｨ繝・・繧ｿ繧ｹ繝医い縺ｸ Storage vMotion 縺ｧ遘ｻ陦・
-## 菴ｿ縺・婿・亥ｯｾ隧ｱ縺ｮ豬√ｌ・・- 螳溯｡・ `python cloneAndVmotion.py`
-- 蟇ｾ隧ｱ縺ｧ莉･荳九ｒ蜈･蜉・  - 繧ｽ繝ｼ繧ｹ/螳帛・ vCenter 縺ｮ隱崎ｨｼ諠・ｱ
-  - 遘ｻ陦悟ｯｾ雎｡ VM 蜷・  - 繧ｲ繧ｹ繝・OS 縺ｮ隱崎ｨｼ諠・ｱ・・oot 縺ｾ縺溘・ sudo 蜿ｯ閭ｽ縺ｪ admin・・- 蜷・ヵ繧ｧ繝ｼ繧ｺ縺ｧ遒ｺ隱阪Γ繝・そ繝ｼ繧ｸ縺瑚｡ｨ遉ｺ縺輔ｌ縲～y` 縺ｧ邯夊｡・
-## 繝医Λ繝悶Ν繧ｷ繝･繝ｼ繝・ぅ繝ｳ繧ｰ
-- 逍朱壼､ｱ謨・ 繝阪ャ繝医Ρ繝ｼ繧ｯ繝昴Μ繧ｷ繝ｼ/繝輔ぃ繧､繧｢繧ｦ繧ｩ繝ｼ繝ｫ縺ｧ ICMP 縺碁・譁ｭ縺輔ｌ縺ｦ縺・↑縺・°遒ｺ隱・- 隱崎ｨｼ螟ｱ謨・ VMware Tools 蛛ｴ縺ｧ蟇ｾ雎｡繧｢繧ｫ繧ｦ繝ｳ繝医↓ Guest Operations 讓ｩ髯舌′縺ゅｋ縺狗｢ｺ隱・- 隧ｳ邏ｰ繝ｭ繧ｰ: `VSPHERE_CLONE_LOG_LEVEL=DEBUG` 繧定ｨｭ螳・
-## 髢狗匱繝｡繝｢
-- 萓晏ｭ倥・ `requirements.txt` 縺ｫ險倩ｼ会ｼ・pip install -r requirements.txt`・・- 隧ｳ邏ｰ縺ｪ繧ｻ繝・ヨ繧｢繝・・縺ｯ `SETUP.md` 繧貞盾辣ｧ
-- Issue/PR 縺ｫ繧医ｋ謾ｹ蝟・署譯医ｒ豁楢ｿ・
+## 実行フロー（概要）
+1. ソース vCenter から対象 VM の NIC 情報、GW、DNS などを取得
+2. 一時データストアへクローン作成（クローン側 NIC を初期化/調整）
+3. 宛先 vCenter へ登録し、PRD ネットワークに合わせて NIC 再構成
+4. ゲスト OS 側で `nmcli` により IP/GW/DNS/ルートを適用・検証
+5. 一時配置から最終 PRD 用データストアへ Storage vMotion で移行
+
+## 使い方（対話の流れ）
+- 実行: `python cloneAndVmotion.py`
+- 対話で以下を入力
+  - ソース/宛先 vCenter の認証情報
+  - 移行対象 VM 名
+  - ゲスト OS の認証情報（root または sudo 可能な admin）
+- 各フェーズで確認メッセージが表示され、`y` で続行
+
+## トラブルシューティング
+- 疎通失敗: ネットワークポリシー/ファイアウォールで ICMP が遮断されていないか確認
+- 認証失敗: VMware Tools 側で対象アカウントに Guest Operations 権限があるか確認
+- 詳細ログ: `VSPHERE_CLONE_LOG_LEVEL=DEBUG` を設定
+
+## 開発メモ
+- 依存は `requirements.txt` に記載（`pip install -r requirements.txt`）
+- 詳細なセットアップは `SETUP.md` を参照
+- Issue/PR による改善提案を歓迎
 
