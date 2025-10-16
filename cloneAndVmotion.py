@@ -26,6 +26,13 @@ try:
 except ImportError:
     REQUESTS_AVAILABLE = False
 
+from vsphere_sdk_network import (
+    VsphereGuestNetworkSDK,
+    IPv4Config,
+    DnsConfig,
+    RouteConfig,
+    find_interface_id_by_mac,
+)
 PRD_STATIC_ROUTE_SEGMENTS = {160, 161, 162, 163, 164}
 NMCLI_FIELDS_WITH_TYPE = ['UUID', 'NAME', 'DEVICE', 'TYPE']
 NMCLI_FIELDS_NO_TYPE = ['UUID', 'NAME', 'DEVICE']
@@ -890,6 +897,7 @@ original_default_gateway: str | None = None
 original_static_routes: List[Dict[str, Any]] = []
 si_source = None
 si_dest = None
+sdk_network_client: VsphereGuestNetworkSDK | None = None
 
 try:
     # --- [Phase 0/7] Pre-flight Check: Authenticating to vCenters ---
@@ -1323,7 +1331,30 @@ try:
                     check_exit_code=check_exit_code,
                 )
         new_default_gateway = calculate_ip_stg_to_prd(original_default_gateway)
-        
+        sdk_interfaces: List[Dict[str, Any]] = []
+        sdk_vm_id: Optional[str] = None
+        use_sdk_networking = False
+        if REQUESTS_AVAILABLE:
+            try:
+                sdk_network_client = VsphereGuestNetworkSDK(
+                    host=VCSA_HOST_DEST,
+                    username=VCSA_USER,
+                    password=VCSA_PWD_DEST,
+                    verify_ssl=False,
+                )
+                sdk_vm_id = getattr(migrated_vm, "_moId", None)
+                if sdk_vm_id:
+                    sdk_interfaces = sdk_network_client.list_interfaces(sdk_vm_id)
+                    if sdk_interfaces:
+                        use_sdk_networking = True
+                        print("   -> Reconfiguring guest networking via the vSphere Automation SDK.")
+                    else:
+                        print("   -> SDK enumerated no guest NICs; using the legacy nmcli workflow.")
+            except Exception as sdk_error:
+                LOGGER.warning("SDK ベースのネットワーク再構成を初期化できませんでした: %s", sdk_error)
+                sdk_network_client = None
+                use_sdk_networking = False
+
         for i, nic_info in enumerate(original_nic_info):
             new_ip = nic_info.get('prd_ip_address')
             if not new_ip:
@@ -1373,7 +1404,94 @@ try:
                 nic_info.get('mac_address'),
             )
             con_name = device_name
-            print(f"   -> ゲスト側インターフェース: '{device_name}' を検出しました。")
+            print(f"   -> Guest OS interface '{device_name}' located.")
+
+            sdk_success = False
+            sdk_dns_servers: List[str] = []
+            if use_sdk_networking and sdk_network_client and sdk_vm_id:
+                nic_identifier = find_interface_id_by_mac(sdk_interfaces, new_mac) or find_interface_id_by_mac(
+                    sdk_interfaces, nic_info.get('mac_address')
+                )
+                if nic_identifier:
+                    if i == 0 and original_dns_servers:
+                        sdk_dns_servers = [
+                            calculate_ip_stg_to_prd(dns) for dns in original_dns_servers if dns
+                        ]
+                    route_specs: List[RouteConfig] = []
+                    applied_static_routes = []
+                    for route_idx, route_info in enumerate(prd_static_routes or []):
+                        owner_index = route_info.get('owner_index')
+                        if owner_index is not None and owner_index != i:
+                            continue
+                        if route_idx in configured_route_indices:
+                            continue
+                        route_network = route_info.get('network')
+                        route_gateway = route_info.get('gateway')
+                        if not route_network or not route_gateway:
+                            continue
+                        route_specs.append(RouteConfig(network=route_network, gateway=route_gateway))
+                        configured_route_indices.add(route_idx)
+                        applied_static_routes.append(f"{route_network} {route_gateway}")
+                    ipv4_spec = IPv4Config(
+                        address=new_ip,
+                        prefix=prefix,
+                        default_gateway=expected_gateway_value,
+                    )
+                    dns_spec = DnsConfig(sdk_dns_servers) if sdk_dns_servers else None
+                    try:
+                        sdk_network_client.update_interface(
+                            vm_id=sdk_vm_id,
+                            nic_id=nic_identifier,
+                            ipv4=ipv4_spec,
+                            dns=dns_spec,
+                            routes=route_specs,
+                        )
+                        sdk_interfaces = sdk_network_client.list_interfaces(sdk_vm_id)
+                        if sdk_dns_servers:
+                            expected_dns_servers = sdk_dns_servers
+                        sdk_success = True
+                        if applied_static_routes:
+                            print("   -> Configured static routes via SDK.")
+                            for route_line in applied_static_routes:
+                                print(f"      - Added: {route_line}")
+                        print("   -> Completed NIC reconfiguration via SDK.")
+                        time.sleep(5)
+                        if new_ip:
+                            guest_command_executor(f"ip addr show {device_name} | grep -q '{new_ip}'", check_exit_code=False)
+                        if new_ip:
+                            arping_commands = [
+                                f"arping -c 3 -A -I {device_name} {new_ip}",
+                                f"arping -c 3 -U -I {device_name} {new_ip}",
+                            ]
+                            for arping_cmd in arping_commands:
+                                guest_command_executor(arping_cmd, check_exit_code=False)
+                        candidate_gateways = []
+                        if expected_gateway_value:
+                            candidate_gateways.append(expected_gateway_value)
+                        for route_entry in applied_static_routes:
+                            try:
+                                _, gw_val = route_entry.split()
+                            except ValueError:
+                                continue
+                            if gw_val and gw_val not in candidate_gateways:
+                                candidate_gateways.append(gw_val)
+                        unique_targets = []
+                        for target in candidate_gateways:
+                            if target and target not in unique_targets:
+                                unique_targets.append(target)
+                        for target in unique_targets:
+                            guest_command_executor(
+                                f"bash -c 'for i in $(seq 1 3); do ping -c 1 -W 2 {target} && exit 0; sleep 2; done; exit 1'",
+                                check_exit_code=False,
+                            )
+                    except Exception as sdk_update_error:
+                        print(f"   -> SDK update failed; falling back to nmcli: {sdk_update_error}")
+                        sdk_success = False
+                else:
+                    print("   -> SDK could not match a NIC by MAC; applying settings with nmcli.")
+
+            if sdk_success:
+                continue
 
             # 2. Disconnect and delete existing connections
             guest_command_executor(f"nmcli device disconnect {device_name} || true", check_exit_code=False)
@@ -1772,6 +1890,11 @@ except Exception as e:
             print("ロールバックはキャンセルされました。VM はソース vCenter に残ります。")
 
 finally:
+    try:
+        if 'sdk_network_client' in locals() and sdk_network_client:
+            sdk_network_client.close()
+    except Exception:
+        pass
     try:
         if 'si_dest' in locals() and si_dest:
             Disconnect(si_dest)
