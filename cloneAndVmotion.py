@@ -512,6 +512,139 @@ def determine_prd_static_routes(nic_infos, default_gateway, original_routes):
     return routes
 
 
+def verify_destination_network_with_sdk(
+    sdk_client: VsphereGuestNetworkSDK,
+    vm_id: str,
+    nic_infos: List[Dict[str, Any]],
+    expected_dns_servers: List[str],
+    expected_routes: List[Dict[str, Any]],
+) -> bool:
+    """Check destination guest networking state via the Automation SDK."""
+    success = True
+    try:
+        interfaces = sdk_client.list_interfaces(vm_id, retries=6, delay_seconds=5.0)
+    except Exception as error:
+        LOGGER.warning("SDK verification failed to read interfaces: %s", error)
+        return False
+
+    interface_map: Dict[str, Dict[str, Any]] = {}
+    candidate_keys = (
+        'mac_address',
+        'mac',
+        'macAddress',
+    )
+    for entry in interfaces:
+        mac_value = ''
+        for key in candidate_keys:
+            value = entry.get(key)
+            if isinstance(value, str) and value:
+                mac_value = value
+                break
+        if not mac_value:
+            link_info = entry.get('link') or entry.get('link_info') or {}
+            if isinstance(link_info, dict):
+                for key in candidate_keys:
+                    value = link_info.get(key)
+                    if isinstance(value, str) and value:
+                        mac_value = value
+                        break
+        if not mac_value:
+            continue
+        interface_map[mac_value.lower()] = dict(entry)
+
+    print("   -> SDK verification snapshot (interfaces):")
+    for nic in nic_infos:
+        expected_ip = nic.get('prd_ip_address') or nic.get('ip_address')
+        expected_mask = nic.get('subnet_mask')
+        expected_prefix = mask_to_prefix(expected_mask) if expected_mask else None
+        expected_mac = (nic.get('new_mac_address') or nic.get('mac_address') or '').lower()
+        label = nic.get('network_name') or expected_mac
+        actual_entry = interface_map.get(expected_mac)
+        if not actual_entry:
+            print(f"      [WARN] MAC {expected_mac} ({label}) が REST API に見つかりません。")
+            success = False
+            continue
+        ip_data = actual_entry.get('ip') or {}
+        actual_ip = None
+        actual_prefix = None
+        for entry in ip_data.get('ip_addresses') or []:
+            if isinstance(entry, dict) and entry.get('ip_address') and '.' in entry.get('ip_address'):
+                actual_ip = entry.get('ip_address')
+                actual_prefix = entry.get('prefix_length')
+                break
+        if expected_ip and actual_ip != expected_ip:
+            print(f"      [WARN] MAC {expected_mac}: 期待IP {expected_ip} / 実際 {actual_ip or '(未設定)'}")
+            success = False
+        else:
+            print(f"      [OK] MAC {expected_mac}: IP {actual_ip or '(未設定)'}")
+        if expected_prefix is not None and actual_prefix is not None and expected_prefix != actual_prefix:
+            print(f"         [WARN] 期待プレフィックス {expected_prefix} / 実際 {actual_prefix}")
+            success = False
+
+    try:
+        state_payload = sdk_client.get_networking_state(vm_id)
+    except Exception as error:
+        LOGGER.warning("SDK verification failed to read DNS state: %s", error)
+        state_payload = {}
+        success = False
+
+    actual_dns = []
+    if isinstance(state_payload, dict):
+        actual_dns = state_payload.get('dns', {}).get('ip_addresses') or []
+    expected_dns_set = {str(dns) for dns in expected_dns_servers or []}
+    actual_dns_set = {str(dns) for dns in actual_dns if dns}
+    if expected_dns_set:
+        if expected_dns_set == actual_dns_set:
+            print(f"   -> DNS: {sorted(actual_dns_set)}")
+        else:
+            print(f"   [WARN] DNS 期待値 {sorted(expected_dns_set)} / 実際 {sorted(actual_dns_set)}")
+            success = False
+    elif actual_dns_set:
+        print(f"   -> DNS: REST API reported {sorted(actual_dns_set)}")
+
+    try:
+        route_payload = sdk_client.list_routes(vm_id)
+    except Exception as error:
+        LOGGER.warning("SDK verification failed to read routes: %s", error)
+        route_payload = []
+        success = False
+
+    actual_route_set = set()
+    for route in route_payload or []:
+        network = route.get('network')
+        prefix = route.get('prefix_length')
+        gateway = route.get('gateway_address') or ''
+        if network is None or prefix is None:
+            continue
+        try:
+            prefix_int = int(prefix)
+        except (TypeError, ValueError):
+            continue
+        actual_route_set.add((str(network), prefix_int, str(gateway)))
+
+    expected_route_set = set()
+    for route in expected_routes or []:
+        network = route.get('network')
+        prefix = route.get('prefix')
+        gateway = route.get('gateway') or ''
+        if network is None or prefix is None:
+            continue
+        try:
+            prefix_int = int(prefix)
+        except (TypeError, ValueError):
+            continue
+        expected_route_set.add((str(network), prefix_int, str(gateway)))
+
+    missing_routes = expected_route_set - actual_route_set
+    extra_routes = actual_route_set - expected_route_set
+    if missing_routes:
+        print(f"   [WARN] 期待ルートが不足: {sorted(missing_routes)}")
+        success = False
+    if extra_routes:
+        print(f"   -> 追加ルート (参考): {sorted(extra_routes)}")
+
+    return success
+
 def verify_nmcli_connection_settings(
     command_executor,
     connection_name: str,
@@ -1421,6 +1554,8 @@ try:
         sdk_interfaces: List[Dict[str, Any]] = []
         sdk_vm_id: Optional[str] = None
         use_sdk_networking = False
+        expected_dns_overall: List[str] = []
+        nmcli_validation_tasks: List[Tuple[str, str, str, Optional[str], List[str], List[str]]] = []
         if REQUESTS_AVAILABLE:
             try:
                 sdk_network_client = VsphereGuestNetworkSDK(
@@ -1707,6 +1842,7 @@ try:
                     dns_str = ' '.join(new_dns_servers)
                     guest_command_executor(f"nmcli connection modify '{con_name}' ipv4.dns '{dns_str}'")
                     expected_dns_servers = new_dns_servers
+                    expected_dns_overall = new_dns_servers[:]
 
             should_configure_routes = nic_info.get('is_gateway_nic')
             if not should_configure_routes and new_default_gateway and new_ip:
@@ -1790,26 +1926,67 @@ try:
                     raise
         
         expected_ip_cidr = f"{new_ip}/{prefix}" if new_ip else ""
-        try:
-            verify_nmcli_connection_settings(
-                guest_command_executor,
-                con_name,
-                device_name,
-                expected_ip_cidr,
-                expected_gateway_value,
-                applied_static_routes,
-                expected_dns_servers,
-            )
-        except RuntimeError as validation_error:
-            print(f"\n[WARN] nmcli validation failed: {validation_error}")
-            decision = input("Continue despite nmcli validation failure? (c=continue / a=abort): ").strip().lower()
-            if decision == 'c':
-                print("   -> Proceeding despite nmcli validation failure per user request.")
-            else:
-                raise
-
+        nmcli_validation_tasks.append((
+            con_name,
+            device_name,
+            expected_ip_cidr,
+            expected_gateway_value,
+            applied_static_routes.copy(),
+            expected_dns_servers[:] if expected_dns_servers else []
+        ))
         ensure_firewall_allows_ssh(guest_command_executor, SSH_ALLOWED_SOURCE_IP)
-        print("   ✓ 全ての NIC の IP 設定が完了しました。")
+        print("   \u2713 全ての NIC の IP 設定が完了しました。")
+
+    sdk_verification_succeeded = False
+    if REQUESTS_AVAILABLE:
+        validation_client = sdk_network_client
+        created_validation_client = False
+        validation_vm_id = sdk_vm_id or getattr(migrated_vm, "_moId", None)
+        if validation_vm_id and validation_client is None:
+            try:
+                validation_client = VsphereGuestNetworkSDK(
+                    host=VCSA_HOST_DEST,
+                    username=VCSA_USER,
+                    password=VCSA_PWD_DEST,
+                    verify_ssl=False,
+                )
+                created_validation_client = True
+            except Exception as sdk_error:
+                LOGGER.warning("Failed to initialise SDK client for post-migration verification: %s", sdk_error)
+        if validation_vm_id and validation_client:
+            try:
+                sdk_verification_succeeded = verify_destination_network_with_sdk(
+                    validation_client,
+                    validation_vm_id,
+                    original_nic_info,
+                    expected_dns_overall,
+                    prd_static_routes,
+                )
+            except Exception as sdk_error:
+                LOGGER.warning("SDK verification encountered an error: %s", sdk_error)
+            finally:
+                if created_validation_client and validation_client:
+                    validation_client.close()
+
+    if not sdk_verification_succeeded:
+        for (con_name, device_name, expected_ip_cidr, expected_gateway_value, routes_snapshot, dns_snapshot) in nmcli_validation_tasks:
+            try:
+                verify_nmcli_connection_settings(
+                    guest_command_executor,
+                    con_name,
+                    device_name,
+                    expected_ip_cidr,
+                    expected_gateway_value,
+                    routes_snapshot,
+                    dns_snapshot,
+                )
+            except RuntimeError as validation_error:
+                print(f"\n[WARN] nmcli validation failed: {validation_error}")
+                decision = input("Continue despite nmcli validation failure? (c=continue / a=abort): ").strip().lower()
+                if decision == 'c':
+                    print("   -> Proceeding despite nmcli validation failure per user request.")
+                else:
+                    raise
 
     print("\n--- [Phase 7/7] Destination vCenter: Final Storage vMotion ---")
     print(f"最終データストア '{TARGET_DATASTORE_NAME_FINAL}' を検索中...")
