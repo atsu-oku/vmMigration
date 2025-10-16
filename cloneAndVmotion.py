@@ -477,7 +477,9 @@ def determine_prd_static_routes(nic_infos, default_gateway, original_routes):
         prd_gateway = calculate_ip_stg_to_prd(gateway) if gateway else default_gateway
         if not prd_gateway:
             continue
-        owner_index: Optional[int] = None
+        owner_index: Optional[int] = route.get('owner_index')
+        if owner_index is not None and (owner_index < 0 or owner_index >= len(nic_infos)):
+            owner_index = None
         if gateway:
             try:
                 stg_gateway_addr = ipaddress.IPv4Address(gateway)
@@ -942,9 +944,36 @@ try:
     print(f"✓ VM '{target_vm.name}' を確認しました。")
 
     if target_vm.guest.toolsRunningStatus != "guestToolsRunning":
-        raise SystemError(
-            "IP アドレスを取得するため、ソース VM の電源が ON で VMware Tools が実行中である必要があります。"
-        )
+        raise SystemError("Source VM must be powered on with VMware Tools running to collect IP information.")
+
+    sdk_source_client = None
+    source_interfaces: List[Dict[str, Any]] = []
+    source_networking_state: Dict[str, Any] = {}
+    source_routes: List[Dict[str, Any]] = []
+    sdk_interfaces_by_mac: Dict[str, Tuple[Dict[str, Any], int]] = {}
+    if REQUESTS_AVAILABLE:
+        sdk_vm_id_source = getattr(target_vm, "_moId", None)
+        if sdk_vm_id_source:
+            try:
+                sdk_source_client = VsphereGuestNetworkSDK(
+                    host=VCSA_HOST_SOURCE,
+                    username=VCSA_USER,
+                    password=VCSA_PWD_SOURCE,
+                    verify_ssl=False,
+                )
+                source_interfaces = sdk_source_client.list_interfaces(sdk_vm_id_source)
+                source_networking_state = sdk_source_client.get_networking_state(sdk_vm_id_source)
+                source_routes = sdk_source_client.list_routes(sdk_vm_id_source)
+            except Exception as sdk_error:
+                LOGGER.warning("Failed to collect source VM network info via API: %s", sdk_error)
+            finally:
+                if sdk_source_client:
+                    sdk_source_client.close()
+            for idx, iface in enumerate(source_interfaces):
+                mac_candidate = (iface.get("mac_address") or iface.get("mac") or "").lower()
+                if mac_candidate:
+                    sdk_interfaces_by_mac[mac_candidate] = (iface, idx)
+
     print("   VMware Tools が稼働中であることを確認しました。")
 
     print("   クローン元 VM の NIC 情報を収集しています...")
@@ -954,6 +983,7 @@ try:
         if not isinstance(device, vim.vm.device.VirtualEthernetCard):
             continue
         mac = device.macAddress
+        mac_lower = (mac or '').lower()
         guest_nic = guest_net_map.get(mac)
         network_name = None
         if isinstance(device.backing, vim.vm.device.VirtualEthernetCard.NetworkBackingInfo):
@@ -969,35 +999,85 @@ try:
             summary = getattr(device_info, 'summary', None) if device_info else None
             network_name = label or summary or 'Unknown Network'
 
-        if not guest_nic:
-            missing_ipv4_messages.append(f'NIC {mac} ({network_name}) data could not be retrieved from VMware Tools.')
+        sdk_iface_entry = sdk_interfaces_by_mac.get(mac_lower)
+        ip_address = None
+        prefix_len = None
+        sdk_interface_index = None
+        sdk_nic_id = None
+        if sdk_iface_entry:
+            iface_data, iface_idx = sdk_iface_entry
+            sdk_interface_index = iface_idx
+            sdk_nic_id = iface_data.get('nic')
+            ip_data = iface_data.get('ip') or {}
+            ip_entries = ip_data.get('ip_addresses') or []
+            for entry in ip_entries:
+                if isinstance(entry, dict) and entry.get('ip_address') and '.' in entry.get('ip_address'):
+                    ip_address = entry.get('ip_address')
+                    prefix_len = entry.get('prefix_length')
+                    break
+        subnet_mask = prefix_to_subnet_mask(prefix_len) if prefix_len is not None else None
+        if not ip_address and guest_nic and guest_nic.ipConfig and getattr(guest_nic.ipConfig, 'ipAddress', None):
+            ip_v4_info = next((ip for ip in guest_nic.ipConfig.ipAddress if '.' in ip.ipAddress), None)
+            if ip_v4_info and getattr(ip_v4_info, 'ipAddress', None):
+                ip_address = ip_v4_info.ipAddress
+                if subnet_mask is None:
+                    subnet_mask = prefix_to_subnet_mask(ip_v4_info.prefixLength)
+        if not ip_address:
+            missing_ipv4_messages.append(f"NIC {mac} ({network_name}) data could not be retrieved from API/VMware Tools.")
             continue
-        if not guest_nic.ipConfig or not getattr(guest_nic.ipConfig, 'ipAddress', None):
-            missing_ipv4_messages.append(f'NIC {mac} ({network_name}) reported no IP addresses via VMware Tools.')
+        if subnet_mask is None and guest_nic and guest_nic.ipConfig and getattr(guest_nic.ipConfig, 'ipAddress', None):
+            ip_v4_info = next((ip for ip in guest_nic.ipConfig.ipAddress if '.' in ip.ipAddress), None)
+            if ip_v4_info:
+                subnet_mask = prefix_to_subnet_mask(ip_v4_info.prefixLength)
+        if subnet_mask is None:
+            missing_ipv4_messages.append(f"NIC {mac} ({network_name}) does not provide a subnet mask.")
             continue
 
-        ip_v4_info = next((ip for ip in guest_nic.ipConfig.ipAddress if '.' in ip.ipAddress), None)
-        if not ip_v4_info or not getattr(ip_v4_info, 'ipAddress', None):
-            missing_ipv4_messages.append(f'NIC {mac} ({network_name}) did not report an IPv4 address.')
-            continue
-
-        subnet_mask = prefix_to_subnet_mask(ip_v4_info.prefixLength)
-        original_nic_info.append({
+        nic_record = {
             'device_type': type(device),
             'mac_address': mac,
             'network_name': network_name,
-            'ip_address': ip_v4_info.ipAddress,
+            'ip_address': ip_address,
             'subnet_mask': subnet_mask,
-            'is_gateway_nic': False  # default False
-        })
+            'is_gateway_nic': False,
+        }
+        if sdk_interface_index is not None:
+            nic_record['sdk_interface_index'] = sdk_interface_index
+        if sdk_nic_id:
+            nic_record['sdk_nic_id'] = sdk_nic_id
+        original_nic_info.append(nic_record)
 
-    if missing_ipv4_messages:
-        print("\n[ERROR] 1つ以上のNICでIPv4アドレスの取得に失敗しました。")
-        for message in missing_ipv4_messages:
-            print(f"   - {message}")
-        raise RuntimeError("少なくとも1つのNICでIPv4アドレスが取得できなかったため処理を続行できません。")
+    if source_routes:
+        original_static_routes.clear()
+        for route in source_routes:
+            network = route.get('network')
+            prefix = route.get('prefix_length')
+            gateway = route.get('gateway_address')
+            interface_index = route.get('interface_index')
+            if network is None or prefix is None:
+                continue
+            entry = {
+                'network': network,
+                'prefix': prefix,
+                'gateway': gateway,
+            }
+            if interface_index is not None:
+                entry['owner_index'] = interface_index
+            original_static_routes.append(entry)
+            if gateway and (network == '0.0.0.0' or prefix == 0):
+                original_default_gateway = gateway
+                if interface_index is not None and 0 <= interface_index < len(original_nic_info):
+                    original_nic_info[interface_index]['is_gateway_nic'] = True
+        if not original_default_gateway:
+            for route in source_routes:
+                gateway = route.get('gateway_address')
+                interface_index = route.get('interface_index')
+                if gateway and interface_index is not None and 0 <= interface_index < len(original_nic_info):
+                    original_default_gateway = gateway
+                    original_nic_info[interface_index]['is_gateway_nic'] = True
+                    break
 
-    if target_vm.guest.ipStack and target_vm.guest.ipStack[0].ipRouteConfig:
+    if not source_routes and target_vm.guest.ipStack and target_vm.guest.ipStack[0].ipRouteConfig:
         for route in target_vm.guest.ipStack[0].ipRouteConfig.ipRoute:
             if route.network == '0.0.0.0' and route.prefixLength == 0:
                 original_default_gateway = route.gateway.ipAddress
@@ -1032,7 +1112,14 @@ try:
                 f"      - {route['network']}/{route['prefix']} via {gw_disp}"
             )
     
-    if target_vm.guest.ipStack and target_vm.guest.ipStack[0].dnsConfig:
+    if source_networking_state:
+        dns_info = source_networking_state.get('dns') or {}
+        original_dns_servers = [
+            dns for dns in (dns_info.get('ip_addresses') or [])
+            if dns and not str(dns).startswith('127.')
+        ]
+
+    if not original_dns_servers and target_vm.guest.ipStack and target_vm.guest.ipStack[0].dnsConfig:
         original_dns_servers = [dns for dns in target_vm.guest.ipStack[0].dnsConfig.ipAddress if not dns.startswith('127.')]
 
     print(f"   ✓ {len(original_nic_info)}件のNIC構成を取得しました。")

@@ -156,6 +156,49 @@ class VsphereGuestNetworkSDK:
         )
         return []
 
+    def get_networking_state(self, vm_id: str) -> Mapping[str, object]:
+        """Return aggregated networking state (DNS, host name, etc.)."""
+        api_url = self._url(f"vcenter/vm/{vm_id}/guest/networking", use_api=True)
+        response = self._session.get(api_url)
+        if response.status_code == 404:
+            rest_url = self._url(f"vcenter/vm/{vm_id}/guest/networking")
+            response = self._session.get(rest_url)
+        if response.status_code in (204, 202):
+            return {}
+        if not response.content:
+            return {}
+        self._raise_for_status(response, f"Failed to retrieve guest networking state for {vm_id}")
+        payload = response.json()
+        if not isinstance(payload, dict):
+            return {}
+        self._logger.debug("Guest networking state response: %s", payload)
+        return payload
+
+    def list_routes(self, vm_id: str) -> List[Mapping[str, object]]:
+        """Return guest routing table entries."""
+        api_url = self._url(f"vcenter/vm/{vm_id}/guest/networking/routes", use_api=True)
+        response = self._session.get(api_url)
+        if response.status_code == 404:
+            rest_url = self._url(f"vcenter/vm/{vm_id}/guest/networking/routes")
+            response = self._session.get(rest_url)
+        if response.status_code in (204, 202):
+            return []
+        if not response.content:
+            return []
+        self._raise_for_status(response, f"Failed to list guest routes for {vm_id}")
+        payload = response.json()
+        self._logger.debug("Guest networking routes response: %s", payload)
+        if isinstance(payload, list):
+            return payload
+        if isinstance(payload, dict):
+            value = payload.get("value")
+            if isinstance(value, list):
+                return value
+            routes = payload.get("routes") or payload.get("items")
+            if isinstance(routes, list):
+                return routes
+        return []
+
     def update_interface(
         self,
         vm_id: str,
