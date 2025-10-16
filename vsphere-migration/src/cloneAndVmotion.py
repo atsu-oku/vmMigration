@@ -9,10 +9,9 @@ import ipaddress
 import urllib.request
 import re
 import shlex
-from dataclasses import dataclass
 from datetime import datetime
 from functools import partial
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List
 try:
     from pyVim.connect import SmartConnect, Disconnect
 except ModuleNotFoundError:
@@ -29,19 +28,6 @@ except ImportError:
 PRD_STATIC_ROUTE_SEGMENTS = {160, 161, 162, 163, 164}
 NMCLI_FIELDS_WITH_TYPE = ['UUID', 'NAME', 'DEVICE', 'TYPE']
 NMCLI_FIELDS_NO_TYPE = ['UUID', 'NAME', 'DEVICE']
-SSH_ALLOWED_SOURCE_IP = "172.16.164.7"
-
-
-@dataclass
-class ConnectionCheckParams:
-    max_attempts: int = 5
-    wait_seconds: int = 3
-    pre_ping_wait_seconds: int = 10
-    ping_retry_count: int = 4
-    ping_retry_delay: int = 2
-    ping_timeout_seconds: int = 2
-
-DEFAULT_CONN_CHECK_PARAMS = ConnectionCheckParams()
 
 LOG_LEVEL_NAME = os.environ.get("VSPHERE_CLONE_LOG_LEVEL", "WARNING").upper()
 LOG_LEVEL = getattr(logging, LOG_LEVEL_NAME, logging.WARNING)
@@ -298,52 +284,17 @@ def parse_nmcli_connection_output(output, field_names):
         connections.append(entry)
     return connections
 
-def ensure_connection_activation(
-    command_executor,
-    connection_name,
-    device_name,
-    ping_targets=None,
-    params: ConnectionCheckParams | None = None,
-):
+def ensure_connection_activation(command_executor, connection_name, device_name, ping_targets=None, max_attempts=5, wait_seconds=3, pre_ping_wait_seconds=10, ping_retry_count=4, ping_retry_delay=2, ping_timeout_seconds=2):
     """Ensure the specified connection is active and optional ping targets respond."""
     if not connection_name:
         return
-
-    config = params or DEFAULT_CONN_CHECK_PARAMS
     targets = []
     if ping_targets:
         for item in ping_targets:
             if item and item not in targets:
                 targets.append(item)
-
-    def _ping_target(target_address):
-        ping_command = (
-            "bash -c 'for i in $(seq 1 {retry}); do "
-            "ping -c 1 -W {timeout} {target} && exit 0; "
-            "sleep {delay}; "
-            "done; exit 1'"
-        ).format(
-            retry=max(1, config.ping_retry_count),
-            timeout=max(1, config.ping_timeout_seconds),
-            target=target_address,
-            delay=max(0, config.ping_retry_delay),
-        )
-        exit_code, cmd_stdout, cmd_stderr = command_executor(
-            ping_command,
-            check_exit_code=False,
-        )
-        if exit_code != 0:
-            print(f"      - Ping to {target_address} failed (exit code {exit_code})")
-            LOGGER.debug("Ping failure details: stdout=%s stderr=%s", cmd_stdout, cmd_stderr)
-            return False
-        LOGGER.debug("Ping to %s succeeded.", target_address)
-        return True
-
-    for attempt in range(1, config.max_attempts + 1):
-        print(
-            f"   -> Verifying connection '{connection_name}' "
-            f"(attempt {attempt}/{config.max_attempts})"
-        )
+    for attempt in range(1, max_attempts + 1):
+        print(f"   -> Verifying connection '{connection_name}' (attempt {attempt}/{max_attempts})")
         _, state_output, _ = command_executor(
             f"nmcli -t -f GENERAL.STATE connection show '{connection_name}'",
             check_exit_code=False,
@@ -354,11 +305,12 @@ def ensure_connection_activation(
                 f"nmcli connection up '{connection_name}'",
                 check_exit_code=False,
             )
-            time.sleep(config.wait_seconds)
+            time.sleep(wait_seconds)
             continue
         if not targets:
             return
-        wait_before_ping = config.pre_ping_wait_seconds if attempt == 1 else config.wait_seconds
+        ping_failed = False
+        wait_before_ping = pre_ping_wait_seconds if attempt == 1 else wait_seconds
         if wait_before_ping > 0:
             LOGGER.debug(
                 "Waiting %s seconds before pinging targets on %s (attempt %s)",
@@ -368,84 +320,53 @@ def ensure_connection_activation(
             )
             time.sleep(wait_before_ping)
         for target in targets:
-            if not _ping_target(target):
-                break
-        else:
-            return
-        time.sleep(config.wait_seconds)
-    summary = ', '.join(targets) if targets else 'none'
-    message = (
-        f"Connection '{connection_name}' failed connectivity checks "
-        f"(targets: {summary})"
-    )
-    raise RuntimeError(message)
-
-
-def ensure_firewall_allows_ssh(command_executor, source_ip):
-    """Ensure iptables/firewalld accepts SSH from the given source."""
-    print("   -> ファイアウォール設定を確認します...")
-    if not source_ip:
-        return
-    exit_code, firewalld_status, _ = command_executor(
-        "systemctl is-active firewalld",
-        check_exit_code=False,
-    )
-    firewalld_active = exit_code == 0 and (firewalld_status or '').strip() == 'active'
-    if firewalld_active:
-        _, default_zone, _ = command_executor(
-            "firewall-cmd --get-default-zone",
-            check_exit_code=False,
-        )
-        zone = (default_zone or 'public').splitlines()[0].strip() or 'public'
-        rich_rule = (
-            f"firewall-cmd --permanent --zone={zone} "
-            f"--add-rich-rule='rule family=\"ipv4\" source address=\"{source_ip}\" "
-            "service name=\"ssh\" accept'"
-        )
-        exit_code, _, cmd_err = command_executor(rich_rule, check_exit_code=False)
-        if exit_code == 0:
-            command_executor("firewall-cmd --reload", check_exit_code=False)
-            print(f"      - firewalld: {zone} に SSH 許可ルールを追加しました ({source_ip})")
-            return
-        LOGGER.debug("Failed to add firewalld rich rule: %s", cmd_err)
-    exit_code, _, _ = command_executor("command -v iptables", check_exit_code=False)
-    if exit_code == 0:
-        check_rule_cmd = (
-            f"iptables -C INPUT -p tcp -s {source_ip} --dport 22 -j ACCEPT"
-        )
-        exit_code, _, _ = command_executor(check_rule_cmd, check_exit_code=False)
-        if exit_code != 0:
-            add_rule_cmd = (
-                f"iptables -I INPUT 1 -p tcp -s {source_ip} --dport 22 -j ACCEPT"
+            ping_script = (
+                "bash -c 'for i in $(seq 1 {retry}); do "
+                "ping -c 1 -W {timeout} {target} && exit 0; "
+                "sleep {delay}; "
+                "done; exit 1'"
+            ).format(
+                retry=max(1, ping_retry_count),
+                timeout=max(1, ping_timeout_seconds),
+                target=target,
+                delay=max(0, ping_retry_delay),
             )
-            command_executor(add_rule_cmd, check_exit_code=False)
-            print(f"      - iptables: SSH 許可ルールを追加しました ({source_ip})")
-            persist_cmds = [
-                "service iptables save",
-                "systemctl save iptables",
-                "iptables-save > /etc/sysconfig/iptables",
-            ]
-            for cmd in persist_cmds:
-                command_executor(cmd, check_exit_code=False)
+            LOGGER.debug(
+                "Connectivity check ping -> target=%s attempt=%s/%s",
+                target,
+                attempt,
+                max_attempts,
+            )
+            exit_code, ping_stdout, ping_stderr = command_executor(
+                ping_script,
+                check_exit_code=False,
+            )
+            if exit_code != 0:
+                print(f"      - Ping to {target} failed (exit code {exit_code})")
+                LOGGER.debug("Ping failure details: stdout=%s stderr=%s", ping_stdout, ping_stderr)
+                ping_failed = True
+                break
+            LOGGER.debug("Ping to %s succeeded.", target)
+        if not ping_failed:
             return
-        print(f"      - iptables: 既に SSH 許可ルールが存在します ({source_ip})")
-        return
-    print("      - firewalld / iptables が有効ではないため、追加設定は行いません。")
+        time.sleep(wait_seconds)
+    summary = ', '.join(targets) if targets else 'none'
+    raise RuntimeError(f"Connection '{connection_name}' failed connectivity checks (targets: {summary})")
 
 
 def determine_prd_static_routes(nic_infos, default_gateway, original_routes):
-    """Return PRD static routes with ownership metadata based on original STG routes."""
-    routes: List[Dict[str, Any]] = []
-    seen: Set[Tuple[str, str, Optional[int]]] = set()
-    local_networks: Dict[int, ipaddress.IPv4Network] = {}
-    for idx, nic in enumerate(nic_infos):
+    """Return PRD static routes (network, gateway) to configure from original STG routes."""
+    routes = []
+    seen = set()
+    local_networks = set()
+    for nic in nic_infos:
         prd_ip = nic.get("prd_ip_address") or calculate_ip_stg_to_prd(nic.get("ip_address"))
         subnet_mask = nic.get("subnet_mask")
         if not prd_ip or not subnet_mask:
             continue
         try:
             network = ipaddress.IPv4Interface(f"{prd_ip}/{subnet_mask}").network
-            local_networks[idx] = network
+            local_networks.add(str(network))
         except (ValueError, ipaddress.AddressValueError):
             continue
     for route in original_routes:
@@ -465,144 +386,17 @@ def determine_prd_static_routes(nic_infos, default_gateway, original_routes):
             prd_network = ipaddress.IPv4Network(f"{prd_network_address}/{stg_network.prefixlen}", strict=False)
         except ValueError:
             continue
-        if any(prd_network == net for net in local_networks.values()):
+        if str(prd_network) in local_networks:
             continue
         prd_gateway = calculate_ip_stg_to_prd(gateway) if gateway else default_gateway
         if not prd_gateway:
             continue
-        owner_index: Optional[int] = None
-        if gateway:
-            try:
-                stg_gateway_addr = ipaddress.IPv4Address(gateway)
-                for idx, nic in enumerate(nic_infos):
-                    nic_ip = nic.get("ip_address")
-                    nic_mask = nic.get("subnet_mask")
-                    if not nic_ip or not nic_mask:
-                        continue
-                    try:
-                        nic_network = ipaddress.IPv4Interface(f"{nic_ip}/{nic_mask}").network
-                    except (ValueError, ipaddress.AddressValueError):
-                        continue
-                    if stg_gateway_addr in nic_network:
-                        owner_index = idx
-                        break
-            except ipaddress.AddressValueError:
-                owner_index = None
-        if owner_index is None:
-            for idx, nic in enumerate(nic_infos):
-                if nic.get("is_gateway_nic"):
-                    owner_index = idx
-                    break
-        if owner_index is None and nic_infos:
-            owner_index = 0
-        key = (str(prd_network), prd_gateway, owner_index)
+        key = (str(prd_network), prd_gateway)
         if key in seen:
             continue
         seen.add(key)
-        routes.append({"network": str(prd_network), "gateway": prd_gateway, "owner_index": owner_index})
+        routes.append((str(prd_network), prd_gateway))
     return routes
-
-
-def verify_nmcli_connection_settings(
-    command_executor,
-    connection_name: str,
-    device_name: str,
-    expected_ip_cidr: str,
-    expected_gateway: Optional[str],
-    expected_routes: List[str],
-    expected_dns_servers: Optional[List[str]] = None,
-) -> None:
-    """Validate that nmcli reports the expected configuration for the given connection."""
-    print(f"   -> Validating nmcli settings (connection: {connection_name})")
-    fields = [
-        "connection.id",
-        "connection.interface-name",
-        "ipv4.method",
-        "ipv4.addresses",
-        "ipv4.gateway",
-        "ipv4.dns",
-        "ipv4.routes",
-    ]
-    nmcli_cmd = f"nmcli -g {','.join(fields)} connection show '{connection_name}'"
-    exit_code, stdout, stderr = command_executor(nmcli_cmd, check_exit_code=False)
-    if exit_code != 0:
-        detail = (stderr or stdout or "").strip()
-        raise RuntimeError(f"nmcli validation error: failed to read settings for '{connection_name}': {detail}")
-    values = stdout.splitlines()
-    while len(values) < len(fields):
-        values.append("")
-    data = {field: values[idx].strip() for idx, field in enumerate(fields)}
-
-    def _normalize_list(raw_value: str) -> List[str]:
-        normalized = (raw_value or "").strip()
-        if not normalized or normalized == "--":
-            return []
-        items: List[str] = []
-        for token in normalized.replace(";", ",").split(","):
-            token = token.strip()
-            if token:
-                items.append(token)
-        return items
-
-    def _normalize_route(route_value: str) -> str:
-        return " ".join(route_value.split())
-
-    method = data.get("ipv4.method", "").lower()
-    if method != "manual":
-        raise RuntimeError(
-            f"nmcli validation error: ipv4.method expected 'manual' but got '{method or '(empty)'}'."
-        )
-
-    addresses = _normalize_list(data.get("ipv4.addresses", ""))
-    if expected_ip_cidr and expected_ip_cidr not in addresses:
-        raise RuntimeError(
-            "nmcli validation error: IPv4 address mismatch. "
-            f"expected '{expected_ip_cidr}', actual={addresses or ['(none)']}"
-        )
-
-    actual_gateway = data.get("ipv4.gateway", "")
-    normalized_gateway = actual_gateway if actual_gateway not in ("--", "") else ""
-    if expected_gateway:
-        if normalized_gateway != expected_gateway:
-            raise RuntimeError(
-                "nmcli validation error: default gateway mismatch. "
-                f"expected '{expected_gateway}', actual='{normalized_gateway or '(none)'}'"
-            )
-    else:
-        if normalized_gateway:
-            raise RuntimeError(
-                "nmcli validation error: unexpected default gateway present. "
-                f"actual='{normalized_gateway}'"
-            )
-
-    actual_routes = {_normalize_route(route) for route in _normalize_list(data.get("ipv4.routes", ""))}
-    expected_route_set = {_normalize_route(route) for route in expected_routes}
-    missing_routes = expected_route_set - actual_routes
-    if missing_routes:
-        raise RuntimeError(
-            "nmcli validation error: missing static routes. "
-            f"missing={sorted(missing_routes)}, actual={sorted(actual_routes) if actual_routes else ['(none)']}"
-        )
-
-    expected_dns = [dns for dns in (expected_dns_servers or []) if dns]
-    if expected_dns:
-        actual_dns = {entry for entry in _normalize_list(data.get("ipv4.dns", ""))}
-        expected_dns_set = set(expected_dns)
-        missing_dns = expected_dns_set - actual_dns
-        if missing_dns:
-            raise RuntimeError(
-                "nmcli validation error: missing DNS servers. "
-                f"missing={sorted(missing_dns)}, actual={sorted(actual_dns) if actual_dns else ['(none)']}"
-            )
-
-    if data.get("connection.interface-name") and data["connection.interface-name"] != device_name:
-        LOGGER.debug(
-            "nmcli connection interface-name mismatch (expected=%s, actual=%s)",
-            device_name,
-            data["connection.interface-name"],
-        )
-
-    print("   -> nmcli settings validation passed")
 
 
 def find_vm_by_name(content, name):
@@ -1016,13 +810,6 @@ try:
                         'prefix': prefix,
                         'gateway': gateway,
                     })
-    if original_static_routes:
-        print("   取得したスタティックルート(STG):")
-        for route in original_static_routes:
-            gw_disp = route['gateway'] or '(none)'
-            print(
-                f"      - {route['network']}/{route['prefix']} via {gw_disp}"
-            )
     
     if target_vm.guest.ipStack and target_vm.guest.ipStack[0].dnsConfig:
         original_dns_servers = [dns for dns in target_vm.guest.ipStack[0].dnsConfig.ipAddress if not dns.startswith('127.')]
@@ -1204,19 +991,12 @@ try:
     print("VM をパワーオンし、ゲスト OS の IP アドレスを設定します。")
     if original_nic_info:
         new_default_gateway = calculate_ip_stg_to_prd(original_default_gateway)
-        gateway_nic_present = any(nic.get('is_gateway_nic') for nic in original_nic_info)
         prd_static_routes = determine_prd_static_routes(
             original_nic_info,
             new_default_gateway,
             original_static_routes,
         )
-        if prd_static_routes:
-            print("   -> PRD向けスタティックルート候補:")
-            for route_info in prd_static_routes:
-                owner_index = route_info.get('owner_index')
-                owner_label = f"NIC #{owner_index + 1}" if owner_index is not None else '任意のNIC'
-                print(f"      - {route_info['network']} via {route_info['gateway']} ({owner_label})")
-        configured_route_indices: Set[int] = set()
+        static_routes_configured = False
         for i, nic in enumerate(original_nic_info):
             new_ip = calculate_ip_stg_to_prd(nic['ip_address'])
             nic['prd_ip_address'] = new_ip
@@ -1332,9 +1112,6 @@ try:
             subnet_mask_parts = nic_info['subnet_mask'].split('.')
             prefix = sum([bin(int(x)).count('1') for x in subnet_mask_parts])
             new_mac = nic_info['new_mac_address']
-            expected_gateway_value = new_default_gateway if nic_info.get('is_gateway_nic') and new_default_gateway else None
-            expected_dns_servers: List[str] = []
-            applied_static_routes: List[str] = []
             
             print("\n" + "=" * 20 + f" NIC {i+1} の設定 " + "=" * 20)
             
@@ -1404,9 +1181,18 @@ try:
                     mac_targets.add(value.replace(':', ''))
                     mac_targets.add(value.replace(':', '-'))
             stale_connection_uuids = set()
-            connection_detail_cache = {}
-
+            from functools import lru_cache
+            
+            @lru_cache(maxsize=128)
             def get_connection_details(uuid_value):
+                detail_cmd = f"nmcli connection show {uuid_value}"
+                detail_exit, detail_stdout, _ = guest_command_executor(detail_cmd, check_exit_code=False)
+                return detail_exit, detail_stdout
+                    guest_command_executor (callable): A function to execute commands in the guest OS.
+            
+                Returns:
+                    tuple: A tuple containing the exit code and the stdout of the command.
+                """
                 if uuid_value in connection_detail_cache:
                     return connection_detail_cache[uuid_value]
                 detail_cmd = f"nmcli connection show {uuid_value}"
@@ -1442,7 +1228,14 @@ try:
                 if mac_targets and not (alias_match or orphaned_interface):
                     detail_exit, detail_stdout = get_connection_details(uuid)
                     if detail_exit == 0 and detail_stdout:
-                        detail_lower = detail_stdout.lower()
+                    detail_exit, detail_stdout = get_connection_details(uuid, connection_detail_cache, guest_command_executor)
+                    if detail_exit != 0:
+                        LOGGER.warning(
+                            "Failed to retrieve connection details for UUID %s. Exit code: %s",
+                            uuid,
+                            detail_exit,
+                        )
+                        continue
                         for target_mac in mac_targets:
                             if target_mac and target_mac in detail_lower:
                                 mac_match = True
@@ -1501,42 +1294,19 @@ try:
                 if new_dns_servers:
                     dns_str = ' '.join(new_dns_servers)
                     guest_command_executor(f"nmcli connection modify '{con_name}' ipv4.dns '{dns_str}'")
-                    expected_dns_servers = new_dns_servers
 
-            should_configure_routes = nic_info.get('is_gateway_nic')
-            if not should_configure_routes and new_default_gateway and new_ip:
-                try:
-                    nic_network = ipaddress.IPv4Interface(f"{new_ip}/{prefix}").network
-                    if ipaddress.IPv4Address(new_default_gateway) in nic_network:
-                        should_configure_routes = True
-                except (ValueError, ipaddress.AddressValueError):
-                    pass
-            if not should_configure_routes and not gateway_nic_present:
-                should_configure_routes = (i == 0)
-
-            if should_configure_routes and prd_static_routes:
-                added_routes = False
-                for route_idx, route_info in enumerate(prd_static_routes):
-                    owner_index = route_info.get('owner_index')
-                    if owner_index is not None and owner_index != i:
-                        continue
-                    if route_idx in configured_route_indices:
-                        continue
-                    network_cidr = route_info['network']
-                    gateway = route_info['gateway']
-                    try:
-                        network_obj = ipaddress.IPv4Network(network_cidr, strict=False)
-                        if new_ip and ipaddress.IPv4Address(new_ip) in network_obj:
-                            continue
-                    except (ValueError, ipaddress.AddressValueError):
-                        pass
-                    guest_command_executor(f"nmcli connection modify '{con_name}' +ipv4.routes '{network_cidr} {gateway}'")
-                    applied_static_routes.append(f"{network_cidr} {gateway}")
-                    configured_route_indices.add(route_idx)
-                    if not added_routes:
-                        print("   -> PRD向けスタティックルートを設定します。")
-                        added_routes = True
+            if (
+                not static_routes_configured
+                and nic_info.get('is_gateway_nic')
+                and prd_static_routes
+            ):
+                print("   -> PRD向けスタティックルートを設定します。")
+                for network_cidr, gateway in prd_static_routes:
+                    guest_command_executor(
+                        f"nmcli connection modify '{con_name}' +ipv4.routes '{network_cidr} {gateway}'"
+                    )
                     print(f"      - 追加: {network_cidr} via {gateway}")
+                static_routes_configured = True
 
             # 4. Bring up the new connection
             guest_command_executor(f"nmcli connection up '{con_name}'")
@@ -1584,26 +1354,6 @@ try:
                 else:
                     raise
         
-        expected_ip_cidr = f"{new_ip}/{prefix}" if new_ip else ""
-        try:
-            verify_nmcli_connection_settings(
-                guest_command_executor,
-                con_name,
-                device_name,
-                expected_ip_cidr,
-                expected_gateway_value,
-                applied_static_routes,
-                expected_dns_servers,
-            )
-        except RuntimeError as validation_error:
-            print(f"\n[WARN] nmcli validation failed: {validation_error}")
-            decision = input("Continue despite nmcli validation failure? (c=continue / a=abort): ").strip().lower()
-            if decision == 'c':
-                print("   -> Proceeding despite nmcli validation failure per user request.")
-            else:
-                raise
-
-        ensure_firewall_allows_ssh(guest_command_executor, SSH_ALLOWED_SOURCE_IP)
         print("   ✓ 全ての NIC の IP 設定が完了しました。")
 
     print("\n--- [Phase 7/7] Destination vCenter: Final Storage vMotion ---")
