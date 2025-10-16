@@ -78,7 +78,7 @@ class VsphereGuestNetworkSDK:
         if base.startswith("https://"):
             base = base[len("https://") :]
         self._host = base.rstrip("/")
-        self._logger = logging.getLogger(__name__)
+        self._logger = logging.getLogger("cloneAndVmotion")
         self._rest_base_url = f"https://{self._host}/rest"
         self._api_base_url = f"https://{self._host}/api"
         self._session: Session = requests.Session()
@@ -124,6 +124,12 @@ class VsphereGuestNetworkSDK:
             interfaces = payload.get("interfaces")
             if isinstance(interfaces, list):
                 return interfaces
+        self._logger.warning(
+            "Guest networking API returned no interfaces for %s (status=%s, payload=%s)",
+            vm_id,
+            response.status_code,
+            payload,
+        )
         return []
 
     def update_interface(
