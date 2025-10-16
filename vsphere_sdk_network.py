@@ -158,12 +158,33 @@ def find_interface_id_by_mac(
 ) -> Optional[str]:
     mac_normalized = (mac_address or "").lower()
     mac_compact = mac_normalized.replace(":", "").replace("-", "")
+    candidate_keys = (
+        "mac",
+        "mac_address",
+        "macAddress",
+        "hardware_address",
+        "hardwareAddress",
+    )
     for entry in interfaces:
-        entry_mac = (entry.get("mac") or "").lower()
+        entry_mac_value = ""
+        for key in candidate_keys:
+            value = entry.get(key)
+            if isinstance(value, str) and value:
+                entry_mac_value = value
+                break
+        if not entry_mac_value:
+            # Some payloads embed the MAC inside a nested "link" structure.
+            link = entry.get("link") or entry.get("link_info") or {}
+            if isinstance(link, Mapping):
+                for key in candidate_keys:
+                    value = link.get(key)
+                    if isinstance(value, str) and value:
+                        entry_mac_value = value
+                        break
+        entry_mac = (entry_mac_value or "").lower()
         if not entry_mac:
             continue
         entry_compact = entry_mac.replace(":", "").replace("-", "")
         if entry_compact == mac_compact or entry_mac == mac_normalized:
-            return entry.get("nic") or entry.get("interface")
+            return entry.get("nic") or entry.get("interface") or entry.get("id")
     return None
-
