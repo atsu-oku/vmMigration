@@ -110,8 +110,8 @@ class VsphereGuestNetworkSDK:
         self,
         vm_id: str,
         *,
-        retries: int = 5,
-        delay_seconds: float = 2.0,
+        retries: int = 12,
+        delay_seconds: float = 5.0,
     ) -> List[Mapping[str, object]]:
         """Return guest NIC metadata, polling a few times if necessary."""
         for attempt in range(1, max(1, retries) + 1):
