@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 import logging
+import time
 from typing import Iterable, List, Mapping, Optional
 
 import requests
@@ -105,30 +106,53 @@ class VsphereGuestNetworkSDK:
         finally:
             self._session.close()
 
-    def list_interfaces(self, vm_id: str) -> List[Mapping[str, object]]:
-        # Prefer the modern /api endpoint, but fall back to /rest if unavailable.
-        api_url = self._url(f"vcenter/vm/{vm_id}/guest/networking/interfaces", use_api=True)
-        response = self._session.get(api_url)
-        if response.status_code == 404:
-            rest_url = self._url(f"vcenter/vm/{vm_id}/guest/networking/interfaces")
-            response = self._session.get(rest_url)
-        self._raise_for_status(response, f"Failed to list guest interfaces for {vm_id}")
-        payload = response.json()
-        self._logger.debug("Guest networking API response: %s", payload)
-        if isinstance(payload, list):
-            return payload
-        if isinstance(payload, dict):
-            value = payload.get("value")
-            if isinstance(value, list):
-                return value
-            interfaces = payload.get("interfaces")
-            if isinstance(interfaces, list):
+    def list_interfaces(
+        self,
+        vm_id: str,
+        *,
+        retries: int = 5,
+        delay_seconds: float = 2.0,
+    ) -> List[Mapping[str, object]]:
+        """Return guest NIC metadata, polling a few times if necessary."""
+        for attempt in range(1, max(1, retries) + 1):
+            api_url = self._url(f"vcenter/vm/{vm_id}/guest/networking/interfaces", use_api=True)
+            response = self._session.get(api_url)
+            if response.status_code == 404:
+                rest_url = self._url(f"vcenter/vm/{vm_id}/guest/networking/interfaces")
+                response = self._session.get(rest_url)
+            self._raise_for_status(response, f"Failed to list guest interfaces for {vm_id}")
+            payload = response.json()
+            self._logger.debug(
+                "Guest networking API attempt %s/%s response: %s",
+                attempt,
+                retries,
+                payload,
+            )
+            interfaces: List[Mapping[str, object]] = []
+            if isinstance(payload, list):
+                interfaces = payload
+            elif isinstance(payload, dict):
+                value = payload.get("value")
+                if isinstance(value, list):
+                    interfaces = value
+                else:
+                    alt = payload.get("interfaces") or payload.get("items")
+                    if isinstance(alt, list):
+                        interfaces = alt
+            if interfaces:
                 return interfaces
+            if attempt < retries:
+                self._logger.debug(
+                    "Guest networking API returned no NICs for %s (attempt %s); retrying in %.1fs",
+                    vm_id,
+                    attempt,
+                    delay_seconds,
+                )
+                time.sleep(max(0.0, delay_seconds))
         self._logger.warning(
-            "Guest networking API returned no interfaces for %s (status=%s, payload=%s)",
+            "Guest networking API returned no interfaces for %s after %s attempts.",
             vm_id,
-            response.status_code,
-            payload,
+            retries,
         )
         return []
 
