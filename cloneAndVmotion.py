@@ -50,7 +50,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-LOGGER = logging.getLogger("gptCloneAndVmotion")
+LOGGER = logging.getLogger("cloneAndVmotion")
 LOGGER.setLevel(LOG_LEVEL)
 
 ROOT_LOGIN_DISABLED = False

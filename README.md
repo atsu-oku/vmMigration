@@ -1,6 +1,6 @@
 # vSphere 自動化スクリプト
 
-`gptCloneAndVmotion.py` は、vSphere 上で STG 環境の VM をクローンし、宛先 vCenter/ネットワークへ登録・再構成したうえで、PRD 用データストアへ Storage vMotion で移行する作業を自動化するスクリプトです。ゲスト OS のネットワーク設定は `nmcli` を用いて自動適用・検証します。
+`cloneAndVmotion.py` は、vSphere 上で STG 環境の VM をクローンし、宛先 vCenter/ネットワークへ登録・再構成したうえで、PRD 用データストアへ Storage vMotion で移行する作業を自動化するスクリプトです。ゲスト OS のネットワーク設定は `nmcli` を用いて自動適用・検証します。
 
 ---
 
@@ -12,7 +12,7 @@
   - `cd vmMigration`
   - `python -m pip install --upgrade pip`
   - `pip install -r requirements.txt`
-  - `python gptCloneAndVmotion.py`
+  - `python cloneAndVmotion.py`
 - macOS/Linux（bash）
   - `python3 -m venv .venv`
   - `source .venv/bin/activate`
@@ -20,9 +20,9 @@
   - `cd vmMigration`
   - `python -m pip install --upgrade pip`
   - `pip install -r requirements.txt`
-  - `python gptCloneAndVmotion.py`
+  - `python cloneAndVmotion.py`
 
-代替の手順（clone → venv）は `SETUP.md` に記載しています。
+代替の手順（clone → venv）は `SETUP.md` を参照してください。
 
 ---
 
@@ -50,7 +50,7 @@
 5. 一時配置から最終 PRD 用データストアへ Storage vMotion で移行
 
 ## 使い方（対話の流れ）
-- 実行: `python gptCloneAndVmotion.py`
+- 実行: `python cloneAndVmotion.py`
 - 対話で以下を入力
   - ソース/宛先 vCenter の認証情報
   - 移行対象 VM 名
