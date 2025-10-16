@@ -1,10 +1,10 @@
-# vSphere è‡ªå‹•åŒ–ã‚¹ã‚¯ãƒªãƒ—ãƒˆ
+# vSphere Ž©“®‰»ƒXƒNƒŠƒvƒg
 
-`cloneAndVmotion.py` ã¯ã€vSphere ä¸Šã§ STG ç’°å¢ƒã® VM ã‚’ã‚¯ãƒ­ãƒ¼ãƒ³ã—ã€å®›å…ˆ vCenter/ãƒãƒƒãƒˆãƒ¯ãƒ¼ã‚¯ã¸ç™»éŒ²ãƒ»å†æ§‹æˆã—ãŸã†ãˆã§ã€PRD ç”¨ãƒ‡ãƒ¼ã‚¿ã‚¹ãƒˆã‚¢ã¸ Storage vMotion ã§ç§»è¡Œã™ã‚‹ä½œæ¥­ã‚’è‡ªå‹•åŒ–ã™ã‚‹ã‚¹ã‚¯ãƒªãƒ—ãƒˆã§ã™ã€‚ã‚²ã‚¹ãƒˆ OS ã®ãƒãƒƒãƒˆãƒ¯ãƒ¼ã‚¯è¨­å®šã¯ `nmcli` ã‚’ç”¨ã„ã¦è‡ªå‹•é©ç”¨ãƒ»æ¤œè¨¼ã—ã¾ã™ã€‚
+`cloneAndVmotion.py` ‚ÍAvSphere ã‚Å STG ŠÂ‹«‚Ì VM ‚ðƒNƒ[ƒ“‚µAˆ¶æ vCenter/ƒlƒbƒgƒ[ƒN‚Ö“o˜^EÄ\¬‚µ‚½‚¤‚¦‚ÅAPRD —pƒf[ƒ^ƒXƒgƒA‚Ö Storage vMotion ‚ÅˆÚs‚·‚éì‹Æ‚ðŽ©“®‰»‚·‚éƒXƒNƒŠƒvƒg‚Å‚·BƒQƒXƒg OS ‚Ìƒlƒbƒgƒ[ƒNÝ’è‚Í `nmcli` ‚ð—p‚¢‚ÄŽ©“®“K—pEŒŸØ‚µ‚Ü‚·B
 
 ---
 
-## ã‚¯ã‚¤ãƒƒã‚¯ã‚¹ã‚¿ãƒ¼ãƒˆï¼ˆæŽ¨å¥¨: venv â†’ cloneï¼‰
+## ƒNƒCƒbƒNƒXƒ^[ƒgi„§: venv ¨ clonej
 - Windows/PowerShell
   - `python -m venv .venv`
   - `.\\.venv\\Scripts\\Activate`
@@ -13,7 +13,7 @@
   - `python -m pip install --upgrade pip`
   - `pip install -r requirements.txt`
   - `python cloneAndVmotion.py`
-- macOS/Linuxï¼ˆbashï¼‰
+- macOS/Linuxibashj
   - `python3 -m venv .venv`
   - `source .venv/bin/activate`
   - `git clone https://github.com/atsu-oku/vmMigration.git`
@@ -22,48 +22,48 @@
   - `pip install -r requirements.txt`
   - `python cloneAndVmotion.py`
 
-ä»£æ›¿ã®æ‰‹é †ï¼ˆclone â†’ venvï¼‰ã¯ `SETUP.md` ã‚’å‚ç…§ã—ã¦ãã ã•ã„ã€‚
+‘ã‘Ö‚ÌŽè‡iclone ¨ venvj‚Í `SETUP.md` ‚ðŽQÆ‚µ‚Ä‚­‚¾‚³‚¢B
 
 ---
 
-## ç‰¹é•·
-- ã‚¯ãƒ­ãƒ¼ãƒ³ â†’ å®›å…ˆ vCenter ç™»éŒ² â†’ NIC å†æ§‹æˆ â†’ IP/GW/DNS/ãƒ«ãƒ¼ãƒˆé©ç”¨ â†’ Storage vMotion ã¾ã§è‡ªå‹•åŒ–
-- è¨­å®šå¾Œã¯ `nmcli` ã§æ¤œè¨¼ã—ã€ä¸æ•´åˆãŒã‚ã‚Œã°è­¦å‘Š
-- ã‚¨ãƒ©ãƒ¼æ™‚ã¯ãƒ­ãƒ¼ãƒ«ãƒãƒƒã‚¯ï¼ˆã‚¯ãƒ­ãƒ¼ãƒ³å‰Šé™¤ãƒ»ä¸è¦ãƒ•ã‚¡ã‚¤ãƒ«å‰Šé™¤ ãªã©ï¼‰ã‚’ææ¡ˆ
+## “Á’·
+- ƒNƒ[ƒ“ ¨ ˆ¶æ vCenter “o˜^ ¨ NIC Ä\¬ ¨ IP/GW/DNS/ƒ‹[ƒg“K—p ¨ Storage vMotion ‚Ü‚ÅŽ©“®‰»
+- Ý’èŒã‚Í `nmcli` ‚ÅŒŸØ‚µA•s®‡‚ª‚ ‚ê‚ÎŒx
+- ƒGƒ‰[Žž‚Íƒ[ƒ‹ƒoƒbƒNiƒNƒ[ƒ“íœE•s—vƒtƒ@ƒCƒ‹íœ ‚È‚Çj‚ð’ñˆÄ
 
-## å¯¾å¿œç’°å¢ƒãƒ»å‰æ
-- vCenter ã« API åˆ°é”ã§ãã‚‹ã“ã¨
-- å¯¾è±¡ VM ã« VMware Tools ãŒå°Žå…¥ãƒ»ç¨¼åƒã—ã€Guest Operations ãŒåˆ©ç”¨å¯èƒ½
-- ã‚²ã‚¹ãƒˆ OS å´ã§ `nmcli`ï¼ˆNetworkManagerï¼‰ãŒåˆ©ç”¨å¯èƒ½ï¼ˆä¸»ã« Linuxï¼‰
-- Python 3.11 ä»¥é™
+## ‘Î‰žŠÂ‹«E‘O’ñ
+- vCenter ‚É API “ž’B‚Å‚«‚é‚±‚Æ
+- ‘ÎÛ VM ‚É VMware Tools ‚ª“±“üE‰Ò“­‚µAGuest Operations ‚ª—˜—p‰Â”\
+- ƒQƒXƒg OS ‘¤‚Å `nmcli`iNetworkManagerj‚ª—˜—p‰Â”\iŽå‚É Linuxj
+- Python 3.11 ˆÈ~
 
-## ä¾å­˜ãƒ¢ã‚¸ãƒ¥ãƒ¼ãƒ«
+## ˆË‘¶ƒ‚ƒWƒ…[ƒ‹
 - pyvmomi
 - requests
-- è©³ç´°ã¯ `requirements.txt` ã¨ `SETUP.md` ã‚’å‚ç…§
+- Ú×‚Í `requirements.txt` ‚Æ `SETUP.md` ‚ðŽQÆ
 
-## å®Ÿè¡Œãƒ•ãƒ­ãƒ¼ï¼ˆæ¦‚è¦ï¼‰
-1. ã‚½ãƒ¼ã‚¹ vCenter ã‹ã‚‰å¯¾è±¡ VM ã® NIC æƒ…å ±ã€GWã€DNS ãªã©ã‚’å–å¾—
-2. ä¸€æ™‚ãƒ‡ãƒ¼ã‚¿ã‚¹ãƒˆã‚¢ã¸ã‚¯ãƒ­ãƒ¼ãƒ³ä½œæˆï¼ˆã‚¯ãƒ­ãƒ¼ãƒ³å´ NIC ã‚’åˆæœŸåŒ–/èª¿æ•´ï¼‰
-3. å®›å…ˆ vCenter ã¸ç™»éŒ²ã—ã€PRD ãƒãƒƒãƒˆãƒ¯ãƒ¼ã‚¯ã«åˆã‚ã›ã¦ NIC å†æ§‹æˆ
-4. ã‚²ã‚¹ãƒˆ OS å´ã§ `nmcli` ã«ã‚ˆã‚Š IP/GW/DNS/ãƒ«ãƒ¼ãƒˆã‚’é©ç”¨ãƒ»æ¤œè¨¼
-5. ä¸€æ™‚é…ç½®ã‹ã‚‰æœ€çµ‚ PRD ç”¨ãƒ‡ãƒ¼ã‚¿ã‚¹ãƒˆã‚¢ã¸ Storage vMotion ã§ç§»è¡Œ
+## ŽÀsƒtƒ[iŠT—vj
+1. ƒ\[ƒX vCenter ‚©‚ç‘ÎÛ VM ‚Ì NIC î•ñAGWADNS ‚È‚Ç‚ðŽæ“¾
+2. ˆêŽžƒf[ƒ^ƒXƒgƒA‚ÖƒNƒ[ƒ“ì¬iƒNƒ[ƒ“‘¤ NIC ‚ð‰Šú‰»/’²®j
+3. ˆ¶æ vCenter ‚Ö“o˜^‚µAPRD ƒlƒbƒgƒ[ƒN‚É‡‚í‚¹‚Ä NIC Ä\¬
+4. ƒQƒXƒg OS ‘¤‚Å `nmcli` ‚É‚æ‚è IP/GW/DNS/ƒ‹[ƒg‚ð“K—pEŒŸØ
+5. ˆêŽž”z’u‚©‚çÅI PRD —pƒf[ƒ^ƒXƒgƒA‚Ö Storage vMotion ‚ÅˆÚs
 
-## ä½¿ã„æ–¹ï¼ˆå¯¾è©±ã®æµã‚Œï¼‰
-- å®Ÿè¡Œ: `python cloneAndVmotion.py`
-- å¯¾è©±ã§ä»¥ä¸‹ã‚’å…¥åŠ›
-  - ã‚½ãƒ¼ã‚¹/å®›å…ˆ vCenter ã®èªè¨¼æƒ…å ±
-  - ç§»è¡Œå¯¾è±¡ VM å
-  - ã‚²ã‚¹ãƒˆ OS ã®èªè¨¼æƒ…å ±ï¼ˆroot ã¾ãŸã¯ sudo å¯èƒ½ãª adminï¼‰
-- å„ãƒ•ã‚§ãƒ¼ã‚ºã§ç¢ºèªãƒ¡ãƒƒã‚»ãƒ¼ã‚¸ãŒè¡¨ç¤ºã•ã‚Œã€`y` ã§ç¶šè¡Œ
+## Žg‚¢•ûi‘Î˜b‚Ì—¬‚êj
+- ŽÀs: `python cloneAndVmotion.py`
+- ‘Î˜b‚ÅˆÈ‰º‚ð“ü—Í
+  - ƒ\[ƒX/ˆ¶æ vCenter ‚Ì”FØî•ñ
+  - ˆÚs‘ÎÛ VM –¼
+  - ƒQƒXƒg OS ‚Ì”FØî•ñiroot ‚Ü‚½‚Í sudo ‰Â”\‚È adminj
+- ŠeƒtƒF[ƒY‚ÅŠm”FƒƒbƒZ[ƒW‚ª•\Ž¦‚³‚êA`y` ‚Å‘±s
 
-## ãƒˆãƒ©ãƒ–ãƒ«ã‚·ãƒ¥ãƒ¼ãƒ†ã‚£ãƒ³ã‚°
-- ç–Žé€šå¤±æ•—: ãƒãƒƒãƒˆãƒ¯ãƒ¼ã‚¯ãƒãƒªã‚·ãƒ¼/ãƒ•ã‚¡ã‚¤ã‚¢ã‚¦ã‚©ãƒ¼ãƒ«ã§ ICMP ãŒé®æ–­ã•ã‚Œã¦ã„ãªã„ã‹ç¢ºèª
-- èªè¨¼å¤±æ•—: VMware Tools å´ã§å¯¾è±¡ã‚¢ã‚«ã‚¦ãƒ³ãƒˆã« Guest Operations æ¨©é™ãŒã‚ã‚‹ã‹ç¢ºèª
-- è©³ç´°ãƒ­ã‚°: `VSPHERE_CLONE_LOG_LEVEL=DEBUG` ã‚’è¨­å®š
+## ƒgƒ‰ƒuƒ‹ƒVƒ…[ƒeƒBƒ“ƒO
+- ‘a’ÊŽ¸”s: ƒlƒbƒgƒ[ƒNƒ|ƒŠƒV[/ƒtƒ@ƒCƒAƒEƒH[ƒ‹‚Å ICMP ‚ªŽÕ’f‚³‚ê‚Ä‚¢‚È‚¢‚©Šm”F
+- ”FØŽ¸”s: VMware Tools ‘¤‚Å‘ÎÛƒAƒJƒEƒ“ƒg‚É Guest Operations Œ ŒÀ‚ª‚ ‚é‚©Šm”F
+- Ú×ƒƒO: `VSPHERE_CLONE_LOG_LEVEL=DEBUG` ‚ðÝ’è
 
-## é–‹ç™ºãƒ¡ãƒ¢
-- ä¾å­˜ã¯ `requirements.txt` ã«è¨˜è¼‰ï¼ˆ`pip install -r requirements.txt`ï¼‰
-- è©³ç´°ãªã‚»ãƒƒãƒˆã‚¢ãƒƒãƒ—ã¯ `SETUP.md` ã‚’å‚ç…§
-- Issue/PR ã«ã‚ˆã‚‹æ”¹å–„ææ¡ˆã‚’æ­“è¿Ž
+## ŠJ”­ƒƒ‚
+- ˆË‘¶‚Í `requirements.txt` ‚É‹LÚi`pip install -r requirements.txt`j
+- Ú×‚ÈƒZƒbƒgƒAƒbƒv‚Í `SETUP.md` ‚ðŽQÆ
+- Issue/PR ‚É‚æ‚é‰ü‘P’ñˆÄ‚ðŠ½Œ}
 
