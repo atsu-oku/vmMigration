@@ -77,7 +77,8 @@ class VsphereGuestNetworkSDK:
         if base.startswith("https://"):
             base = base[len("https://") :]
         self._host = base.rstrip("/")
-        self._base_url = f"https://{self._host}/rest"
+        self._rest_base_url = f"https://{self._host}/rest"
+        self._api_base_url = f"https://{self._host}/api"
         self._session: Session = requests.Session()
         self._session.verify = verify_ssl
         if not verify_ssl:
@@ -102,11 +103,24 @@ class VsphereGuestNetworkSDK:
             self._session.close()
 
     def list_interfaces(self, vm_id: str) -> List[Mapping[str, object]]:
-        url = self._url(f"vcenter/vm/{vm_id}/guest/networking/interfaces")
-        response = self._session.get(url)
+        # Prefer the modern /api endpoint, but fall back to /rest if unavailable.
+        api_url = self._url(f"vcenter/vm/{vm_id}/guest/networking/interfaces", use_api=True)
+        response = self._session.get(api_url)
+        if response.status_code == 404:
+            rest_url = self._url(f"vcenter/vm/{vm_id}/guest/networking/interfaces")
+            response = self._session.get(rest_url)
         self._raise_for_status(response, f"Failed to list guest interfaces for {vm_id}")
         payload = response.json()
-        return payload.get("value", [])
+        if isinstance(payload, list):
+            return payload
+        if isinstance(payload, dict):
+            value = payload.get("value")
+            if isinstance(value, list):
+                return value
+            interfaces = payload.get("interfaces")
+            if isinstance(interfaces, list):
+                return interfaces
+        return []
 
     def update_interface(
         self,
@@ -127,16 +141,25 @@ class VsphereGuestNetworkSDK:
         if route_items:
             spec.setdefault("ipv4", {}).setdefault("routes", route_items)
         payload = {"spec": spec}
-        url = self._url(f"vcenter/vm/{vm_id}/guest/networking/interfaces/{nic_id}?action=update")
-        response = self._session.post(url, data=json.dumps(payload))
+        api_url = self._url(
+            f"vcenter/vm/{vm_id}/guest/networking/interfaces/{nic_id}?action=update",
+            use_api=True,
+        )
+        response = self._session.post(api_url, json=payload)
+        if response.status_code == 404:
+            rest_url = self._url(
+                f"vcenter/vm/{vm_id}/guest/networking/interfaces/{nic_id}?action=update"
+            )
+            response = self._session.post(rest_url, data=json.dumps(payload))
         self._raise_for_status(
             response,
             f"Failed to update guest interface {nic_id} for VM {vm_id}",
         )
 
-    def _url(self, suffix: str) -> str:
+    def _url(self, suffix: str, *, use_api: bool = False) -> str:
         trimmed = suffix[1:] if suffix.startswith("/") else suffix
-        return f"{self._base_url}/{trimmed}"
+        base = self._api_base_url if use_api else self._rest_base_url
+        return f"{base}/{trimmed}"
 
     @staticmethod
     def _raise_for_status(response: requests.Response, message: str) -> None:
