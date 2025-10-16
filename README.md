@@ -30,6 +30,7 @@
 - クローン → 宛先 vCenter 登録 → NIC 再構成 → IP/GW/DNS/ルート適用 → Storage vMotion まで自動化
 - 設定後は `nmcli` で検証し、不整合があれば警告
 - エラー時はロールバック（クローン削除・不要ファイル削除 など）を提案
+- Uses the vSphere Automation SDK REST API for guest IPv4/DNS provisioning (falls back to nmcli when unavailable).
 
 ## 対応環境・前提
 - vCenter に API 到達できること
