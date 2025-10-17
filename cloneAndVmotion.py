@@ -465,10 +465,18 @@ def ensure_firewall_allows_ssh(command_executor, source_ip):
         LOGGER.debug("Failed to add firewalld rich rule: %s", cmd_err)
     exit_code, _, _ = command_executor("command -v iptables", check_exit_code=False)
     if exit_code == 0:
-        health_code, _, health_err = command_executor("iptables -S", check_exit_code=False)
+        health_code, iptables_state, health_err = command_executor("iptables -S", check_exit_code=False)
         if health_code != 0:
             LOGGER.debug("iptables sanity check failed: %s", health_err)
         else:
+            if not firewalld_active:
+                lines = [line.strip() for line in (iptables_state or "").splitlines() if line.strip()]
+                policy_lines = [line for line in lines if line.startswith("-P ")]
+                rule_lines = [line for line in lines if line.startswith("-A ") or line.startswith("-I ")]
+                policies_accept = policy_lines and all(line.upper().endswith(" ACCEPT") for line in policy_lines)
+                if policies_accept and not rule_lines:
+                    print("      - firewalld inactive and iptables policies ACCEPT; no firewall changes needed.")
+                    return
             check_rule_cmd = (
                 f"iptables -C INPUT -p tcp -s {source_ip} --dport 22 -j ACCEPT"
             )
