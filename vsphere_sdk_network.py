@@ -214,6 +214,7 @@ class VsphereGuestNetworkSDK:
             dns_payload = dns.as_dict()
             if dns_payload:
                 spec["dns"] = dns_payload
+        spec["ipv6"] = {"type": "DISABLED"}
         route_items = [route.as_dict() for route in routes or [] if route.network and route.gateway]
         if route_items:
             spec.setdefault("ipv4", {}).setdefault("routes", route_items)

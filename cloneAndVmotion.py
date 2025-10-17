@@ -525,6 +525,8 @@ def configure_interface_without_nmcli(
         "set -e",
         f"ip link set {device_name} down || true",
         f"ip addr flush dev {device_name} || true",
+        f"ip -6 addr flush dev {device_name} || true",
+        f"sysctl -w net.ipv6.conf.{device_name}.disable_ipv6=1 || true",
         f"ip addr add {new_ip}/{prefix} dev {device_name}",
         f"ip link set {device_name} up",
     ]
@@ -1941,7 +1943,14 @@ try:
                             for uuid in sorted(stale_connection_uuids):
                                 guest_command_executor(f"nmcli connection delete uuid {uuid}")
                         guest_command_executor(f"nmcli connection add type ethernet con-name '{con_name}' ifname '{device_name}'")
-                        guest_command_executor(f"nmcli connection modify '{con_name}' ipv4.method manual ipv4.addresses '{new_ip}/{prefix}'")
+                        guest_command_executor(f"nmcli connection modify '{con_name}' ipv4.method manual")
+                        guest_command_executor(f"nmcli connection modify '{con_name}' ipv6.method disabled", check_exit_code=False)
+                        guest_command_executor(f"nmcli connection modify '{con_name}' ipv6.never-default yes", check_exit_code=False)
+                        guest_command_executor(f"nmcli connection modify '{con_name}' ipv6.addresses ''", check_exit_code=False)
+                        guest_command_executor(f"nmcli connection modify '{con_name}' ipv6.routes ''", check_exit_code=False)
+                        guest_command_executor(f"nmcli connection modify '{con_name}' ipv6.dns ''", check_exit_code=False)
+                        if new_ip and prefix:
+                            guest_command_executor(f"nmcli connection modify '{con_name}' ipv4.addresses '{new_ip}/{prefix}'")
                         if nic_info.get('is_gateway_nic') and new_default_gateway:
                             guest_command_executor(f"nmcli connection modify '{con_name}' ipv4.gateway '{new_default_gateway}'")
                         if new_dns_servers:
@@ -2013,7 +2022,8 @@ try:
             # 4. Bring up the new connection
             if use_nmcli_connection:
                 guest_command_executor(f"nmcli connection up '{con_name}'")
-            
+            guest_command_executor(f"ip -6 addr flush dev {device_name}", check_exit_code=False)
+
             # 4.5. Broadcast gratuitous ARP to refresh neighbor caches
             if new_ip:
                 arping_commands = [
