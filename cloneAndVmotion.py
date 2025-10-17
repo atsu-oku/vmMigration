@@ -341,6 +341,34 @@ def _select_default_gateway_route(
     return best_match or fallback
 
 
+def _select_even_octet_gateway(nic_records: List[Dict[str, Any]]) -> Optional[Tuple[str, int]]:
+    """Choose a gateway from NICs whose STG third octet is even (PRD 側で偶数になる)."""
+    for idx, nic in enumerate(nic_records):
+        ip_addr = nic.get("ip_address")
+        subnet_mask = nic.get("subnet_mask")
+        if not ip_addr or not subnet_mask:
+            continue
+        try:
+            third_octet = int(ip_addr.split(".")[2])
+        except (ValueError, IndexError):
+            continue
+        if third_octet % 2 != 0:
+            continue
+        try:
+            iface = ipaddress.IPv4Interface(f"{ip_addr}/{subnet_mask}")
+        except (ValueError, ipaddress.AddressValueError):
+            continue
+        hosts_iter = iface.network.hosts()
+        try:
+            gateway_addr = next(hosts_iter)
+            if str(gateway_addr) == ip_addr:
+                gateway_addr = next(hosts_iter)
+        except StopIteration:
+            continue
+        return str(gateway_addr), idx
+    return None
+
+
 def _derive_fallback_gateway(nic_records: List[Dict[str, Any]]) -> Optional[Tuple[str, int]]:
     """Derive a plausible STG default gateway and owning NIC when none was supplied."""
     candidate: Optional[Tuple[str, int]] = None
@@ -1559,9 +1587,10 @@ try:
                         'gateway': gateway,
                     })
     if original_default_gateway is None:
-        fallback_gateway = _derive_fallback_gateway(original_nic_info)
-        if fallback_gateway:
-            original_default_gateway, gateway_owner_idx = fallback_gateway
+        even_gateway = _select_even_octet_gateway(original_nic_info)
+        chosen_gateway = even_gateway or _derive_fallback_gateway(original_nic_info)
+        if chosen_gateway:
+            original_default_gateway, gateway_owner_idx = chosen_gateway
             for idx, nic in enumerate(original_nic_info):
                 nic['is_gateway_nic'] = (idx == gateway_owner_idx)
             print(f"   -> デフォルトゲートウェイが未設定のため {original_default_gateway} (NIC {gateway_owner_idx + 1}) を推測しました。")
