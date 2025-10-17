@@ -311,6 +311,7 @@ def _select_default_gateway_route(
     """Choose the most appropriate default gateway entry among the provided candidates."""
     best_match: Optional[Tuple[str, int]] = None
     fallback: Optional[Tuple[str, int]] = None
+    multiple_candidates = len([route for route in candidates if route.get("gateway")]) > 1
     for candidate in candidates:
         gateway = candidate.get("gateway")
         if not gateway:
@@ -338,7 +339,7 @@ def _select_default_gateway_route(
             derived_owner = owner_idx if owner_idx is not None else _find_gateway_owner_index(nic_records, gateway)
             if derived_owner is not None:
                 fallback = (gateway, derived_owner)
-    return best_match or fallback
+    return (best_match or fallback) if not multiple_candidates else None
 
 
 def _select_even_octet_gateway(nic_records: List[Dict[str, Any]]) -> Optional[Tuple[str, int]]:
@@ -1593,7 +1594,6 @@ try:
             if route.network == '0.0.0.0' and route.prefixLength == 0:
                 original_default_gateway = route.gateway.ipAddress
                 print(f"   デフォルトゲートウェイ '{original_default_gateway}' を取得しました。")
-                # ゲートウェイがどのNICに属するかを判定
                 for idx, nic in enumerate(original_nic_info):
                     try:
                         nic_iface = ipaddress.IPv4Interface(f"{nic['ip_address']}/{nic['subnet_mask']}")
@@ -1616,15 +1616,15 @@ try:
                         'prefix': prefix,
                         'gateway': gateway,
                     })
-    if original_default_gateway is None:
-        inferred_gateway = _infer_gateway_from_routes(original_nic_info, original_static_routes)
-        even_gateway = _select_even_octet_gateway(original_nic_info)
-        chosen_gateway = inferred_gateway or even_gateway or _derive_fallback_gateway(original_nic_info)
-        if chosen_gateway:
-            original_default_gateway, gateway_owner_idx = chosen_gateway
-            for idx, nic in enumerate(original_nic_info):
-                nic['is_gateway_nic'] = (idx == gateway_owner_idx)
-            print(f"   -> デフォルトゲートウェイが未設定のため {original_default_gateway} (NIC {gateway_owner_idx + 1}) を推測しました。")
+
+    inferred_gateway = _infer_gateway_from_routes(original_nic_info, original_static_routes)
+    even_gateway = _select_even_octet_gateway(original_nic_info)
+    chosen_gateway = inferred_gateway or even_gateway or _derive_fallback_gateway(original_nic_info)
+    if chosen_gateway:
+        original_default_gateway, gateway_owner_idx = chosen_gateway
+        for idx, nic in enumerate(original_nic_info):
+            nic['is_gateway_nic'] = (idx == gateway_owner_idx)
+        print(f"   -> デフォルトゲートウェイが未設定のため {original_default_gateway} (NIC {gateway_owner_idx + 1}) を推測しました。")
 
     if original_static_routes:
         print("   取得したスタティックルート(STG):")
