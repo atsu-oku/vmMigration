@@ -426,13 +426,22 @@ def ensure_firewall_allows_ssh(command_executor, source_ip):
     firewalld_active = False
     exit_code, _, _ = command_executor("command -v systemctl", check_exit_code=False)
     if exit_code == 0:
-        exit_code, firewalld_state, _ = command_executor(
-            "systemctl show firewalld.service --property=ActiveState --value",
-            check_exit_code=False,
-        )
-        if exit_code == 0:
-            firewalld_active = firewalld_state.strip().lower() == 'active'
-        else:
+        firewalld_state_output = ""
+        for show_cmd in (
+            "systemctl show firewalld.service --property=ActiveState",
+            "systemctl show firewalld.service",
+        ):
+            show_exit, show_stdout, _ = command_executor(show_cmd, check_exit_code=False)
+            if show_exit == 0 and show_stdout:
+                firewalld_state_output = show_stdout
+                break
+        if firewalld_state_output:
+            for line in firewalld_state_output.splitlines():
+                if line.lower().startswith("activestate="):
+                    state_value = line.split("=", 1)[1].strip().lower()
+                    firewalld_active = state_value == "active"
+                    break
+        if not firewalld_active:
             exit_code, firewalld_status, _ = command_executor(
                 "systemctl is-active firewalld",
                 check_exit_code=False,
