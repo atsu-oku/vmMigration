@@ -369,6 +369,36 @@ def _select_even_octet_gateway(nic_records: List[Dict[str, Any]]) -> Optional[Tu
     return None
 
 
+def _infer_gateway_from_routes(
+    nic_records: List[Dict[str, Any]],
+    static_routes: List[Dict[str, Any]],
+) -> Optional[Tuple[str, int]]:
+    """Infer a default gateway by analysing non-default static routes pointing at remote gateways."""
+    usage: Dict[Tuple[str, int], int] = {}
+    for route in static_routes:
+        gateway = route.get("gateway")
+        if not gateway:
+            continue
+        owner_idx = route.get("owner_index")
+        if owner_idx is not None and not (0 <= owner_idx < len(nic_records)):
+            owner_idx = None
+        if owner_idx is None:
+            owner_idx = _find_gateway_owner_index(nic_records, gateway)
+        if owner_idx is None:
+            continue
+        key = (gateway, owner_idx)
+        usage[key] = usage.get(key, 0) + 1
+    if not usage:
+        return None
+    # Stable ordering: highest usage first, then lowest owner index, lastly lexical gateway
+    sorted_usage = sorted(
+        usage.items(),
+        key=lambda item: (-item[1], item[0][1], item[0][0]),
+    )
+    (gateway, owner_idx), _ = sorted_usage[0]
+    return gateway, owner_idx
+
+
 def _derive_fallback_gateway(nic_records: List[Dict[str, Any]]) -> Optional[Tuple[str, int]]:
     """Derive a plausible STG default gateway and owning NIC when none was supplied."""
     candidate: Optional[Tuple[str, int]] = None
@@ -1587,8 +1617,9 @@ try:
                         'gateway': gateway,
                     })
     if original_default_gateway is None:
+        inferred_gateway = _infer_gateway_from_routes(original_nic_info, original_static_routes)
         even_gateway = _select_even_octet_gateway(original_nic_info)
-        chosen_gateway = even_gateway or _derive_fallback_gateway(original_nic_info)
+        chosen_gateway = inferred_gateway or even_gateway or _derive_fallback_gateway(original_nic_info)
         if chosen_gateway:
             original_default_gateway, gateway_owner_idx = chosen_gateway
             for idx, nic in enumerate(original_nic_info):
