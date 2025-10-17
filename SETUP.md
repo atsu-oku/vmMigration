@@ -1,35 +1,35 @@
-# �Z�b�g�A�b�v�K�C�h
+# セットアップガイド
 
-## ���|�W�g���擾 (git clone)
-���̃��|�W�g���́A���z���ivenv�j�̍쐬�����ɂ��2�ʂ�̐i�ߕ�������܂��B�g�D�|���V�[�Łuvenv ���ɍ쐬�v�����߂���ꍇ�̓p�^�[��B���g�p���Ă��������B
+## リポジトリ取得 (git clone)
+このリポジトリは、仮想環境（venv）の作成順序により2通りの進め方があります。組織ポリシーで「venv を先に作成」が求められる場合はパターンBを使用してください。
 
-�p�^�[��A: ��� clone�i��ʓI�ȗ���j
+パターンA: 先に clone（一般的な流れ）
 - HTTPS: `git clone https://github.com/atsu-oku/vmMigration.git`
 - SSH: `git clone git@github.com:atsu-oku/vmMigration.git`
-- �f�B���N�g���ֈړ�: `cd vmMigration`
+- ディレクトリへ移動: `cd vmMigration`
 
-�p�^�[��B: ��� venv ���쐬�E�L�������Ă��� clone�i�|���V�[�����j
-- Windows/PowerShell�i��j
+パターンB: 先に venv を作成・有効化してから clone（ポリシー準拠）
+- Windows/PowerShell（例）
   - `python -m venv .venv`
   - `.\\.venv\\Scripts\\Activate`
   - `git clone https://github.com/atsu-oku/vmMigration.git`
   - `cd vmMigration`
   - `pip install -r requirements.txt`
-- macOS/Linux�ibash�j
+- macOS/Linux（bash）
   - `python3 -m venv .venv`
   - `source .venv/bin/activate`
   - `git clone https://github.com/atsu-oku/vmMigration.git`
   - `cd vmMigration`
   - `pip install -r requirements.txt`
 
-**�O�����**
-- Python 3.11 �ȏ�
-- vCenter API �֓��B�\�ȃl�b�g���[�N��
-- �Ώ� VM �� VMware Tools �������E�ғ����AGuest Operations �����p�\
-- �Q�X�g OS �� `nmcli`�iNetworkManager�j�����p�\�i��� Linux�j
+**前提条件**
+- Python 3.11 以上
+- vCenter API へ到達可能なネットワーク環境
+- 対象 VM に VMware Tools が導入・稼働し、Guest Operations が利用可能
+- ゲスト OS に `nmcli`（NetworkManager）が利用可能（主に Linux）。未導入でも動作はしますが、レガシー設定手順にフォールバックするため検証範囲が限定されます。
 
-**�C���X�g�[���i����: ���z�� venv�j**
-- �ˑ����W���[���� `requirements.txt` �ŊǗ����܂��B
+**インストール（推奨: 仮想環境 venv）**
+- 依存モジュールは `requirements.txt` で管理します。
 - PowerShell (Windows)
   - `python -m venv .venv`
   - `.\\.venv\\Scripts\\Activate`
@@ -41,37 +41,38 @@
   - `python -m pip install --upgrade pip`
   - `pip install -r requirements.txt`
 
-**�O���[�o�����ł̃Z�b�g�A�b�v�ivenv ���g��Ȃ��ꍇ�j**
-- ���� Python ���O���[�o���ɓ������Ă���ꍇ�ł��A�\�Ȃ烆�[�U�[�̈�ɃC���X�g�[�����Ă��������i�����Փ˂⑼�v���W�F�N�g�ւ̉e��������邽�߁j�B
-- Windows�iPowerShell�j
-  - Python �m�F: `python --version` �܂��� `py -3.11 --version`
-  - ���[�U�[�̈�֓���: `python -m pip install --user -r requirements.txt`
-  - `--user` �œ��ꂽ�X�N���v�g�͒ʏ� `%USERPROFILE%\AppData\Roaming\Python\Python311\Scripts` �ɔz�u����܂��B�K�v�ɉ����� PATH �ɒǉ����Ă��������B
-  - �V�X�e���S�̂ւ̓������K�v�ȏꍇ�͊Ǘ��Ҍ����� PowerShell �Ŏ��s���܂����A�����͂��܂���B
-- macOS/Linux�ibash�j
-  - Python �m�F: `python3 --version`
-  - ���[�U�[�̈�֓���: `python3 -m pip install --user -r requirements.txt`
-  - ���[�U�[�̈�̎��s�t�@�C���͒ʏ� `~/.local/bin` �ɔz�u����܂��BPATH �� `~/.local/bin` ��ǉ����Ă��������B
-- ����m�F
+**グローバル環境でのセットアップ（venv を使わない場合）**
+- 既に Python をグローバルに導入している場合でも、可能ならユーザー領域にインストールしてください（権限衝突や他プロジェクトへの影響を避けるため）。
+- Windows（PowerShell）
+  - Python 確認: `python --version` または `py -3.11 --version`
+  - ユーザー領域へ導入: `python -m pip install --user -r requirements.txt`
+  - `--user` で入れたスクリプトは通常 `%USERPROFILE%\AppData\Roaming\Python\Python311\Scripts` に配置されます。必要に応じて PATH に追加してください。
+  - システム全体への導入が必要な場合は管理者権限の PowerShell で実行しますが、推奨はしません。
+- macOS/Linux（bash）
+  - Python 確認: `python3 --version`
+  - ユーザー領域へ導入: `python3 -m pip install --user -r requirements.txt`
+  - ユーザー領域の実行ファイルは通常 `~/.local/bin` に配置されます。PATH に `~/.local/bin` を追加してください。
+- 動作確認
   - `python -c "import pyVmomi, requests; print('deps ok')"`
-- ���ӓ_
-  - `sudo pip install` �͋ɗ͔����Ă��������i�V�X�e���̈���������₷�����߁j�B��ނ𓾂Ȃ��ꍇ�͐��m�ȗv���̂��ƂŎ��{���A�e����c�����Ă��������B
-  - �ˑ��Փ˂����������ꍇ�͉��z���ivenv�j�̎g�p�ɐ؂�ւ��邱�Ƃ𐄏����܂��B
+- 注意点
+  - `sudo pip install` は極力避けてください（システム領域を汚染しやすいため）。やむを得ない場合は正確な要件のもとで実施し、影響を把握してください。
+  - 依存衝突が発生した場合は仮想環境（venv）の使用に切り替えることを推奨します。
 
-**�ݒ�i�C�Ӂj**
-- ���O�ڍדx: `VSPHERE_CLONE_LOG_LEVEL`
-  - �i���ݒ�: `setx VSPHERE_CLONE_LOG_LEVEL DEBUG`�iPowerShell�B�V�����V�F���ŗL���j
-  - �ꎞ�ݒ�: `set VSPHERE_CLONE_LOG_LEVEL=DEBUG`�iPowerShell�j / `export VSPHERE_CLONE_LOG_LEVEL=DEBUG`�ibash�j
+**設定（任意）**
+- ログ詳細度: `VSPHERE_CLONE_LOG_LEVEL`
+  - 永続設定: `setx VSPHERE_CLONE_LOG_LEVEL DEBUG`（PowerShell。新しいシェルで有効）
+  - 一時設定: `set VSPHERE_CLONE_LOG_LEVEL=DEBUG`（PowerShell） / `export VSPHERE_CLONE_LOG_LEVEL=DEBUG`（bash）
 
-**���s**
+**実行**
 - `python cloneAndVmotion.py`
-- �X�N���v�g���s���ɁA�\�[�X/���� vCenter �̔F�؏��A�Ώ� VM ���A�Q�X�g OS �F�؏�����͂��܂��B
-- �e�t�F�[�Y�Ŋm�F�v�����v�g���\������A`y` �ő��s���܂��B
+- スクリプト実行中に、ソース/宛先 vCenter の認証情報、対象 VM 名、ゲスト OS 認証情報を入力します。
+- 各フェーズで確認プロンプトが表示され、`y` で続行します。
 
-**�g���u���V���[�e�B���O**
-- �a�ʎ��s: �l�b�g���[�N�|���V�[/�t�@�C�A�E�H�[���� ICMP ���Ւf����Ă��Ȃ����m�F
-- �F�؎��s: VMware Tools ���őΏۃA�J�E���g�� Guest Operations �������邩�m�F
-- �ڍ׃��O: `VSPHERE_CLONE_LOG_LEVEL=DEBUG` ��ݒ�
+**トラブルシューティング**
+- 疎通失敗: ネットワークポリシー/ファイアウォールで ICMP が遮断されていないか確認
+- 認証失敗: VMware Tools 側で対象アカウントに Guest Operations 許可があるか確認
+- コマンド失敗: ログに終了コードと CLI 出力が残ります。`nmcli` が無い場合はレガシー手順へのフォールバックが利用されたか確認してください。
+- 詳細ログ: `VSPHERE_CLONE_LOG_LEVEL=DEBUG` を設定
 
-**�⑫**
-- `requirement.txt` ���������Ă��܂����A�ʏ�� `requirements.txt` �̎g�p�𐄏����܂��B
+**補足**
+- `requirement.txt` も同梱していますが、通常は `requirements.txt` の使用を推奨します。
