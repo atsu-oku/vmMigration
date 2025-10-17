@@ -1843,115 +1843,115 @@ try:
             if nmcli_supported:
                 try:
                     try:
-                                    guest_command_executor(f"nmcli device disconnect {device_name} || true", check_exit_code=False)
-                                    device_name_normalized = device_name.lower()
-                                    mac_normalized = new_mac_lower.replace('-', ':') if new_mac_lower else ""
-                                    old_mac_normalized = original_mac_lower.replace('-', ':')
-                                    nmcli_fields = NMCLI_FIELDS_WITH_TYPE
-                                    nmcli_list_cmd = f"nmcli -t -f {','.join(nmcli_fields)} connection show"
-                                    try:
-                                        _, nmcli_output, _ = guest_command_executor(nmcli_list_cmd)
-                                    except RuntimeError:
-                                        nmcli_fields = NMCLI_FIELDS_NO_TYPE
-                                        nmcli_list_cmd = f"nmcli -t -f {','.join(nmcli_fields)} connection show"
-                                        _, nmcli_output, _ = guest_command_executor(nmcli_list_cmd)
-                                    parsed_connections = parse_nmcli_connection_output(nmcli_output, nmcli_fields)
-                                    existing_connections = []
-                                    for entry in parsed_connections:
-                                        normalized_entry = {}
-                                        for field in nmcli_fields:
-                                            normalized_entry[field.lower()] = entry.get(field, "")
-                                        existing_connections.append(normalized_entry)
-                                    alias_targets = {value for value in (device_name_normalized, con_name.lower()) if value}
-                                    alias_targets_compact = {value.replace('-', '').replace('_', '').replace(' ', '') for value in alias_targets}
-                                    mac_targets = set()
-                                    for value in (mac_normalized, old_mac_normalized):
-                                        if value:
-                                            mac_targets.add(value)
-                                            mac_targets.add(value.replace(':', ''))
-                                            mac_targets.add(value.replace(':', '-'))
-                                    stale_connection_uuids = set()
-                                    connection_detail_cache = {}
-                    
-                                    def get_connection_details(uuid_value):
-                                        if uuid_value in connection_detail_cache:
-                                            return connection_detail_cache[uuid_value]
-                                        detail_cmd = f"nmcli connection show {uuid_value}"
-                                        detail_exit, detail_stdout, _ = guest_command_executor(detail_cmd, check_exit_code=False)
-                                        connection_detail_cache[uuid_value] = (detail_exit, detail_stdout)
-                                        return connection_detail_cache[uuid_value]
-                    
-                                    for conn in existing_connections:
-                                        uuid = (conn.get('uuid') or "").strip()
-                                        if not uuid:
-                                            continue
-                                        name_norm = (conn.get('name') or "").strip().lower()
-                                        device_norm = (conn.get('device') or "").strip().lower()
-                                        type_norm = (conn.get('type') or "").strip().lower()
-                                        name_compact = name_norm.replace('-', '').replace('_', '').replace(' ', '')
-                                        device_compact = device_norm.replace('-', '').replace('_', '').replace(' ', '')
-                                        alias_match = False
-                                        if alias_targets:
-                                            if device_norm in alias_targets or name_norm in alias_targets:
-                                                alias_match = True
-                                            elif device_compact and any(target in device_compact for target in alias_targets_compact):
-                                                alias_match = True
-                                            elif name_compact and any(target in name_compact for target in alias_targets_compact):
-                                                alias_match = True
-                                        orphaned_interface = False
-                                        if not device_norm:
-                                            if name_norm and LEGACY_INTERFACE_PATTERN.match(name_norm):
-                                                if available_interfaces and name_norm not in available_interfaces and name_compact not in available_interfaces_compact:
-                                                    orphaned_interface = True
-                                            elif alias_targets and name_compact and any(target in name_compact for target in alias_targets_compact):
-                                                orphaned_interface = True
-                                        mac_match = False
-                                        if mac_targets and not (alias_match or orphaned_interface):
-                                            detail_exit, detail_stdout = get_connection_details(uuid)
-                                            if detail_exit == 0 and detail_stdout:
-                                                detail_lower = detail_stdout.lower()
-                                                for target_mac in mac_targets:
-                                                    if target_mac and target_mac in detail_lower:
-                                                        mac_match = True
-                                                        break
-                                        if type_norm and type_norm not in ('802-3-ethernet', 'ethernet'):
-                                            if not mac_match:
-                                                continue
-                                        if alias_match or orphaned_interface or mac_match:
-                                            stale_connection_uuids.add(uuid)
-                                    if stale_connection_uuids:
-                                        print(f"   -> Removing stale nmcli connections ({len(stale_connection_uuids)} entries).")
-                                        for uuid in sorted(stale_connection_uuids):
-                                            guest_command_executor(f"nmcli connection delete uuid {uuid}")
-                                    guest_command_executor(f"nmcli connection add type ethernet con-name '{con_name}' ifname '{device_name}'")
-                                    guest_command_executor(f"nmcli connection modify '{con_name}' ipv4.method manual ipv4.addresses '{new_ip}/{prefix}'")
-                                    if nic_info.get('is_gateway_nic') and new_default_gateway:
-                                        guest_command_executor(f"nmcli connection modify '{con_name}' ipv4.gateway '{new_default_gateway}'")
-                                    if new_dns_servers:
-                                        dns_str = ' '.join(new_dns_servers)
-                                        guest_command_executor(f"nmcli connection modify '{con_name}' ipv4.dns '{dns_str}'")
-                                    if should_configure_routes and routes_for_nic:
-                                        added_routes = False
-                                        for route_idx, route_info in routes_for_nic:
-                                            gateway = route_info['gateway']
-                                            prefix_value = route_info.get('prefix')
-                                            network_base = route_info['network']
-                                            network_cidr = f"{network_base}/{prefix_value}" if prefix_value is not None else network_base
-                                            try:
-                                                network_obj = ipaddress.IPv4Network(network_cidr, strict=False)
-                                                if new_ip and ipaddress.IPv4Address(new_ip) in network_obj:
-                                                    continue
-                                            except (ValueError, ipaddress.AddressValueError):
-                                                continue
-                                            guest_command_executor(
-                                                f"nmcli connection modify '{con_name}' +ipv4.routes '{network_cidr} {gateway}'"
-                                            )
-                                            selected_route_indices.append(route_idx)
-                                            selected_route_lines.append(f"{network_cidr} {gateway}")
-                                            if not added_routes:
-                                                print("   -> Applied PRD static routes via nmcli.")
-                                                added_routes = True
-                                            print(f"      - Added: {network_cidr} via {gateway}")
+                        guest_command_executor(f"nmcli device disconnect {device_name} || true", check_exit_code=False)
+                        device_name_normalized = device_name.lower()
+                        mac_normalized = new_mac_lower.replace('-', ':') if new_mac_lower else ""
+                        old_mac_normalized = original_mac_lower.replace('-', ':')
+                        nmcli_fields = NMCLI_FIELDS_WITH_TYPE
+                        nmcli_list_cmd = f"nmcli -t -f {','.join(nmcli_fields)} connection show"
+                        try:
+                            _, nmcli_output, _ = guest_command_executor(nmcli_list_cmd)
+                        except RuntimeError:
+                            nmcli_fields = NMCLI_FIELDS_NO_TYPE
+                            nmcli_list_cmd = f"nmcli -t -f {','.join(nmcli_fields)} connection show"
+                            _, nmcli_output, _ = guest_command_executor(nmcli_list_cmd)
+                        parsed_connections = parse_nmcli_connection_output(nmcli_output, nmcli_fields)
+                        existing_connections = []
+                        for entry in parsed_connections:
+                            normalized_entry = {}
+                            for field in nmcli_fields:
+                                normalized_entry[field.lower()] = entry.get(field, "")
+                            existing_connections.append(normalized_entry)
+                        alias_targets = {value for value in (device_name_normalized, con_name.lower()) if value}
+                        alias_targets_compact = {value.replace('-', '').replace('_', '').replace(' ', '') for value in alias_targets}
+                        mac_targets = set()
+                        for value in (mac_normalized, old_mac_normalized):
+                            if value:
+                                mac_targets.add(value)
+                                mac_targets.add(value.replace(':', ''))
+                                mac_targets.add(value.replace(':', '-'))
+                        stale_connection_uuids = set()
+                        connection_detail_cache = {}
+
+                        def get_connection_details(uuid_value):
+                            if uuid_value in connection_detail_cache:
+                                return connection_detail_cache[uuid_value]
+                            detail_cmd = f"nmcli connection show {uuid_value}"
+                            detail_exit, detail_stdout, _ = guest_command_executor(detail_cmd, check_exit_code=False)
+                            connection_detail_cache[uuid_value] = (detail_exit, detail_stdout)
+                            return connection_detail_cache[uuid_value]
+
+                        for conn in existing_connections:
+                            uuid = (conn.get('uuid') or "").strip()
+                            if not uuid:
+                                continue
+                            name_norm = (conn.get('name') or "").strip().lower()
+                            device_norm = (conn.get('device') or "").strip().lower()
+                            type_norm = (conn.get('type') or "").strip().lower()
+                            name_compact = name_norm.replace('-', '').replace('_', '').replace(' ', '')
+                            device_compact = device_norm.replace('-', '').replace('_', '').replace(' ', '')
+                            alias_match = False
+                            if alias_targets:
+                                if device_norm in alias_targets or name_norm in alias_targets:
+                                    alias_match = True
+                                elif device_compact and any(target in device_compact for target in alias_targets_compact):
+                                    alias_match = True
+                                elif name_compact and any(target in name_compact for target in alias_targets_compact):
+                                    alias_match = True
+                            orphaned_interface = False
+                            if not device_norm:
+                                if name_norm and LEGACY_INTERFACE_PATTERN.match(name_norm):
+                                    if available_interfaces and name_norm not in available_interfaces and name_compact not in available_interfaces_compact:
+                                        orphaned_interface = True
+                                elif alias_targets and name_compact and any(target in name_compact for target in alias_targets_compact):
+                                    orphaned_interface = True
+                            mac_match = False
+                            if mac_targets and not (alias_match or orphaned_interface):
+                                detail_exit, detail_stdout = get_connection_details(uuid)
+                                if detail_exit == 0 and detail_stdout:
+                                    detail_lower = detail_stdout.lower()
+                                    for target_mac in mac_targets:
+                                        if target_mac and target_mac in detail_lower:
+                                            mac_match = True
+                                            break
+                            if type_norm and type_norm not in ('802-3-ethernet', 'ethernet'):
+                                if not mac_match:
+                                    continue
+                            if alias_match or orphaned_interface or mac_match:
+                                stale_connection_uuids.add(uuid)
+                        if stale_connection_uuids:
+                            print(f"   -> Removing stale nmcli connections ({len(stale_connection_uuids)} entries).")
+                            for uuid in sorted(stale_connection_uuids):
+                                guest_command_executor(f"nmcli connection delete uuid {uuid}")
+                        guest_command_executor(f"nmcli connection add type ethernet con-name '{con_name}' ifname '{device_name}'")
+                        guest_command_executor(f"nmcli connection modify '{con_name}' ipv4.method manual ipv4.addresses '{new_ip}/{prefix}'")
+                        if nic_info.get('is_gateway_nic') and new_default_gateway:
+                            guest_command_executor(f"nmcli connection modify '{con_name}' ipv4.gateway '{new_default_gateway}'")
+                        if new_dns_servers:
+                            dns_str = ' '.join(new_dns_servers)
+                            guest_command_executor(f"nmcli connection modify '{con_name}' ipv4.dns '{dns_str}'")
+                        if should_configure_routes and routes_for_nic:
+                            added_routes = False
+                            for route_idx, route_info in routes_for_nic:
+                                gateway = route_info['gateway']
+                                prefix_value = route_info.get('prefix')
+                                network_base = route_info['network']
+                                network_cidr = f"{network_base}/{prefix_value}" if prefix_value is not None else network_base
+                                try:
+                                    network_obj = ipaddress.IPv4Network(network_cidr, strict=False)
+                                    if new_ip and ipaddress.IPv4Address(new_ip) in network_obj:
+                                        continue
+                                except (ValueError, ipaddress.AddressValueError):
+                                    continue
+                                guest_command_executor(
+                                    f"nmcli connection modify '{con_name}' +ipv4.routes '{network_cidr} {gateway}'"
+                                )
+                                selected_route_indices.append(route_idx)
+                                selected_route_lines.append(f"{network_cidr} {gateway}")
+                                if not added_routes:
+                                    print("   -> Applied PRD static routes via nmcli.")
+                                    added_routes = True
+                                print(f"      - Added: {network_cidr} via {gateway}")
                     except NmcliNotAvailableError:
                         print("   -> nmcli command unavailable; applying legacy network configuration.")
                         selected_route_indices, selected_route_lines = configure_interface_without_nmcli(
