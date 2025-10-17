@@ -1,10 +1,10 @@
-# vSphere �������X�N���v�g
+# vSphere 自動化スクリプト
 
-`cloneAndVmotion.py` �́AvSphere ��� STG ���� VM ���N���[�����A���� vCenter/�l�b�g���[�N�֓o�^�E�č\�����������ŁAPRD �p�f�[�^�X�g�A�� Storage vMotion �ňڍs�����Ƃ�����������X�N���v�g�ł��B�Q�X�g OS �̃l�b�g���[�N�ݒ�� `nmcli` ��p���Ď����K�p�E���؂��܂��B
+`cloneAndVmotion.py` は、vSphere 上で STG 環境の VM をクローンし、宛先 vCenter/ネットワークへ登録・再構成したうえで、PRD 用データストアへ Storage vMotion で移行する作業を自動化するスクリプトです。ゲスト OS のネットワーク設定は `nmcli` を用いて自動適用・検証します。
 
 ---
 
-## �N�C�b�N�X�^�[�g�i����: venv �� clone�j
+## クイックスタート（推奨: venv → clone）
 - Windows/PowerShell
   - `python -m venv .venv`
   - `.\\.venv\\Scripts\\Activate`
@@ -13,7 +13,7 @@
   - `python -m pip install --upgrade pip`
   - `pip install -r requirements.txt`
   - `python cloneAndVmotion.py`
-- macOS/Linux�ibash�j
+- macOS/Linux（bash）
   - `python3 -m venv .venv`
   - `source .venv/bin/activate`
   - `git clone https://github.com/atsu-oku/vmMigration.git`
@@ -22,49 +22,50 @@
   - `pip install -r requirements.txt`
   - `python cloneAndVmotion.py`
 
-��ւ̎菇�iclone �� venv�j�� `SETUP.md` ���Q�Ƃ��Ă��������B
+代替の手順（clone → venv）は `SETUP.md` を参照してください。
 
 ---
 
-## ����
-- �N���[�� �� ���� vCenter �o�^ �� NIC �č\�� �� IP/GW/DNS/���[�g�K�p �� Storage vMotion �܂Ŏ�����
-- �ݒ��� `nmcli` �Ō��؂��A�s����������Όx��
-- �G���[���̓��[���o�b�N�i�N���[���폜�E�s�v�t�@�C���폜 �Ȃǁj����
+## 特長
+- クローン → 宛先 vCenter 登録 → NIC 再構成 → IP/GW/DNS/ルート適用 → Storage vMotion まで自動化
+- 設定後は `nmcli` で検証し、不整合があれば警告
+- ゲストコマンドのエラー処理を強化し、`nmcli` が無い場合はレガシー適用に自動フォールバック
+- エラー時はロールバック（クローン削除・不要ファイル削除 など）を提案
 - Uses the vSphere Automation SDK REST API for guest IPv4/DNS provisioning (falls back to nmcli when unavailable).
 
-## �Ή����E�O��
-- vCenter �� API ���B�ł��邱��
-- �Ώ� VM �� VMware Tools �������E�ғ����AGuest Operations �����p�\
-- �Q�X�g OS ���� `nmcli`�iNetworkManager�j�����p�\�i��� Linux�j
-- Python 3.11 �ȍ~
+## 対応環境・前提
+- vCenter に API 到達できること
+- 対象 VM に VMware Tools が導入・稼働し、Guest Operations が利用可能
+- ゲスト OS 側で `nmcli`（NetworkManager）が利用可能（主に Linux）。未導入の場合はスクリプトがレガシー設定方式に切り替えますが、検証範囲が狭くなる点に留意してください。
+- Python 3.11 以降
 
-## �ˑ����W���[��
+## 依存モジュール
 - pyvmomi
 - requests
-- �ڍׂ� `requirements.txt` �� `SETUP.md` ���Q��
+- 詳細は `requirements.txt` と `SETUP.md` を参照
 
-## ���s�t���[�i�T�v�j
-1. �\�[�X vCenter ����Ώ� VM �� NIC ���AGW�ADNS �Ȃǂ��擾
-2. �ꎞ�f�[�^�X�g�A�փN���[���쐬�i�N���[���� NIC ��������/�����j
-3. ���� vCenter �֓o�^���APRD �l�b�g���[�N�ɍ��킹�� NIC �č\��
-4. �Q�X�g OS ���� `nmcli` �ɂ�� IP/GW/DNS/���[�g��K�p�E����
-5. �ꎞ�z�u����ŏI PRD �p�f�[�^�X�g�A�� Storage vMotion �ňڍs
+## 実行フロー（概要）
+1. ソース vCenter から対象 VM の NIC 情報、GW、DNS などを取得
+2. 一時データストアへクローン作成（クローン側 NIC を初期化/調整）
+3. 宛先 vCenter へ登録し、PRD ネットワークに合わせて NIC 再構成
+4. ゲスト OS 側で `nmcli` により IP/GW/DNS/ルートを適用・検証（必要に応じてレガシー手順へフォールバック）
+5. 一時配置から最終 PRD 用データストアへ Storage vMotion で移行
 
-## �g�����i�Θb�̗���j
-- ���s: `python cloneAndVmotion.py`
-- �Θb�ňȉ������
-  - �\�[�X/���� vCenter �̔F�؏��
-  - �ڍs�Ώ� VM ��
-  - �Q�X�g OS �̔F�؏��iroot �܂��� sudo �\�� admin�j
-- �e�t�F�[�Y�Ŋm�F���b�Z�[�W���\������A`y` �ő��s
+## 使い方（対話の流れ）
+- 実行: `python cloneAndVmotion.py`
+- 対話で以下を入力
+  - ソース/宛先 vCenter の認証情報
+  - 移行対象 VM 名
+  - ゲスト OS の認証情報（root または sudo 可能な admin）
+- 各フェーズで確認メッセージが表示され、`y` で続行
 
-## �g���u���V���[�e�B���O
-- �a�ʎ��s: �l�b�g���[�N�|���V�[/�t�@�C�A�E�H�[���� ICMP ���Ւf����Ă��Ȃ����m�F
-- �F�؎��s: VMware Tools ���őΏۃA�J�E���g�� Guest Operations ���������邩�m�F
-- �ڍ׃��O: `VSPHERE_CLONE_LOG_LEVEL=DEBUG` ��ݒ�
+## トラブルシューティング
+- 疎通失敗: ネットワークポリシー/ファイアウォールで ICMP が遮断されていないか確認
+- 認証失敗: VMware Tools 側で対象アカウントに Guest Operations 権限があるか確認
+- コマンド失敗: ログに終了コードと CLI 出力が記録されます。`nmcli` が無い/見つからない場合は自動でレガシー手順に切り替わったか確認してください。
+- 詳細ログ: `VSPHERE_CLONE_LOG_LEVEL=DEBUG` を設定
 
-## �J������
-- �ˑ��� `requirements.txt` �ɋL�ځi`pip install -r requirements.txt`�j
-- �ڍׂȃZ�b�g�A�b�v�� `SETUP.md` ���Q��
-- Issue/PR �ɂ����P��Ă����}
-
+## 開発メモ
+- 依存は `requirements.txt` に記載（`pip install -r requirements.txt`）
+- 詳細なセットアップは `SETUP.md` を参照
+- Issue/PR による改善提案を歓迎

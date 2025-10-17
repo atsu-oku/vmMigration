@@ -1,17 +1,21 @@
-?# Version History
+# Version History
+
+## 2025-10-17
+- Hardened guest command error handling with clearer exit-code reasons and CLI output capture.
+- Fixed newline injection when staging admin passwords and ensured nmcli fallback logic short-circuits correctly.
 
 ## 2025-10-16
 - Added PRD static-route ownership tracking so each route is bound to the correct NIC during migration.
 - Added nmcli post-configuration validation to confirm IP/gateway/routes/DNS after vMotion.
 
 ## 2025-10-12
-- ƒƒP[ƒ‹ŒÅ’è‚Æo—Í‚ÌˆêŠÑ«‚ğ‰ü‘PBnmcli/ping ‚Ì‹““®‚ª‘z’è‚Ç‚¨‚è‚É‚È‚é‚æ‚¤’²®B
-- sudo Às‚ÌƒtƒH[ƒ‹ƒoƒbƒNˆ—‚ğ‹­‰»‚µAå—vƒRƒ}ƒ“ƒh‚ÌÄÀs«‚ğ‰ü‘PB
-- README.md / SETUP.md ‚ğÄ\¬‚µ‚ÄAƒZƒbƒgƒAƒbƒvè‡‚Æg‚¢•û‚ğ–¾Šm‰»B
+- ãƒ­ã‚±ãƒ¼ãƒ«å›ºå®šã¨å‡ºåŠ›ã®ä¸€è²«æ€§ã‚’æ”¹å–„ã€‚nmcli/ping ã®æŒ™å‹•ãŒæƒ³å®šã©ãŠã‚Šã«ãªã‚‹ã‚ˆã†èª¿æ•´ã€‚
+- sudo å®Ÿè¡Œæ™‚ã®ãƒ•ã‚©ãƒ¼ãƒ«ãƒãƒƒã‚¯å‡¦ç†ã‚’å¼·åŒ–ã—ã€ä¸»è¦ã‚³ãƒãƒ³ãƒ‰ã®å†å®Ÿè¡Œæ€§ã‚’æ”¹å–„ã€‚
+- README.md / SETUP.md ã‚’å†æ§‹æˆã—ã¦ã€ã‚»ãƒƒãƒˆã‚¢ãƒƒãƒ—æ‰‹é †ã¨ä½¿ã„æ–¹ã‚’æ˜ç¢ºåŒ–ã€‚
 
 ## 2025-10-11
-- ƒNƒ[ƒ“ ¨ IP İ’è ¨ Storage vMotion ‚Ü‚Å‚Ìƒtƒ[‚ğ®”õB
-- ƒQƒXƒg OS ‚Å nmcli / ping ‚ğ—p‚¢‚½‘a’ÊŠm”F‚Æƒ[ƒ‹ƒoƒbƒNˆ—‚ğ’Ç‰ÁB
+- ã‚¯ãƒ­ãƒ¼ãƒ³ â†’ IP è¨­å®š â†’ Storage vMotion ã¾ã§ã®ãƒ•ãƒ­ãƒ¼ã‚’æ•´å‚™ã€‚
+- ã‚²ã‚¹ãƒˆ OS ã§ nmcli / ping ã‚’ç”¨ã„ãŸç–é€šç¢ºèªã¨ãƒ­ãƒ¼ãƒ«ãƒãƒƒã‚¯å‡¦ç†ã‚’è¿½åŠ ã€‚
 
 ## 2025-10-10
-- ƒvƒƒWƒFƒNƒg‰Šú‰»Bƒ\[ƒX vCenter ‚Æˆ¶æ vCenter ‚ğŒ×‚®ˆÚsƒXƒNƒŠƒvƒg‚Ì“y‘ä‚ğì¬B
+- ãƒ—ãƒ­ã‚¸ã‚§ã‚¯ãƒˆåˆæœŸåŒ–ã€‚ã‚½ãƒ¼ã‚¹ vCenter ã¨å®›å…ˆ vCenter ã‚’è·¨ãç§»è¡Œã‚¹ã‚¯ãƒªãƒ—ãƒˆã®åœŸå°ã‚’ä½œæˆã€‚
