@@ -446,7 +446,7 @@ def ensure_firewall_allows_ssh(command_executor, source_ip):
         zone = (default_zone or 'public').splitlines()[0].strip() or 'public'
         rich_rule = (
             f"firewall-cmd --permanent --zone={zone} "
-            f"--add-rich-rule='rule family="ipv4" source address="{source_ip}" service name="ssh" accept'"
+            f"--add-rich-rule='rule family=\"ipv4\" source address=\"{source_ip}\" service name=\"ssh\" accept'"
         )
         exit_code, _, cmd_err = command_executor(rich_rule, check_exit_code=False)
         if exit_code == 0:
@@ -1018,8 +1018,7 @@ def execute_command_in_guest(guest_op_manager, vm, root_auth, admin_auth, admin_
                 suffix=".tmp",
                 directoryPath="/tmp",
             )
-            password_bytes = (admin_pwd + "
-").encode("utf-8")
+            password_bytes = (admin_pwd + "\n").encode("utf-8")
             file_attr = vim.vm.guest.FileManager.FileAttributes()
             upload_url = file_manager.InitiateFileTransferToGuest(
                 vm=vm,
@@ -1134,24 +1133,23 @@ def execute_command_in_guest(guest_op_manager, vm, root_auth, admin_auth, admin_
         print("[GUEST-CMD] 結果: 成功")
     else:
         print("[GUEST-CMD] 結果: 失敗")
-        if check_exit_code:
-            if exit_code != 0:
-                reason = (stderr or "").strip() or "終了コードが 0 ではありません"
-            elif stderr_indicates_error:
-                reason = (stderr or "").strip() or "標準エラー出力にエラーが含まれていました"
-            else:
-                reason = "原因不明のエラー"
-            combined_cli_output = ((stderr or "") + "
-" + (stdout or "")).lower()
+        combined_cli_output = ((stderr or "") + "\n" + (stdout or "")).lower()
+        reason = (stderr or "").strip() or "原因不明のエラー"
         if "nmcli" in command and ("command not found" in combined_cli_output or exit_code == 127):
             raise NmcliNotAvailableError(command)
+        if not check_exit_code:
+            return exit_code, stdout, stderr
+        if exit_code != 0:
+            reason = (stderr or "").strip() or "終了コードが 0 ではありません"
+        elif stderr_indicates_error:
+            reason = (stderr or "").strip() or "標準エラー出力にエラーが含まれていました"
         if fallback_error is not None and auth_used == "admin":
-                raise RuntimeError(
-                    f"admin ユーザーでのコマンド実行に失敗しました (終了コード {exit_code}, 理由: {reason})"
-                ) from fallback_error
             raise RuntimeError(
-                f"コマンド実行に失敗しました (終了コード {exit_code}, 理由: {reason})"
-            )
+                f"admin ユーザーでのコマンド実行に失敗しました (終了コード {exit_code}, 理由: {reason})"
+            ) from fallback_error
+        raise RuntimeError(
+            f"コマンド実行に失敗しました (終了コード {exit_code}, 理由: {reason})"
+        )
     return exit_code, stdout, stderr
 
 # ------------------------------------------------
@@ -1805,14 +1803,6 @@ try:
             con_name = device_name
             print(f"   -> Guest OS interface '{device_name}' located.")
 
-            sdk_success = False
-            sdk_dns_servers: List[str] = []
-            if use_sdk_networking and sdk_network_client and sdk_vm_id:
-                nic_identifier = find_interface_id_by_mac(sdk_interfaces, new_mac) or find_interface_id_by_mac(
-                    sdk_interfaces, nic_info.get('mac_address')
-                )
-                if nic_identifier:
-        
             nmcli_check_exit, _, _ = guest_command_executor("command -v nmcli", check_exit_code=False)
             nmcli_supported = nmcli_check_exit == 0
 
@@ -1833,6 +1823,7 @@ try:
                         continue
                     routes_for_nic.append((route_idx, route_info))
 
+            should_configure_routes = False
             if not should_configure_routes and new_default_gateway and new_ip:
                 try:
                     nic_network = ipaddress.IPv4Interface(f"{new_ip}/{prefix}").network
@@ -1996,8 +1987,9 @@ try:
                     routes_for_nic if should_configure_routes else [],
                     new_dns_servers if new_dns_servers else None,
                 )
-                use_nmcli_connection = False            for route_idx in selected_route_indices:
-                configured_route_indices.add(route_idx)
+                use_nmcli_connection = False
+                for route_idx in selected_route_indices:
+                    configured_route_indices.add(route_idx)
             if selected_route_lines:
                 applied_static_routes.extend(selected_route_lines)
 
