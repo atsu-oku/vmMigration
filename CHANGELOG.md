@@ -3,6 +3,7 @@
 ## 2025-10-17
 - Hardened guest command error handling with clearer exit-code reasons and CLI output capture.
 - Fixed newline injection when staging admin passwords and ensured nmcli fallback logic short-circuits correctly.
+- Added vCenter keep-alive threading to prevent session expiry during long storage vMotion sequences.
 
 ## 2025-10-16
 - Added PRD static-route ownership tracking so each route is bound to the correct NIC during migration.

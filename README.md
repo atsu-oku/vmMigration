@@ -63,6 +63,7 @@
 - 疎通失敗: ネットワークポリシー/ファイアウォールで ICMP が遮断されていないか確認
 - 認証失敗: VMware Tools 側で対象アカウントに Guest Operations 権限があるか確認
 - コマンド失敗: ログに終了コードと CLI 出力が記録されます。`nmcli` が無い/見つからない場合は自動でレガシー手順に切り替わったか確認してください。
+- セッション切断: 長時間の処理中でも vCenter へ定期的に keep-alive を送信します。より短い間隔が必要な場合は `VSPHERE_CLONE_KEEPALIVE_SECONDS`（秒）で調整できます。
 - 詳細ログ: `VSPHERE_CLONE_LOG_LEVEL=DEBUG` を設定
 
 ## 開発メモ

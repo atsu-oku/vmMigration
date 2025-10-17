@@ -62,6 +62,8 @@
 - ログ詳細度: `VSPHERE_CLONE_LOG_LEVEL`
   - 永続設定: `setx VSPHERE_CLONE_LOG_LEVEL DEBUG`（PowerShell。新しいシェルで有効）
   - 一時設定: `set VSPHERE_CLONE_LOG_LEVEL=DEBUG`（PowerShell） / `export VSPHERE_CLONE_LOG_LEVEL=DEBUG`（bash）
+- vCenter セッション維持: `VSPHERE_CLONE_KEEPALIVE_SECONDS`（既定 240）
+  - 期間が長いワークロードでセッションが切れる場合は秒数を短く設定してください。
 
 **実行**
 - `python cloneAndVmotion.py`
