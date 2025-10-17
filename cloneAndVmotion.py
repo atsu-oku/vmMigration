@@ -281,6 +281,95 @@ def _parse_ifconfig_output(raw_text):
                 current["ipv4"].append({"address": address_value, "prefix_length": prefix_len})
     return interfaces
 
+
+def _find_gateway_owner_index(nic_records: List[Dict[str, Any]], gateway_ip: Optional[str]) -> Optional[int]:
+    """Return the index of the NIC whose STG network contains the provided gateway."""
+    if not gateway_ip:
+        return None
+    try:
+        gateway_addr = ipaddress.IPv4Address(gateway_ip)
+    except (ValueError, ipaddress.AddressValueError):
+        return None
+    for idx, nic in enumerate(nic_records):
+        nic_ip = nic.get("ip_address")
+        nic_mask = nic.get("subnet_mask")
+        if not nic_ip or not nic_mask:
+            continue
+        try:
+            nic_network = ipaddress.IPv4Interface(f"{nic_ip}/{nic_mask}").network
+        except (ValueError, ipaddress.AddressValueError):
+            continue
+        if gateway_addr in nic_network:
+            return idx
+    return None
+
+
+def _select_default_gateway_route(
+    candidates: List[Dict[str, Any]],
+    nic_records: List[Dict[str, Any]],
+) -> Optional[Tuple[str, int]]:
+    """Choose the most appropriate default gateway entry among the provided candidates."""
+    best_match: Optional[Tuple[str, int]] = None
+    fallback: Optional[Tuple[str, int]] = None
+    for candidate in candidates:
+        gateway = candidate.get("gateway")
+        if not gateway:
+            continue
+        owner_idx = candidate.get("owner_index")
+        if owner_idx is not None and not (0 <= owner_idx < len(nic_records)):
+            owner_idx = None
+        if owner_idx is None:
+            owner_idx = _find_gateway_owner_index(nic_records, gateway)
+        mutated_gateway = calculate_ip_stg_to_prd(gateway)
+        if owner_idx is not None and mutated_gateway:
+            nic = nic_records[owner_idx]
+            nic_prd_ip = nic.get("prd_ip_address") or calculate_ip_stg_to_prd(nic.get("ip_address"))
+            nic_mask = nic.get("subnet_mask")
+            if nic_prd_ip and nic_mask:
+                try:
+                    nic_prd_network = ipaddress.IPv4Interface(f"{nic_prd_ip}/{nic_mask}").network
+                    if ipaddress.IPv4Address(mutated_gateway) in nic_prd_network:
+                        return gateway, owner_idx
+                except (ValueError, ipaddress.AddressValueError):
+                    pass
+        if owner_idx is not None and best_match is None:
+            best_match = (gateway, owner_idx)
+        if mutated_gateway and fallback is None:
+            derived_owner = owner_idx if owner_idx is not None else _find_gateway_owner_index(nic_records, gateway)
+            if derived_owner is not None:
+                fallback = (gateway, derived_owner)
+    return best_match or fallback
+
+
+def _derive_fallback_gateway(nic_records: List[Dict[str, Any]]) -> Optional[Tuple[str, int]]:
+    """Derive a plausible STG default gateway and owning NIC when none was supplied."""
+    candidate: Optional[Tuple[str, int]] = None
+    for idx, nic in enumerate(nic_records):
+        ip_addr = nic.get("ip_address")
+        subnet_mask = nic.get("subnet_mask")
+        if not ip_addr or not subnet_mask:
+            continue
+        try:
+            stg_iface = ipaddress.IPv4Interface(f"{ip_addr}/{subnet_mask}")
+        except (ValueError, ipaddress.AddressValueError):
+            continue
+        network = stg_iface.network
+        hosts_iter = network.hosts()
+        try:
+            gateway_addr = next(hosts_iter)
+            if str(gateway_addr) == ip_addr:
+                gateway_addr = next(hosts_iter)
+        except StopIteration:
+            continue
+        if gateway_addr is None:
+            continue
+        gateway_str = str(gateway_addr)
+        if nic.get("is_gateway_nic"):
+            return gateway_str, idx
+        if candidate is None:
+            candidate = (gateway_str, idx)
+    return candidate
+
 def collect_interface_inventory(command_executor):
     """Return a list of interface metadata dictionaries for the guest OS."""
     attempts = [
@@ -1410,6 +1499,7 @@ try:
 
     if source_routes:
         original_static_routes.clear()
+        default_route_candidates: List[Dict[str, Any]] = []
         for route in source_routes:
             network = route.get('network')
             prefix = route.get('prefix_length')
@@ -1426,17 +1516,19 @@ try:
                 entry['owner_index'] = interface_index
             original_static_routes.append(entry)
             if gateway and (network == '0.0.0.0' or prefix == 0):
-                original_default_gateway = gateway
-                if interface_index is not None and 0 <= interface_index < len(original_nic_info):
-                    original_nic_info[interface_index]['is_gateway_nic'] = True
-        if not original_default_gateway:
-            for route in source_routes:
-                gateway = route.get('gateway_address')
-                interface_index = route.get('interface_index')
-                if gateway and interface_index is not None and 0 <= interface_index < len(original_nic_info):
+                default_route_candidates.append({'gateway': gateway, 'owner_index': interface_index})
+                if original_default_gateway is None:
                     original_default_gateway = gateway
-                    original_nic_info[interface_index]['is_gateway_nic'] = True
-                    break
+        selected_default = _select_default_gateway_route(default_route_candidates, original_nic_info)
+        if selected_default:
+            original_default_gateway, gateway_owner_idx = selected_default
+            for idx, nic in enumerate(original_nic_info):
+                nic['is_gateway_nic'] = (idx == gateway_owner_idx)
+        elif default_route_candidates and original_default_gateway is not None:
+            owner_candidate = default_route_candidates[0].get('owner_index')
+            if owner_candidate is not None and 0 <= owner_candidate < len(original_nic_info):
+                for idx, nic in enumerate(original_nic_info):
+                    nic['is_gateway_nic'] = (idx == owner_candidate)
 
     if not source_routes and target_vm.guest.ipStack and target_vm.guest.ipStack[0].ipRouteConfig:
         for route in target_vm.guest.ipStack[0].ipRouteConfig.ipRoute:
@@ -1444,12 +1536,13 @@ try:
                 original_default_gateway = route.gateway.ipAddress
                 print(f"   デフォルトゲートウェイ '{original_default_gateway}' を取得しました。")
                 # ゲートウェイがどのNICに属するかを判定
-                for nic in original_nic_info:
+                for idx, nic in enumerate(original_nic_info):
                     try:
                         nic_iface = ipaddress.IPv4Interface(f"{nic['ip_address']}/{nic['subnet_mask']}")
                         gw_addr = ipaddress.IPv4Address(original_default_gateway)
                         if gw_addr in nic_iface.network:
-                            nic['is_gateway_nic'] = True
+                            for j, candidate in enumerate(original_nic_info):
+                                candidate['is_gateway_nic'] = (j == idx)
                             print(f"   -> IP {nic['ip_address']} のNICをゲートウェイNICと判定しました。")
                             break
                     except (ValueError, ipaddress.AddressValueError):
@@ -1465,6 +1558,14 @@ try:
                         'prefix': prefix,
                         'gateway': gateway,
                     })
+    if original_default_gateway is None:
+        fallback_gateway = _derive_fallback_gateway(original_nic_info)
+        if fallback_gateway:
+            original_default_gateway, gateway_owner_idx = fallback_gateway
+            for idx, nic in enumerate(original_nic_info):
+                nic['is_gateway_nic'] = (idx == gateway_owner_idx)
+            print(f"   -> デフォルトゲートウェイが未設定のため {original_default_gateway} (NIC {gateway_owner_idx + 1}) を推測しました。")
+
     if original_static_routes:
         print("   取得したスタティックルート(STG):")
         for route in original_static_routes:
