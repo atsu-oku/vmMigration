@@ -3,6 +3,7 @@ import os
 import ssl
 import getpass
 import time
+import threading
 import json
 import logging
 import ipaddress
@@ -140,6 +141,42 @@ STDERR_ERROR_REGEXES = [
     re.compile(r'traceback \(most recent call last\)', re.IGNORECASE),
 ]
 LEGACY_INTERFACE_PATTERN = re.compile(r'^(ens|eno|enp|enx|eth|em)[0-9a-z\-]*$', re.IGNORECASE)
+
+VCENTER_KEEPALIVE_SECONDS = int(os.environ.get("VSPHERE_CLONE_KEEPALIVE_SECONDS", "240"))
+
+KeepAliveHandle = Tuple[threading.Thread, threading.Event]
+
+
+def _start_keepalive_thread(service_instance, label: str, interval: int = VCENTER_KEEPALIVE_SECONDS) -> Optional[KeepAliveHandle]:
+    """Start a background thread that periodically calls CurrentTime on the service instance."""
+    if not service_instance or interval <= 0:
+        return None
+
+    stop_event = threading.Event()
+
+    def _keepalive_loop() -> None:
+        while not stop_event.wait(interval):
+            try:
+                service_instance.CurrentTime()
+            except Exception:
+                LOGGER.debug("Keep-alive ping failed for %s; stopping keep-alive thread.", label, exc_info=True)
+                break
+
+    thread = threading.Thread(target=_keepalive_loop, name=f"{label}-keepalive", daemon=True)
+    thread.start()
+    return thread, stop_event
+
+
+def _stop_keepalive_thread(handle: Optional[KeepAliveHandle], timeout: float = 5.0) -> None:
+    """Signal the keep-alive thread to stop and wait briefly for it to exit."""
+    if not handle:
+        return
+    thread, stop_event = handle
+    stop_event.set()
+    try:
+        thread.join(timeout)
+    except Exception:
+        LOGGER.debug("Error while joining keep-alive thread", exc_info=True)
 
 def _compact_interface_name(name):
     lowered = (name or "").lower()
@@ -1221,6 +1258,8 @@ original_static_routes: List[Dict[str, Any]] = []
 si_source = None
 si_dest = None
 sdk_network_client: VsphereGuestNetworkSDK | None = None
+source_keepalive_handle: Optional[KeepAliveHandle] = None
+dest_keepalive_handle: Optional[KeepAliveHandle] = None
 
 try:
     # --- [Phase 0/7] Pre-flight Check: Authenticating to vCenters ---
@@ -1247,6 +1286,7 @@ try:
     if not si_source:
         raise ConnectionError(f"ソース vCenter ({VCSA_HOST_SOURCE}) に接続できませんでした。")
     print("✓ ソース vCenter への接続に成功しました。")
+    source_keepalive_handle = _start_keepalive_thread(si_source, "source-vcenter")
     
     content_source = si_source.RetrieveContent()
     
@@ -1515,6 +1555,8 @@ try:
     new_vm_on_source.UnregisterVM()
     unregistered_from_source = True
     print("   ✓ 登録解除完了。")
+    _stop_keepalive_thread(source_keepalive_handle)
+    source_keepalive_handle = None
     Disconnect(si_source)
     si_source = None
     new_vm_on_source = None 
@@ -1525,6 +1567,7 @@ try:
     if not si_dest:
         raise ConnectionError(f"宛先 vCenter ({VCSA_HOST_DEST}) に接続できませんでした。")
     print("✓ 宛先 vCenter への接続に成功しました。")
+    dest_keepalive_handle = _start_keepalive_thread(si_dest, "dest-vcenter")
     content_dest = si_dest.RetrieveContent()
     if any(vm for vm in content_dest.viewManager.CreateContainerView(content_dest.rootFolder, [vim.VirtualMachine], True).view if vm.name == clone_name):
         raise FileExistsError(f"同名の VM '{clone_name}' が宛先 vCenter に既に存在します。")
@@ -1942,15 +1985,22 @@ try:
                             print(f"   -> Removing stale nmcli connections ({len(stale_connection_uuids)} entries).")
                             for uuid in sorted(stale_connection_uuids):
                                 guest_command_executor(f"nmcli connection delete uuid {uuid}")
-                        guest_command_executor(f"nmcli connection add type ethernet con-name '{con_name}' ifname '{device_name}'")
-                        guest_command_executor(f"nmcli connection modify '{con_name}' ipv4.method manual")
+                        guest_command_executor(
+                            f"nmcli connection add type ethernet con-name '{con_name}' ifname '{device_name}' autoconnect no"
+                        )
+                        if new_ip and prefix:
+                            guest_command_executor(
+                                f"nmcli connection modify '{con_name}' ipv4.method manual ipv4.addresses '{new_ip}/{prefix}'"
+                            )
+                        else:
+                            guest_command_executor(
+                                f"nmcli connection modify '{con_name}' ipv4.method manual ipv4.addresses ''"
+                            )
                         guest_command_executor(f"nmcli connection modify '{con_name}' ipv6.method disabled", check_exit_code=False)
                         guest_command_executor(f"nmcli connection modify '{con_name}' ipv6.never-default yes", check_exit_code=False)
                         guest_command_executor(f"nmcli connection modify '{con_name}' ipv6.addresses ''", check_exit_code=False)
                         guest_command_executor(f"nmcli connection modify '{con_name}' ipv6.routes ''", check_exit_code=False)
                         guest_command_executor(f"nmcli connection modify '{con_name}' ipv6.dns ''", check_exit_code=False)
-                        if new_ip and prefix:
-                            guest_command_executor(f"nmcli connection modify '{con_name}' ipv4.addresses '{new_ip}/{prefix}'")
                         if nic_info.get('is_gateway_nic') and new_default_gateway:
                             guest_command_executor(f"nmcli connection modify '{con_name}' ipv4.gateway '{new_default_gateway}'")
                         if new_dns_servers:
@@ -2185,6 +2235,8 @@ try:
     
     print("\n✓ ストレージ vMotion が正常に完了しました。")
     print("\n✓ すべての移行プロセスが正常に完了しました。")
+    _stop_keepalive_thread(dest_keepalive_handle)
+    dest_keepalive_handle = None
     Disconnect(si_dest)
     si_dest = None
 
@@ -2200,12 +2252,23 @@ except Exception as e:
         rollback_approval = input("\nこの VM を削除して操作前の状態に戻しますか？ (y/n): ")
         if rollback_approval.lower() == 'y':
             try:
-                if si_dest is None or not si_dest.CurrentTime(): # 接続が切れている場合は再接続
+                if si_dest is None:
+                    connection_alive = False
+                else:
+                    try:
+                        si_dest.CurrentTime()
+                        connection_alive = True
+                    except Exception:
+                        connection_alive = False
+                if not connection_alive:  # 接続が切れている場合は再接続
                     print("   クリーンアップのため宛先 vCenter に再接続します...")
+                    _stop_keepalive_thread(dest_keepalive_handle)
+                    dest_keepalive_handle = None
                     si_dest = SmartConnect(host=VCSA_HOST_DEST, user=VCSA_USER, pwd=VCSA_PWD_DEST, port=VCSA_PORT, sslContext=ctx)
                     if not si_dest:
                         raise ConnectionError("宛先 vCenter への再接続に失敗しました。") from None
                     print("   ✓ 再接続に成功しました。")
+                    dest_keepalive_handle = _start_keepalive_thread(si_dest, "dest-vcenter-cleanup")
 
                 content_dest_cleanup = si_dest.RetrieveContent()
                 vm_to_delete = find_vm_by_name(content_dest_cleanup, clone_name)
@@ -2311,8 +2374,18 @@ finally:
     except Exception:
         pass
     try:
+        if 'dest_keepalive_handle' in locals():
+            _stop_keepalive_thread(dest_keepalive_handle)
+    except Exception:
+        pass
+    try:
         if 'si_dest' in locals() and si_dest:
             Disconnect(si_dest)
+    except Exception:
+        pass
+    try:
+        if 'source_keepalive_handle' in locals():
+            _stop_keepalive_thread(source_keepalive_handle)
     except Exception:
         pass
     try:

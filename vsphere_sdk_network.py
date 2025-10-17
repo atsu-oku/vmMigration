@@ -115,11 +115,11 @@ class VsphereGuestNetworkSDK:
     ) -> List[Mapping[str, object]]:
         """Return guest NIC metadata, polling a few times if necessary."""
         for attempt in range(1, max(1, retries) + 1):
-            api_url = self._url(f"vcenter/vm/{vm_id}/guest/networking/interfaces", use_api=True)
-            response = self._session.get(api_url)
+            rest_url = self._url(f"vcenter/vm/{vm_id}/guest/networking/interfaces")
+            response = self._session.get(rest_url)
             if response.status_code == 404:
-                rest_url = self._url(f"vcenter/vm/{vm_id}/guest/networking/interfaces")
-                response = self._session.get(rest_url)
+                api_url = self._url(f"vcenter/vm/{vm_id}/guest/networking/interfaces", use_api=True)
+                response = self._session.get(api_url)
             self._raise_for_status(response, f"Failed to list guest interfaces for {vm_id}")
             payload = response.json()
             self._logger.debug(
@@ -158,11 +158,11 @@ class VsphereGuestNetworkSDK:
 
     def get_networking_state(self, vm_id: str) -> Mapping[str, object]:
         """Return aggregated networking state (DNS, host name, etc.)."""
-        api_url = self._url(f"vcenter/vm/{vm_id}/guest/networking", use_api=True)
-        response = self._session.get(api_url)
+        rest_url = self._url(f"vcenter/vm/{vm_id}/guest/networking")
+        response = self._session.get(rest_url)
         if response.status_code == 404:
-            rest_url = self._url(f"vcenter/vm/{vm_id}/guest/networking")
-            response = self._session.get(rest_url)
+            api_url = self._url(f"vcenter/vm/{vm_id}/guest/networking", use_api=True)
+            response = self._session.get(api_url)
         if response.status_code in (204, 202):
             return {}
         if not response.content:
@@ -176,11 +176,11 @@ class VsphereGuestNetworkSDK:
 
     def list_routes(self, vm_id: str) -> List[Mapping[str, object]]:
         """Return guest routing table entries."""
-        api_url = self._url(f"vcenter/vm/{vm_id}/guest/networking/routes", use_api=True)
-        response = self._session.get(api_url)
+        rest_url = self._url(f"vcenter/vm/{vm_id}/guest/networking/routes")
+        response = self._session.get(rest_url)
         if response.status_code == 404:
-            rest_url = self._url(f"vcenter/vm/{vm_id}/guest/networking/routes")
-            response = self._session.get(rest_url)
+            api_url = self._url(f"vcenter/vm/{vm_id}/guest/networking/routes", use_api=True)
+            response = self._session.get(api_url)
         if response.status_code in (204, 202):
             return []
         if not response.content:
@@ -219,16 +219,16 @@ class VsphereGuestNetworkSDK:
         if route_items:
             spec.setdefault("ipv4", {}).setdefault("routes", route_items)
         payload = {"spec": spec}
-        api_url = self._url(
-            f"vcenter/vm/{vm_id}/guest/networking/interfaces/{nic_id}?action=update",
-            use_api=True,
+        rest_url = self._url(
+            f"vcenter/vm/{vm_id}/guest/networking/interfaces/{nic_id}?action=update"
         )
-        response = self._session.post(api_url, json=payload)
+        response = self._session.post(rest_url, json=payload)
         if response.status_code == 404:
-            rest_url = self._url(
-                f"vcenter/vm/{vm_id}/guest/networking/interfaces/{nic_id}?action=update"
+            api_url = self._url(
+                f"vcenter/vm/{vm_id}/guest/networking/interfaces/{nic_id}?action=update",
+                use_api=True,
             )
-            response = self._session.post(rest_url, data=json.dumps(payload))
+            response = self._session.post(api_url, json=payload)
         self._raise_for_status(
             response,
             f"Failed to update guest interface {nic_id} for VM {vm_id}",
