@@ -1,5 +1,12 @@
 # Version History
 
+## 2025-10-19
+- Improved default-gateway inference to prefer vSphere route metadata and NIC subnet checks.
+- Normalised DNS verification output to remove false “missing DNS” warnings and clearly display actual/expected sets.
+- Filtered SDK route snapshots so only non-default discrepancies are reported.
+- Ensured `nmcli` connections remain in autoconnect mode and prevented duplicate static-route application.
+- Updated documentation (README/SETUP) to reflect the new verification behaviour and configuration options.
+
 ## 2025-10-17
 - Hardened guest command error handling with clearer exit-code reasons and CLI output capture.
 - Fixed newline injection when staging admin passwords and ensured nmcli fallback logic short-circuits correctly.
