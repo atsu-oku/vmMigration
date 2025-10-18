@@ -1,23 +1,11 @@
-## OPENAI_API_KEY ローテーション手順
+# Operational TODO
 
-1. **新キーの準備**
-   - OpenAI から新しい `OPENAI_API_KEY` を発行し、保管ポリシーに従って安全な場所に保存する。
+## Near Term
+- [ ] Add automated smoke tests that exercise the connectivity checks with mocked SDK responses.
+- [ ] Expose the list of verification ping targets in a configuration file to simplify environment-specific tuning.
+- [ ] Document rollback procedures (VM deletion / datastore clean-up) with screenshots for the operations team.
 
-2. **環境設定の更新**
-   - ローカル開発環境の `.env` などに新キーを追加し、既存キーはローテーション完了まで保持する。
-   - CI/CD やステージング／本番環境の Secrets／環境変数を順次新しいキーへ差し替える。Docker Compose や Kubernetes Secret を利用している場合は各マニフェストも更新する。
-
-3. **ドキュメント整備**
-   - `.env.example` や README、社内 Wiki など、キー設定方法に言及している資料を新しい運用手順に合わせて更新する。
-
-4. **コード確認**
-   - `OPENAI_API_KEY` を参照している箇所を点検し、環境変数名にハードコードがないか、fallback やエラー処理が適切かを確認する。
-
-5. **デプロイと反映**
-   - 各環境で設定を反映後、該当プロセス／サービスを再起動または再デプロイし、新キーで動作するようにする。
-
-6. **動作検証**
-   - OpenAI API を利用する機能（CLI、バッチ処理、バックエンドなど）で疎通確認を行い、ログに旧キーが露出していないことを確認する。
-
-7. **旧キーの無効化**
-   - すべての環境で新キーへの切り替えが完了したら、OpenAI の管理画面で旧キーを無効化し、不要な秘密情報を破棄する。
+## Backlog
+- [ ] Evaluate supporting IPv6 configuration once PRD networks begin adopting dual-stack.
+- [ ] Investigate packaging an optional HTML report summarising migration results.
+- [ ] Consider building a small CLI wrapper that pre-validates credentials and network reachability before running the full script.

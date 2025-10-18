@@ -1,72 +1,102 @@
-# vSphere 自動化スクリプト
+# vSphere Migration Automation Scripts
 
-`cloneAndVmotion.py` は、vSphere 上で STG 環境の VM をクローンし、宛先 vCenter/ネットワークへ登録・再構成したうえで、PRD 用データストアへ Storage vMotion で移行する作業を自動化するスクリプトです。ゲスト OS のネットワーク設定は `nmcli` を用いて自動適用・検証します。
-
----
-
-## クイックスタート（推奨: venv → clone）
-- Windows/PowerShell
-  - `python -m venv .venv`
-  - `.\\.venv\\Scripts\\Activate`
-  - `git clone https://github.com/atsu-oku/vmMigration.git`
-  - `cd vmMigration`
-  - `python -m pip install --upgrade pip`
-  - `pip install -r requirements.txt`
-  - `python cloneAndVmotion.py`
-- macOS/Linux（bash）
-  - `python3 -m venv .venv`
-  - `source .venv/bin/activate`
-  - `git clone https://github.com/atsu-oku/vmMigration.git`
-  - `cd vmMigration`
-  - `python -m pip install --upgrade pip`
-  - `pip install -r requirements.txt`
-  - `python cloneAndVmotion.py`
-
-代替の手順（clone → venv）は `SETUP.md` を参照してください。
+`cloneAndVmotion.py` automates the end-to-end workflow required to move a VM from a staging (STG) vCenter to a production (PRD) vCenter. The script clones the source VM, re-registers it on the destination environment, rebuilds NICs against PRD networks, applies the appropriate IP/DNS/route configuration inside the guest OS, and finishes with a Storage vMotion to the final PRD datastore. Guest networking is configured through `nmcli` when available, with a shell-based fallback to support legacy environments.
 
 ---
 
-## 特長
-- クローン → 宛先 vCenter 登録 → NIC 再構成 → IP/GW/DNS/ルート適用 → Storage vMotion まで自動化
-- 設定後は `nmcli` で検証し、不整合があれば警告
-- ゲストコマンドのエラー処理を強化し、`nmcli` が無い場合はレガシー適用に自動フォールバック
-- エラー時はロールバック（クローン削除・不要ファイル削除 など）を提案
-- Uses the vSphere Automation SDK REST API for guest IPv4/DNS provisioning (falls back to nmcli when unavailable).
+## Quick Start
 
-## 対応環境・前提
-- vCenter に API 到達できること
-- 対象 VM に VMware Tools が導入・稼働し、Guest Operations が利用可能
-- ゲスト OS 側で `nmcli`（NetworkManager）が利用可能（主に Linux）。未導入の場合はスクリプトがレガシー設定方式に切り替えますが、検証範囲が狭くなる点に留意してください。
-- Python 3.11 以降
+> Python 3.11 or later is required. The examples below assume PowerShell on Windows and bash on macOS/Linux.
 
-## 依存モジュール
-- pyvmomi
-- requests
-- 詳細は `requirements.txt` と `SETUP.md` を参照
+### 1. Create and activate a virtual environment
 
-## 実行フロー（概要）
-1. ソース vCenter から対象 VM の NIC 情報、GW、DNS などを取得
-2. 一時データストアへクローン作成（クローン側 NIC を初期化/調整）
-3. 宛先 vCenter へ登録し、PRD ネットワークに合わせて NIC 再構成
-4. ゲスト OS 側で `nmcli` により IP/GW/DNS/ルートを適用・検証（必要に応じてレガシー手順へフォールバック）
-5. 一時配置から最終 PRD 用データストアへ Storage vMotion で移行
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate
+```
 
-## 使い方（対話の流れ）
-- 実行: `python cloneAndVmotion.py`
-- 対話で以下を入力
-  - ソース/宛先 vCenter の認証情報
-  - 移行対象 VM 名
-  - ゲスト OS の認証情報（root または sudo 可能な admin）
-- 各フェーズで確認メッセージが表示され、`y` で続行
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
 
-## トラブルシューティング
-- 疎通失敗: ネットワークポリシー/ファイアウォールで ICMP が遮断されていないか確認
-- 認証失敗: VMware Tools 側で対象アカウントに Guest Operations 権限があるか確認
-- コマンド失敗: ログに終了コードと CLI 出力が記録されます。`nmcli` が無い/見つからない場合は自動でレガシー手順に切り替わったか確認してください。
-- セッション切断: 長時間の処理中でも vCenter へ定期的に keep-alive を送信します。より短い間隔が必要な場合は `VSPHERE_CLONE_KEEPALIVE_SECONDS`（秒）で調整できます。
-- 詳細ログ: `VSPHERE_CLONE_LOG_LEVEL=DEBUG` を設定
+### 2. Clone and install dependencies
 
-## 開発メモ
-- 依存は `requirements.txt` に記載（`pip install -r requirements.txt`）
-- 詳細なセットアップは `SETUP.md` を参照
-- Issue/PR による改善提案を歓迎
+```bash
+git clone https://github.com/atsu-oku/vmMigration.git
+cd vmMigration
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+### 3. Run the migration script
+
+```bash
+python cloneAndVmotion.py
+```
+
+Alternative setup flows (e.g., creating the virtual environment before cloning, using system-wide installs) are documented in `SETUP.md`.
+
+---
+
+## Highlights
+
+- Covers the full lifecycle: clone → destination vCenter registration → NIC rebuild → guest IP/GW/DNS/static routes → Storage vMotion.
+- Validates the applied configuration via the vSphere Automation SDK REST APIs. Falls back to `nmcli` verification when the automation APIs are unavailable.
+- Reworked default-gateway detection combines source route metadata with guest inspection to correctly identify the owning NIC.
+- Normalises DNS comparisons to stop false “missing DNS” warnings and reports only meaningful differences.
+- Avoids duplicate static-route application across NICs and keeps `nmcli` connections in autoconnect mode for post-reboot resilience.
+- Provides guided rollback steps (VM deletion, datastore clean-up) when a failure occurs mid-flight.
+
+---
+
+## Requirements
+
+- Network reachability to both the source and destination vCenter instances; API access must be permitted.
+- VMware Tools running inside the guest with Guest Operations enabled.
+- `nmcli`/NetworkManager available within the guest OS (typically Linux). When absent, the script applies a legacy configuration path, though verification coverage will be reduced.
+- Python 3.11+ with the dependencies listed in `requirements.txt`.
+
+---
+
+## Execution Flow (Summary)
+
+1. Collect source VM information (NICs, existing routes, DNS) and infer the default gateway/NIC ownership.
+2. Clone the VM into a staging datastore on the source vCenter, removing NICs to prepare for PRD configuration.
+3. Register the clone with the destination vCenter and recreate NICs mapped to the PRD networks.
+4. Apply guest network settings (IP/DNS/routes) using `nmcli`, or a shell fallback when `nmcli` is unavailable. Verification is performed via the vSphere SDK and/or `nmcli`.
+5. Execute the final Storage vMotion to the production datastore, then print a completion summary.
+
+During long-running operations the script keeps both vCenter sessions alive by issuing periodic keep-alive calls. The interval can be adjusted through `VSPHERE_CLONE_KEEPALIVE_SECONDS`.
+
+---
+
+## Usage Notes
+
+- Run the script with `python cloneAndVmotion.py` and follow the prompts:
+  - Source/destination vCenter credentials
+  - Target VM name
+  - Guest OS credentials (root and/or sudo-capable user)
+- Each phase presents a confirmation banner; respond with `y` to proceed.
+- Increase logging verbosity by exporting `VSPHERE_CLONE_LOG_LEVEL=DEBUG`.
+- The final verification step can be switched between SDK and `nmcli` by setting `REQUESTS_AVAILABLE`; when `requests` is installed, the SDK path is preferred.
+
+---
+
+## Troubleshooting
+
+- **Connectivity checks fail** – ensure ICMP is permitted between the guest and your validation targets. The script prints the exact ping command used.
+- **Guest authentication fails** – confirm the VMware Tools guest operations permissions for the supplied account.
+- **DNS mismatch warnings** – the log now prints the expected vs. actual sets. If both values are empty, no warning is shown; any listed discrepancy indicates the guest did not adopt the configured servers.
+- **Route discrepancies** – only non-default mismatches are listed. Default routes (`0.0.0.0/0`) are tracked via the gateway inference logic.
+- **Rollback requests** – when an error occurs after registration, the script prompts for cleanup (VM deletion, datastore file removal). Follow the guided prompts to leave the environment consistent.
+
+---
+
+## Further Reading
+
+- `SETUP.md`: Detailed environment preparation options (with/without virtual environments) and logging variables.
+- `CHANGELOG.md`: Version history.
+- `TODO.md`: Operational to-do items and follow-up tasks.
+
+Feel free to open issues or PRs to improve the tooling. The maintainers welcome feedback based on lab or production migrations.***
