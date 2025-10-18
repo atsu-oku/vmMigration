@@ -21,7 +21,8 @@ from typing import Iterable, List, Mapping, Optional
 
 import requests
 from requests import Session
-from requests.packages.urllib3.exceptions import InsecureRequestWarning
+import urllib3
+from urllib3.exceptions import InsecureRequestWarning
 
 
 @dataclass
@@ -86,7 +87,7 @@ class VsphereGuestNetworkSDK:
         self._session.verify = verify_ssl
         self._session.headers.update({"Accept": "application/json"})
         if not verify_ssl:
-            requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+            urllib3.disable_warnings(InsecureRequestWarning)
         self._authenticate(username, password)
 
     def _authenticate(self, username: str, password: str) -> None:
