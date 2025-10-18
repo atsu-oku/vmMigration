@@ -13,7 +13,7 @@ import shlex
 from dataclasses import dataclass
 from datetime import datetime
 from functools import partial
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple, TypeAlias
 try:
     from pyVim.connect import SmartConnect, Disconnect
 except ModuleNotFoundError:
@@ -144,7 +144,7 @@ LEGACY_INTERFACE_PATTERN = re.compile(r'^(ens|eno|enp|enx|eth|em)[0-9a-z\-]*$', 
 
 VCENTER_KEEPALIVE_SECONDS = int(os.environ.get("VSPHERE_CLONE_KEEPALIVE_SECONDS", "240"))
 
-KeepAliveHandle = Tuple[threading.Thread, threading.Event]
+KeepAliveHandle: TypeAlias = Tuple[threading.Thread, threading.Event]
 
 
 def _start_keepalive_thread(service_instance, label: str, interval: int = VCENTER_KEEPALIVE_SECONDS) -> Optional[KeepAliveHandle]:
