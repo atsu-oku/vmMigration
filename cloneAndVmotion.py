@@ -105,23 +105,23 @@ def prefix_to_subnet_mask(prefix_length):
     netmask = (0xffffffff << host_bits) & 0xffffffff
     return '.'.join([str((netmask >> i) & 0xff) for i in (24, 16, 8, 0)])
 
-def calculate_ip_stg_to_prd(ip_address):
+def calculate_ip_stg_to_prd(address):
     """Map STG IPv4 addresses (third octet 170-179) to PRD range by subtracting 10."""
-    if not ip_address:
+    if not address:
         return None
-    parts = ip_address.split('.')
+    parts = address.split('.')
     if len(parts) != 4:
-        raise ValueError(f'Invalid IPv4 format: {ip_address}')
+        raise ValueError(f'Invalid IPv4 format: {address}')
     try:
         octets = [int(x) for x in parts]
     except ValueError as exc:
-        raise ValueError(f'Non-numeric value detected in IPv4 address: {ip_address}') from exc
+        raise ValueError(f'Non-numeric value detected in IPv4 address: {address}') from exc
     if any(o < 0 or o > 255 for o in octets):
-        raise ValueError(f'IPv4 octet out of range 0-255: {ip_address}')
+        raise ValueError(f'IPv4 octet out of range 0-255: {address}')
     if 170 <= octets[2] <= 179:
         octets[2] = octets[2] - 10
         return '.'.join(str(o) for o in octets)
-    return ip_address
+    return address
 
 
 def mask_to_prefix(netmask):
@@ -1491,7 +1491,7 @@ try:
             network_name = label or summary or 'Unknown Network'
 
         sdk_iface_entry = sdk_interfaces_by_mac.get(mac_lower)
-        ip_address = None
+        ip_addr = None
         prefix_len = None
         sdk_interface_index = None
         sdk_nic_id = None
@@ -1503,17 +1503,17 @@ try:
             ip_entries = ip_data.get('ip_addresses') or []
             for entry in ip_entries:
                 if isinstance(entry, dict) and entry.get('ip_address') and '.' in entry.get('ip_address'):
-                    ip_address = entry.get('ip_address')
+                    ip_addr = entry.get('ip_address')
                     prefix_len = entry.get('prefix_length')
                     break
         subnet_mask = prefix_to_subnet_mask(prefix_len) if prefix_len is not None else None
-        if not ip_address and guest_nic and guest_nic.ipConfig and getattr(guest_nic.ipConfig, 'ipAddress', None):
+        if not ip_addr and guest_nic and guest_nic.ipConfig and getattr(guest_nic.ipConfig, 'ipAddress', None):
             ip_v4_info = next((ip for ip in guest_nic.ipConfig.ipAddress if '.' in ip.ipAddress), None)
             if ip_v4_info and getattr(ip_v4_info, 'ipAddress', None):
-                ip_address = ip_v4_info.ipAddress
+                ip_addr = ip_v4_info.ipAddress
                 if subnet_mask is None:
                     subnet_mask = prefix_to_subnet_mask(ip_v4_info.prefixLength)
-        if not ip_address:
+        if not ip_addr:
             missing_ipv4_messages.append(f"NIC {mac} ({network_name}) data could not be retrieved from API/VMware Tools.")
             continue
         if subnet_mask is None and guest_nic and guest_nic.ipConfig and getattr(guest_nic.ipConfig, 'ipAddress', None):
@@ -1528,7 +1528,7 @@ try:
             'device_type': type(device),
             'mac_address': mac,
             'network_name': network_name,
-            'ip_address': ip_address,
+            'ip_address': ip_addr,
             'subnet_mask': subnet_mask,
             'is_gateway_nic': False,
         }
