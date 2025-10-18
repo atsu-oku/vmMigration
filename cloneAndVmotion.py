@@ -1491,7 +1491,7 @@ try:
             network_name = label or summary or 'Unknown Network'
 
         sdk_iface_entry = sdk_interfaces_by_mac.get(mac_lower)
-        ip_address = None
+        ip_addr = None
         prefix_len = None
         sdk_interface_index = None
         sdk_nic_id = None
@@ -1503,17 +1503,17 @@ try:
             ip_entries = ip_data.get('ip_addresses') or []
             for entry in ip_entries:
                 if isinstance(entry, dict) and entry.get('ip_address') and '.' in entry.get('ip_address'):
-                    ip_address = entry.get('ip_address')
+                    ip_addr = entry.get('ip_address')
                     prefix_len = entry.get('prefix_length')
                     break
         subnet_mask = prefix_to_subnet_mask(prefix_len) if prefix_len is not None else None
-        if not ip_address and guest_nic and guest_nic.ipConfig and getattr(guest_nic.ipConfig, 'ipAddress', None):
+        if not ip_addr and guest_nic and guest_nic.ipConfig and getattr(guest_nic.ipConfig, 'ipAddress', None):
             ip_v4_info = next((ip for ip in guest_nic.ipConfig.ipAddress if '.' in ip.ipAddress), None)
             if ip_v4_info and getattr(ip_v4_info, 'ipAddress', None):
-                ip_address = ip_v4_info.ipAddress
+                ip_addr = ip_v4_info.ipAddress
                 if subnet_mask is None:
                     subnet_mask = prefix_to_subnet_mask(ip_v4_info.prefixLength)
-        if not ip_address:
+        if not ip_addr:
             missing_ipv4_messages.append(f"NIC {mac} ({network_name}) data could not be retrieved from API/VMware Tools.")
             continue
         if subnet_mask is None and guest_nic and guest_nic.ipConfig and getattr(guest_nic.ipConfig, 'ipAddress', None):
@@ -1528,7 +1528,7 @@ try:
             'device_type': type(device),
             'mac_address': mac,
             'network_name': network_name,
-            'ip_address': ip_address,
+            'ip_address': ip_addr,
             'subnet_mask': subnet_mask,
             'is_gateway_nic': False,
         }
