@@ -43,9 +43,9 @@ Alternative setup flows (e.g., creating the virtual environment before cloning, 
 
 - Covers the full lifecycle: clone → destination vCenter registration → NIC rebuild → guest IP/GW/DNS/static routes → Storage vMotion.
 - Validates the applied configuration via the vSphere Automation SDK REST APIs. Falls back to `nmcli` verification when the automation APIs are unavailable.
-- Reworked default-gateway detection combines source route metadata with guest inspection to correctly identify the owning NIC.
+- Reworked default-gateway detection combines source route metadata with guest inspection to correctly identify the owning NIC. When the source VM exposes no default route, the script falls back to the PRD segment rule (third octet 160/162) and labels the inference in the logs.
 - Normalises DNS comparisons to stop false “missing DNS” warnings and reports only meaningful differences.
-- Avoids duplicate static-route application across NICs and keeps `nmcli` connections in autoconnect mode for post-reboot resilience.
+- Avoids duplicate static-route application across NICs, clears stale default routes before reconfiguration, and keeps `nmcli` connections in autoconnect mode for post-reboot resilience.
 - Provides guided rollback steps (VM deletion, datastore clean-up) when a failure occurs mid-flight.
 
 ---
@@ -79,6 +79,7 @@ During long-running operations the script keeps both vCenter sessions alive by i
   - Guest OS credentials (root and/or sudo-capable user)
 - Each phase presents a confirmation banner; respond with `y` to proceed.
 - Increase logging verbosity by exporting `VSPHERE_CLONE_LOG_LEVEL=DEBUG`.
+- After a root authentication failure the workflow automatically switches to the sudo-capable account for the remainder of the run, avoiding repeated root prompts.
 - The final verification step can be switched between SDK and `nmcli` by setting `REQUESTS_AVAILABLE`; when `requests` is installed, the SDK path is preferred.
 
 ---
@@ -90,6 +91,14 @@ During long-running operations the script keeps both vCenter sessions alive by i
 - **DNS mismatch warnings** – the log now prints the expected vs. actual sets. If both values are empty, no warning is shown; any listed discrepancy indicates the guest did not adopt the configured servers.
 - **Route discrepancies** – only non-default mismatches are listed. Default routes (`0.0.0.0/0`) are tracked via the gateway inference logic.
 - **Rollback requests** – when an error occurs after registration, the script prompts for cleanup (VM deletion, datastore file removal). Follow the guided prompts to leave the environment consistent.
+
+---
+
+## Tested Platforms
+
+- RHEL 7.9 (NetworkManager + `nmcli`) — end-to-end migration validated 2025-10-19.
+
+Additional guest OS reports are welcome; please file issues with findings.
 
 ---
 
