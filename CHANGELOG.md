@@ -6,7 +6,6 @@
 - Added `CloneAndVmotionWorkflow` / `WorkflowState` scaffolding so early migration phases observe SRP.
 - Centralised vCenter authentication via `authenticate_vcenter` helper to remove duplicated SmartConnect calls.
 
-
 ## 2025-10-18
 
 - Improved default-gateway inference to prefer vSphere route metadata and NIC subnet checks.
@@ -41,4 +40,3 @@
 ## 2025-10-10
 
 - Initial project setup, establishing the migration script foundation spanning source and destination vCenters.
-
