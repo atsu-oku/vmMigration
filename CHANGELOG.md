@@ -1,9 +1,16 @@
-# Version History
+﻿# Version History
 
-## 2025-10-19
+## 2025-10-19 (Refactor)
+
+- Introduced `GuestCommandExecutor` to encapsulate guest command execution and simplify debugging.
+- Added `CloneAndVmotionWorkflow` / `WorkflowState` scaffolding so early migration phases observe SRP.
+- Centralised vCenter authentication via `authenticate_vcenter` helper to remove duplicated SmartConnect calls.
+
+
+## 2025-10-18
 
 - Improved default-gateway inference to prefer vSphere route metadata and NIC subnet checks.
-- Normalised DNS verification output to remove false “missing DNS” warnings and clearly display actual/expected sets.
+- Normalised DNS verification output to remove false 窶徇issing DNS窶・warnings and clearly display actual/expected sets.
 - Filtered SDK route snapshots so only non-default discrepancies are reported.
 - Ensured `nmcli` connections remain in autoconnect mode and prevented duplicate static-route application.
 - Updated documentation (README/SETUP) to reflect the new verification behaviour and configuration options.
@@ -22,15 +29,16 @@
 
 ## 2025-10-12
 
-- ロケール固定と出力の一貫性を改善。nmcli/ping の挙動が想定どおりになるよう調整。
-- sudo 実行時のフォールバック処理を強化し、主要コマンドの再実行性を改善。
-- README.md / SETUP.md を再構成して、セットアップ手順と使い方を明確化。
+- Fixed locale handling and output formatting so nmcli/ping behave consistently.
+- Hardened sudo fallback logic to improve resilience when rerunning key commands.
+- Restructured README.md / SETUP.md to clarify setup steps and usage.
 
 ## 2025-10-11
 
-- クローン → IP 設定 → Storage vMotion までのフローを整備。
-- ゲスト OS で nmcli / ping を用いた疎通確認とロールバック処理を追加。
+- Organised the flow from clone → IP configuration → Storage vMotion.
+- Added connectivity verification and rollback steps using nmcli / ping inside the guest OS.
 
 ## 2025-10-10
 
-- プロジェクト初期化。ソース vCenter と宛先 vCenter を跨ぐ移行スクリプトの土台を作成。
+- Initial project setup, establishing the migration script foundation spanning source and destination vCenters.
+
