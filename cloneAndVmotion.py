@@ -6,7 +6,6 @@ import time
 import threading
 import logging
 import ipaddress
-import urllib.request
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Set, Tuple
 try:
@@ -29,11 +28,8 @@ from guest_commands import (
     reset_root_login_disabled,
 )
 from network_utils import (
-    ConnectionCheckParams,
-    DEFAULT_CONN_CHECK_PARAMS,
     NMCLI_FIELDS_NO_TYPE,
     NMCLI_FIELDS_WITH_TYPE,
-    PRD_STATIC_ROUTE_SEGMENTS,
     SSH_ALLOWED_SOURCE_IP,
     LEGACY_INTERFACE_PATTERN,
     calculate_ip_stg_to_prd,
@@ -313,9 +309,9 @@ try:
             network_name = guest_nic.network
         if not network_name:
             device_info = getattr(device, 'deviceInfo', None)
-            label = getattr(device_info, 'label', None) if device_info else None
+            network_label = getattr(device_info, 'label', None) if device_info else None
             summary = getattr(device_info, 'summary', None) if device_info else None
-            network_name = label or summary or 'Unknown Network'
+            network_name = network_label or summary or 'Unknown Network'
 
         sdk_iface_entry = sdk_interfaces_by_mac.get(mac_lower)
         nic_ip_address: Optional[str] = None
@@ -1400,10 +1396,18 @@ except Exception as error:
                     print("   Reconnecting to the destination vCenter for cleanup...")
                     _stop_keepalive_thread(dest_keepalive_handle)
                     dest_keepalive_handle = None
-                    si_dest = SmartConnect(host=VCSA_HOST_DEST, user=VCSA_USER,
-                                           pwd=VCSA_PWD_DEST, port=VCSA_PORT, sslContext=ctx)
+                    try:
+                        si_dest = SmartConnect(
+                            host=VCSA_HOST_DEST,
+                            user=VCSA_USER,
+                            pwd=VCSA_PWD_DEST,
+                            port=VCSA_PORT,
+                            sslContext=ctx,
+                        )
+                    except Exception as reconnect_error:
+                        raise ConnectionError("Failed to reconnect to the destination vCenter.") from reconnect_error
                     if not si_dest:
-                        raise ConnectionError("Failed to reconnect to the destination vCenter.")
+                        raise ConnectionError("Failed to reconnect to the destination vCenter.")  # pylint: disable=raise-missing-from
                     print("   [OK] Reconnected successfully.")
                     dest_keepalive_handle = _start_keepalive_thread(si_dest, "dest-vcenter-cleanup")
                 content_dest_cleanup = si_dest.RetrieveContent()
