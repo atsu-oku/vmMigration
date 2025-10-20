@@ -21,7 +21,12 @@ try:
     REQUESTS_AVAILABLE = True
 except ImportError:
     REQUESTS_AVAILABLE = False
-from vsphere_sdk_network import VsphereGuestNetworkSDK
+from vsphere_sdk_network import (
+    VsphereGuestNetworkSDK,
+    IPv4Config,
+    DnsConfig,
+    RouteConfig,
+)
 from guest_commands import (
     execute_command_in_guest,
     NmcliNotAvailableError,
@@ -1011,9 +1016,69 @@ try:
             if not should_configure_routes and not gateway_nic_present:
                 should_configure_routes = (i == 0)
             use_nmcli_connection = nmcli_supported
+            rest_attempted = False
+            rest_configured = False
+            if (
+                use_sdk_networking
+                and sdk_network_client
+                and sdk_vm_id
+                and nic_info.get('sdk_nic_id')
+                and new_ip
+                and prefix is not None
+            ):
+                rest_attempted = True
+                try:
+                    ipv4_spec = IPv4Config(
+                        address=new_ip,
+                        prefix=prefix,
+                        default_gateway=expected_gateway_value if should_configure_routes else None,
+                    )
+                    dns_spec = DnsConfig(expected_dns_servers) if expected_dns_servers else None
+                    route_specs: List[RouteConfig] = []
+                    for route_idx, route_info in routes_for_nic:
+                        route_network = route_info.get('network')
+                        route_gateway = route_info.get('gateway')
+                        route_prefix = route_info.get('prefix')
+                        if not route_network or not route_gateway:
+                            continue
+                        try:
+                            route_prefix_int = int(route_prefix) if route_prefix is not None else None
+                        except (TypeError, ValueError):
+                            route_prefix_int = None
+                        route_specs.append(
+                            RouteConfig(
+                                network=str(route_network),
+                                gateway=str(route_gateway),
+                                prefix=route_prefix_int,
+                            )
+                        )
+                    sdk_network_client.update_interface(
+                        sdk_vm_id,
+                        str(nic_info['sdk_nic_id']),
+                        ipv4_spec,
+                        dns_spec,
+                        route_specs if route_specs else None,
+                    )
+                    rest_configured = True
+                    use_nmcli_connection = False
+                    if expected_dns_servers and not expected_dns_overall:
+                        expected_dns_overall = expected_dns_servers[:]
+                    for route_idx, _ in routes_for_nic:
+                        configured_route_indices.add(route_idx)
+                    print("   -> REST APIで客先のNICをしっとり更新できたよ。")
+                except Exception as sdk_update_error:  # pylint: disable=broad-exception-caught
+                    LOGGER.warning(
+                        "REST guest networking update failed; falling back to guest operations: %s",
+                        sdk_update_error,
+                    )
+                    print("   -> RESTまわりが機嫌を損ねたみたい。いつもの客操作で仕立て直すね。")
+                    use_sdk_networking = False
             selected_route_indices: List[int] = []
             selected_route_lines: List[str] = []
-            if nmcli_supported:
+            if rest_configured:
+                selected_route_indices = [route_idx for route_idx, _ in routes_for_nic]
+                selected_route_lines = []
+            elif nmcli_supported:
                 try:
                     try:
                         guest_command_executor(f"nmcli device disconnect {device_name} || true", check_exit_code=False)
