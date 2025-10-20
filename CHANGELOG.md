@@ -1,11 +1,18 @@
 ﻿# Version History
 
+## 2025-10-19 (Gateway fallback & auth hardening)
+
+- Tightened default-route inference to consider only explicit 0.0.0.0/0 entries from vSphere REST responses, preventing duplicate PRD defaults.
+- Added PRD segment fallback (third octet 160/162) with clear logging when the source VM has no default gateway.
+- Ensured root guest authentication is attempted once per run; subsequent commands use the sudo-capable user automatically.
+- Simplified SDK verification output by removing redundant route listings and documented the behaviour (README.md).
+- Validated end-to-end flow on RHEL 7.9 (NetworkManager + `nmcli`); recorded the platform in documentation.
+
 ## 2025-10-19 (Refactor)
 
 - Introduced `GuestCommandExecutor` to encapsulate guest command execution and simplify debugging.
 - Added `CloneAndVmotionWorkflow` / `WorkflowState` scaffolding so early migration phases observe SRP.
 - Centralised vCenter authentication via `authenticate_vcenter` helper to remove duplicated SmartConnect calls.
-
 
 ## 2025-10-18
 
@@ -41,4 +48,3 @@
 ## 2025-10-10
 
 - Initial project setup, establishing the migration script foundation spanning source and destination vCenters.
-
