@@ -10,7 +10,7 @@ import ipaddress
 import urllib.request
 import re
 import shlex
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 try:
@@ -66,6 +66,14 @@ LOGGER = logging.getLogger("cloneAndVmotion")
 LOGGER.setLevel(LOG_LEVEL)
 
 ROOT_LOGIN_DISABLED = False
+
+
+def authenticate_vcenter(host: str, user: str, password: str, ssl_ctx: ssl.SSLContext):
+    """Establish a SmartConnect session to the specified vCenter and return the service instance."""
+    session = SmartConnect(host=host, user=user, pwd=password, port=VCSA_PORT, sslContext=ssl_ctx)
+    if not session:
+        raise ConnectionError(f"Failed to authenticate to vCenter ({host}).")
+    return session
 
 # ------------------------------------------------
 # Connection and Migration Settings
@@ -685,6 +693,7 @@ def ensure_firewall_allows_ssh(command_executor, source_ip):
             return
     print("      - firewalld / iptables unavailable; skipping firewall adjustments.")
 
+
 def configure_interface_without_nmcli(
     command_executor,
     interface_name: str,
@@ -958,11 +967,11 @@ def verify_destination_network_with_sdk(
         LOGGER.warning("SDK verification failed to read routes: %s", error)
         route_payload = []
         success = False
-        actual_route_set = set()
-        for route in route_payload or []:
-            network = route.get('network')
-            prefix = route.get('prefix_length')
-            gateway = route.get('gateway_address') or ''
+    actual_route_set = set()
+    for route in route_payload or []:
+        network = route.get('network')
+        prefix = route.get('prefix_length')
+        gateway = route.get('gateway_address') or ''
         if network is None or prefix is None:
             continue
         try:
@@ -970,11 +979,11 @@ def verify_destination_network_with_sdk(
         except (TypeError, ValueError):
             continue
         actual_route_set.add((str(network), prefix_int, str(gateway)))
-        expected_route_set = set()
-        for route in expected_routes or []:
-            network_value = route.get('network')
-            prefix_value = route.get('prefix')
-            gateway = route.get('gateway') or ''
+    expected_route_set = set()
+    for route in expected_routes or []:
+        network_value = route.get('network')
+        prefix_value = route.get('prefix')
+        gateway = route.get('gateway') or ''
         if network_value is None:
             continue
         network_str = str(network_value)
@@ -991,14 +1000,15 @@ def verify_destination_network_with_sdk(
         except (TypeError, ValueError):
             continue
         expected_route_set.add((network_str, prefix_int, str(gateway)))
-        missing_routes = expected_route_set - actual_route_set
-        extra_routes = actual_route_set - expected_route_set
-        if missing_routes:
-            print(f"   [WARN] Missing expected routes: {sorted(missing_routes)}")
-            success = False
-        if extra_routes:
-            print(f"   -> Additional routes (for reference): {sorted(extra_routes)}")
-        return success
+    missing_routes = expected_route_set - actual_route_set
+    extra_routes = actual_route_set - expected_route_set
+    if missing_routes:
+        print(f"   [WARN] Missing expected routes: {sorted(missing_routes)}")
+        success = False
+    if extra_routes:
+        print(f"   -> Additional routes (for reference): {sorted(extra_routes)}")
+    return success
+
 
 def verify_nmcli_connection_settings(
     command_executor,
@@ -1117,6 +1127,8 @@ def wait_for_vm_availability(content, name, retries=30, delay_seconds=2):
             return vm
         time.sleep(max(1, delay_seconds))
     raise RuntimeError(f"Destination vCenter did not contain VM '{name}' (timed out).")
+
+
 
 
 class GuestCommandExecutor:
@@ -1250,6 +1262,7 @@ class GuestCommandExecutor:
             programPath="/bin/bash",
             arguments=f"-lc {shlex.quote(redirected_cmd)}",
         )
+
         try:
             pid = self.process_manager.StartProgramInGuest(vm=vm, auth=auth, spec=spec)
             exit_code = self._wait_for_exit(vm, auth, pid)
@@ -1301,6 +1314,7 @@ class GuestCommandExecutor:
     def _run_as_admin(self, vm, command: str) -> Tuple[int, str, str]:
         if not self._can_use_admin():
             raise RuntimeError("Admin credentials are not available for guest operations.")
+
         temp_password = None
         try:
             temp_password = self._create_temp_password_file(vm)
@@ -1379,6 +1393,7 @@ class GuestCommandExecutor:
             "no tty present" in stderr_lower or "must have a tty" in stderr_lower
         )
 
+
 def execute_command_in_guest(
     guest_op_manager,
     vm,
@@ -1390,6 +1405,323 @@ def execute_command_in_guest(
 ):
     executor = GuestCommandExecutor(guest_op_manager, root_auth, admin_auth, admin_pwd)
     return executor.run(vm, command, check_exit_code=check_exit_code)
+
+
+@dataclass
+class WorkflowState:
+    clone_name: Optional[str] = None
+    vmx_path: Optional[str] = None
+    new_vm_on_source: Optional[Any] = None
+    migrated_vm_for_rollback: Optional[Any] = None
+    migrated_vm_name_for_rollback: Optional[str] = None
+    migrated_vm: Optional[Any] = None
+    unregistered_from_source: bool = False
+    original_nic_info: List[Dict[str, Any]] = field(default_factory=list)
+    original_dns_servers: List[str] = field(default_factory=list)
+    original_default_gateway: Optional[str] = None
+    original_static_routes: List[Dict[str, Any]] = field(default_factory=list)
+    prd_static_routes: List[Dict[str, Any]] = field(default_factory=list)
+    sdk_network_client: Optional[VsphereGuestNetworkSDK] = None
+    source_keepalive_handle: Optional[Tuple[threading.Thread, threading.Event]] = None
+    dest_keepalive_handle: Optional[Tuple[threading.Thread, threading.Event]] = None
+    target_datastore: Optional[Any] = None
+    target_folder: Optional[Any] = None
+
+
+class CloneAndVmotionWorkflow:
+    def __init__(
+        self,
+        ctx: ssl.SSLContext,
+        vcsa_pwd_source: str,
+        vcsa_pwd_dest: str,
+        target_vm_name: str,
+        guest_root_pwd: str,
+        guest_admin_pwd: str,
+    ) -> None:
+        self.ctx = ctx
+        self.vcsa_pwd_source = vcsa_pwd_source
+        self.vcsa_pwd_dest = vcsa_pwd_dest
+        self.target_vm_name = target_vm_name
+        self.guest_root_pwd = guest_root_pwd
+        self.guest_admin_pwd = guest_admin_pwd
+        self.state = WorkflowState()
+        self.si_source = None
+        self.si_dest = None
+        self.content_source = None
+        self.content_dest = None
+        self.target_vm = None
+
+    def run(self) -> None:
+        try:
+            self._preflight_check()
+            self._collect_source_vm_details()
+            self._confirm_clone_plan()
+            self._perform_source_clone_operations()
+            self._register_destination_vm()
+            self._recreate_destination_nics()
+            self._configure_destination_network()
+            self._perform_storage_vmotion()
+            self._finalize_success()
+        except Exception as error:  # pylint: disable=broad-exception-caught
+            self._handle_error(error)
+        finally:
+            self._cleanup()
+
+    def _preflight_check(self) -> None:
+        print("\n--- [Phase 0/7] Pre-flight Check: Authenticating to vCenters ---")
+        print(f"   Attempting to connect to source vCenter ({VCSA_HOST_SOURCE})...")
+        si_source = authenticate_vcenter(VCSA_HOST_SOURCE, VCSA_USER, self.vcsa_pwd_source, self.ctx)
+        print("   [OK] Source vCenter authentication succeeded.")
+        Disconnect(si_source)
+
+        print(f"   Attempting to connect to destination vCenter ({VCSA_HOST_DEST})...")
+        si_dest = authenticate_vcenter(VCSA_HOST_DEST, VCSA_USER, self.vcsa_pwd_dest, self.ctx)
+        print("   [OK] Destination vCenter authentication succeeded.")
+        Disconnect(si_dest)
+
+    def _collect_source_vm_details(self) -> None:
+        print("\n--- [Phase 1/7] Source vCenter: Collect Info & Prepare ---")
+        self.si_source = authenticate_vcenter(VCSA_HOST_SOURCE, VCSA_USER, self.vcsa_pwd_source, self.ctx)
+        print("[OK] Connected to source vCenter.")
+        self.state.source_keepalive_handle = _start_keepalive_thread(self.si_source, "source-vcenter")
+
+        self.content_source = self.si_source.RetrieveContent()
+        container_view = self.content_source.viewManager.CreateContainerView(
+            self.content_source.rootFolder,
+            [vim.VirtualMachine],
+            True,
+        )
+        try:
+            self.target_vm = next(
+                (vm for vm in container_view.view if vm.name == self.target_vm_name),
+                None,
+            )
+        finally:
+            container_view.Destroy()
+
+        if not self.target_vm:
+            raise FileNotFoundError(f"VM '{self.target_vm_name}' was not found.")
+        print(f"[OK] Located VM '{self.target_vm.name}'.")
+
+        if self.target_vm.guest.toolsRunningStatus != "guestToolsRunning":
+            raise SystemError("Source VM must be powered on with VMware Tools running to collect IP information.")
+
+        sdk_interfaces_by_mac: Dict[str, Tuple[Dict[str, Any], int]] = {}
+        sdk_vm_id_source = getattr(self.target_vm, "_moId", None)
+        if sdk_vm_id_source and REQUESTS_AVAILABLE:
+            try:
+                sdk_source_client = VsphereGuestNetworkSDK(
+                    host=VCSA_HOST_SOURCE,
+                    username=VCSA_USER,
+                    password=self.vcsa_pwd_source,
+                    verify_ssl=False,
+                )
+                interfaces = sdk_source_client.list_interfaces(sdk_vm_id_source)
+                networking_state = sdk_source_client.get_networking_state(sdk_vm_id_source)
+                routes = sdk_source_client.list_routes(sdk_vm_id_source)
+            except Exception as sdk_error:  # pylint: disable=broad-exception-caught
+                LOGGER.warning("Failed to collect source VM network info via API: %s", sdk_error)
+                interfaces = []
+                networking_state = {}
+                routes = []
+            finally:
+                if 'sdk_source_client' in locals():
+                    try:
+                        sdk_source_client.close()
+                    except Exception:  # pylint: disable=broad-exception-caught
+                        pass
+            for idx, iface in enumerate(interfaces or []):
+                mac_candidate = (iface.get("mac_address") or iface.get("mac") or "").lower()
+                if mac_candidate:
+                    sdk_interfaces_by_mac[mac_candidate] = (iface, idx)
+        else:
+            networking_state = {}
+            routes = []
+
+        guest_net_map = {nic.macAddress: nic for nic in self.target_vm.guest.net if nic.macAddress}
+        original_nic_info: List[Dict[str, Any]] = []
+        missing_ipv4_messages: List[str] = []
+
+        for device in self.target_vm.config.hardware.device:
+            if not isinstance(device, vim.vm.device.VirtualEthernetCard):
+                continue
+            mac_address = device.macAddress
+            nic_info: Dict[str, Any] = {
+                "mac_address": mac_address,
+                "label": getattr(device.deviceInfo, "label", ""),
+                "network_name": getattr(device.backing, "network", None).name if getattr(device.backing, "network", None) else "",
+                "device_key": device.key,
+                "device_type": type(device),
+            }
+            if mac_address in guest_net_map:
+                guest_nic = guest_net_map[mac_address]
+                if guest_nic.ipConfig and guest_nic.ipConfig.ipAddress:
+                    for ip_entry in guest_nic.ipConfig.ipAddress:
+                        if ':' in ip_entry.ipAddress:
+                            continue
+                        nic_info["ip_address"] = ip_entry.ipAddress
+                        nic_info["prefix"] = ip_entry.prefixLength
+                        nic_info["subnet_mask"] = prefix_to_subnet_mask(ip_entry.prefixLength)
+                        break
+                    else:
+                        missing_ipv4_messages.append(mac_address)
+                else:
+                    missing_ipv4_messages.append(mac_address)
+            if mac_address.lower() in sdk_interfaces_by_mac:
+                iface_info, iface_idx = sdk_interfaces_by_mac[mac_address.lower()]
+                nic_info["sdk_interface_index"] = iface_idx
+                nic_info["sdk_interface"] = iface_info
+            original_nic_info.append(nic_info)
+
+        if missing_ipv4_messages:
+            LOGGER.debug("NICs without IPv4 info from guest tools: %s", missing_ipv4_messages)
+
+        default_gateway = None
+        static_routes = []
+        dns_servers = []
+
+        if networking_state:
+            dns_config = (networking_state.get("dns") or {}).get("ip_addresses")
+            if dns_config:
+                dns_servers = [dns for dns in dns_config if dns and not str(dns).startswith("127.")]
+            ip_stack = networking_state.get("ip_stack") or {}
+            ipv4 = (ip_stack.get("ipv4") or {})
+            default_gateway = ipv4.get("default_gateway")
+            static_routes = ipv4.get("routes") or []
+        elif self.target_vm.guest.ipStack:
+            stack = self.target_vm.guest.ipStack[0]
+            if stack.dnsConfig:
+                dns_servers = [dns for dns in stack.dnsConfig.ipAddress if not dns.startswith("127.")]
+            if stack.route:
+                static_routes = [
+                    {
+                        "network": route.network,
+                        "prefix": getattr(route, "prefixLength", None),
+                        "gateway": route.gateway.ipAddress if route.gateway else None,
+                        "owner_index": getattr(route, "owner", None),
+                    }
+                    for route in stack.route
+                ]
+            if stack.ipRouteConfig and stack.ipRouteConfig.defaultGateway:
+                default_gateway = stack.ipRouteConfig.defaultGateway.ipAddress
+
+        self.state.original_nic_info = original_nic_info
+        self.state.original_dns_servers = dns_servers
+        self.state.original_default_gateway = default_gateway
+        self.state.original_static_routes = static_routes
+
+    def _confirm_clone_plan(self) -> None:
+        clone_name = self.state.clone_name or f"{self.target_vm.name}-{datetime.now().strftime('%Y%m%d')}"
+        self.state.clone_name = clone_name
+
+        print("\n" + "=" * 25 + " Pre-execution Check (1/4) " + "=" * 25)
+        print("Review the details below before creating the clone and starting the migration.")
+        print("\n  [Source VM details]")
+        print(f"    - VM name       : {self.target_vm.name}")
+        print(f"    - OS            : {self.target_vm.summary.config.guestFullName}")
+        print("\n  [Source NIC details]")
+        if self.state.original_nic_info:
+            for i, nic in enumerate(self.state.original_nic_info):
+                print(f"    - NIC {i+1} ({nic['mac_address']})")
+                print(f"      - Network     : {nic['network_name']}")
+                print(f"      - IP Address  : {nic.get('ip_address', '(unknown)')}")
+                print(f"      - Subnet Mask : {nic.get('subnet_mask', '(unknown)')}")
+        else:
+            print("    - No NIC information was found.")
+        if self.state.original_default_gateway:
+            print(f"    - Gateway     : {self.state.original_default_gateway}")
+        else:
+            print("    - Default gateway not detected.")
+        print("\n  [Clone VM specification]")
+        print(f"    - New VM name   : {clone_name}")
+        print(f"    - Placement datastore: {TARGET_DATASTORE_NAME}")
+        print("=" * 64)
+
+        user_approval = input("\nProceed with this clone operation? (y/n): ")
+        if user_approval.lower() != 'y':
+            raise InterruptedError("Operation cancelled by the user.")
+
+    def _perform_source_clone_operations(self) -> None:
+        if not self.si_source:
+            raise RuntimeError("Source vCenter connection is not available.")
+
+        target_datastore = self.state.target_datastore
+        if not target_datastore:
+            raise RuntimeError("Target datastore information is missing.")
+
+        clone_name = self.state.clone_name
+        target_folder = self.state.target_folder or getattr(self.target_vm, 'parent', None)
+
+        relocate_spec = vim.vm.RelocateSpec(datastore=target_datastore)
+        clone_spec = vim.vm.CloneSpec(location=relocate_spec, powerOn=False, template=False)
+
+        print("\nStarting clone task...")
+        task = self.target_vm.Clone(folder=target_folder, name=clone_name, spec=clone_spec)
+        while task.info.state not in [vim.TaskInfo.State.success, vim.TaskInfo.State.error]:
+            progress = task.info.progress or 0
+            print(f"   Clone progress: {progress}%", end='\r')
+            time.sleep(5)
+        print(" " * 40, end='\r')
+        if task.info.state != vim.TaskInfo.State.success:
+            raise RuntimeError(f"Clone task failed: {task.info.error.msg}")
+        print(f"\n[OK] Clone completed: '{clone_name}'")
+
+        new_vm_on_source = task.info.result
+        self.state.new_vm_on_source = new_vm_on_source
+
+        print(f"   Removing NICs from cloned VM '{new_vm_on_source.name}'...")
+        nic_devices = [
+            dev for dev in new_vm_on_source.config.hardware.device
+            if isinstance(dev, vim.vm.device.VirtualEthernetCard)
+        ]
+        if nic_devices:
+            nic_change_spec = [
+                vim.vm.device.VirtualDeviceSpec(operation='remove', device=nic)
+                for nic in nic_devices
+            ]
+            config_spec = vim.vm.ConfigSpec(deviceChange=nic_change_spec)
+            task = new_vm_on_source.ReconfigVM_Task(spec=config_spec)
+            while task.info.state not in [vim.TaskInfo.State.success, vim.TaskInfo.State.error]:
+                time.sleep(2)
+            if task.info.state != vim.TaskInfo.State.success:
+                raise RuntimeError(f"NIC removal failed: {task.info.error.msg}")
+            print("   [OK] Removed NICs.")
+        else:
+            print("   - No NICs found on cloned VM; skipping removal.")
+
+        self.state.vmx_path = new_vm_on_source.config.files.vmPathName
+        print(f"   Unregistering VM '{clone_name}' from the source vCenter...")
+        new_vm_on_source.UnregisterVM()
+        self.state.unregistered_from_source = True
+        print("   [OK] Unregistration completed.")
+
+        _stop_keepalive_thread(self.state.source_keepalive_handle)
+        self.state.source_keepalive_handle = None
+        Disconnect(self.si_source)
+        self.si_source = None
+        self.content_source = None
+        self.state.new_vm_on_source = None
+
+    def _register_destination_vm(self) -> None:
+        raise NotImplementedError
+
+    def _recreate_destination_nics(self) -> None:
+        raise NotImplementedError
+
+    def _configure_destination_network(self) -> None:
+        raise NotImplementedError
+
+    def _perform_storage_vmotion(self) -> None:
+        raise NotImplementedError
+
+    def _finalize_success(self) -> None:
+        raise NotImplementedError
+
+    def _handle_error(self, error: Exception) -> None:
+        raise NotImplementedError
+
+    def _cleanup(self) -> None:
+        raise NotImplementedError
 
 # ------------------------------------------------
 # 1. Enter passwords
@@ -1442,321 +1774,35 @@ si_dest = None
 sdk_network_client: VsphereGuestNetworkSDK | None = None
 source_keepalive_handle: Optional[Tuple[threading.Thread, threading.Event]] = None
 dest_keepalive_handle: Optional[Tuple[threading.Thread, threading.Event]] = None
+workflow: Optional[CloneAndVmotionWorkflow] = None
 try:
-    # --- [Phase 0/7] Pre-flight Check: Authenticating to vCenters ---
-    print("\n--- [Phase 0/7] Pre-flight Check: Authenticating to vCenters ---")
-    print(f"   Attempting to connect to source vCenter ({VCSA_HOST_SOURCE})...")
-    si_source = SmartConnect(host=VCSA_HOST_SOURCE, user=VCSA_USER, pwd=VCSA_PWD_SOURCE, port=VCSA_PORT, sslContext=ctx)
-    if not si_source:
-        raise ConnectionError(f"Failed to authenticate to source vCenter ({VCSA_HOST_SOURCE}).")
-    print("   [OK] Source vCenter authentication succeeded.")
-    Disconnect(si_source)
-    si_source = None
-    print(f"   Attempting to connect to destination vCenter ({VCSA_HOST_DEST})...")
-    si_dest = SmartConnect(host=VCSA_HOST_DEST, user=VCSA_USER, pwd=VCSA_PWD_DEST, port=VCSA_PORT, sslContext=ctx)
-    if not si_dest:
-        raise ConnectionError(f"Failed to authenticate to destination vCenter ({VCSA_HOST_DEST}).")
-    print("   [OK] Destination vCenter authentication succeeded.")
-    Disconnect(si_dest)
-    si_dest = None
-
-    # --- [Phase 1/7] Source vCenter: Collect Info & Prepare ---
-    print("\n--- [Phase 1/7] Source vCenter: Collect Info & Prepare ---")
-    si_source = SmartConnect(host=VCSA_HOST_SOURCE, user=VCSA_USER, pwd=VCSA_PWD_SOURCE, port=VCSA_PORT, sslContext=ctx)
-    if not si_source:
-        raise ConnectionError(f"Unable to connect to source vCenter ({VCSA_HOST_SOURCE}).")
-    print("[OK] Connected to source vCenter.")
-    source_keepalive_handle = _start_keepalive_thread(si_source, "source-vcenter")
-
-    content_source = si_source.RetrieveContent()
-
-    target_vm = next(
-        (
-            vm
-            for vm in content_source.viewManager.CreateContainerView(
-                content_source.rootFolder, [vim.VirtualMachine], True
-            ).view
-            if vm.name == target_vm_name
-        ),
-        None,
+    workflow = CloneAndVmotionWorkflow(
+        ctx=ctx,
+        vcsa_pwd_source=VCSA_PWD_SOURCE,
+        vcsa_pwd_dest=VCSA_PWD_DEST,
+        target_vm_name=target_vm_name,
+        guest_root_pwd=GUEST_ROOT_PWD,
+        guest_admin_pwd=GUEST_ADMIN_PWD,
     )
-    if not target_vm:
-        raise FileNotFoundError(f"VM '{target_vm_name}' was not found.")
-    print(f"[OK] Located VM '{target_vm.name}'.")
-    if target_vm.guest.toolsRunningStatus != "guestToolsRunning":
-        raise SystemError("Source VM must be powered on with VMware Tools running to collect IP information.")
-    sdk_source_client = None
-    source_interfaces: List[Dict[str, Any]] = []
-    source_networking_state: Dict[str, Any] = {}
-    source_routes: List[Dict[str, Any]] = []
-    sdk_interfaces_by_mac: Dict[str, Tuple[Dict[str, Any], int]] = {}
-    if REQUESTS_AVAILABLE:
-        sdk_vm_id_source = getattr(target_vm, "_moId", None)
-        if sdk_vm_id_source:
-            try:
-                sdk_source_client = VsphereGuestNetworkSDK(
-                    host=VCSA_HOST_SOURCE,
-                    username=VCSA_USER,
-                    password=VCSA_PWD_SOURCE,
-                    verify_ssl=False,
-                )
-                source_interfaces = sdk_source_client.list_interfaces(sdk_vm_id_source)
-                source_networking_state = sdk_source_client.get_networking_state(sdk_vm_id_source)
-                source_routes = sdk_source_client.list_routes(sdk_vm_id_source)
-            except Exception as sdk_error:
-                LOGGER.warning("Failed to collect source VM network info via API: %s", sdk_error)
-            finally:
-                if sdk_source_client:
-                    sdk_source_client.close()
-            for idx, iface in enumerate(source_interfaces):
-                mac_candidate = (iface.get("mac_address") or iface.get("mac") or "").lower()
-                if mac_candidate:
-                    sdk_interfaces_by_mac[mac_candidate] = (iface, idx)
-    print("   Verified that VMware Tools is running.")
-    print("   Gathering NIC information from the source VM...")
-    guest_net_map = {nic.macAddress: nic for nic in target_vm.guest.net if nic.macAddress}
-    missing_ipv4_messages = []
-    for device in target_vm.config.hardware.device:
-        if not isinstance(device, vim.vm.device.VirtualEthernetCard):
-            continue
-        mac = device.macAddress
-        mac_lower = (mac or '').lower()
-        guest_nic = guest_net_map.get(mac)
-        network_name = None
-        if isinstance(device.backing, vim.vm.device.VirtualEthernetCard.NetworkBackingInfo):
-            network_name = device.backing.network.name
-        elif isinstance(device.backing, vim.vm.device.VirtualEthernetCard.DistributedVirtualPortBackingInfo):
-            if guest_nic and getattr(guest_nic, 'network', None):
-                network_name = guest_nic.network
-        if not network_name and guest_nic and getattr(guest_nic, 'network', None):
-            network_name = guest_nic.network
-        if not network_name:
-            device_info = getattr(device, 'deviceInfo', None)
-            label = getattr(device_info, 'label', None) if device_info else None
-            summary = getattr(device_info, 'summary', None) if device_info else None
-            network_name = label or summary or 'Unknown Network'
-            sdk_iface_entry = sdk_interfaces_by_mac.get(mac_lower)
-            nic_ip_address = None
-            prefix_len = None
-            sdk_interface_index = None
-            sdk_nic_id = None
-        if sdk_iface_entry:
-            iface_data, iface_idx = sdk_iface_entry
-            sdk_interface_index = iface_idx
-            sdk_nic_id = iface_data.get('nic')
-            ip_data = iface_data.get('ip') or {}
-            ip_entries = ip_data.get('ip_addresses') or []
-        for ip_entry in ip_entries:
-            if isinstance(ip_entry, dict) and ip_entry.get('ip_address') and '.' in ip_entry.get('ip_address'):
-                nic_ip_address = ip_entry.get('ip_address')
-                prefix_len = ip_entry.get('prefix_length')
-                break
-            subnet_mask = prefix_to_subnet_mask(prefix_len) if prefix_len is not None else None
-            if not nic_ip_address and guest_nic and guest_nic.ipConfig and getattr(guest_nic.ipConfig, 'ipAddress', None):
-                ip_v4_info = next((ip for ip in guest_nic.ipConfig.ipAddress if '.' in ip.ipAddress), None)
-            if ip_v4_info and getattr(ip_v4_info, 'ipAddress', None):
-                nic_ip_address = ip_v4_info.ipAddress
-            if subnet_mask is None:
-                subnet_mask = prefix_to_subnet_mask(ip_v4_info.prefixLength)
-            if nic_ip_address:
-                if subnet_mask is None and guest_nic and guest_nic.ipConfig and getattr(guest_nic.ipConfig, 'ipAddress', None):
-                    ip_v4_info = next((ip for ip in guest_nic.ipConfig.ipAddress if '.' in ip.ipAddress), None)
-                if ip_v4_info:
-                    subnet_mask = prefix_to_subnet_mask(ip_v4_info.prefixLength)
-                if subnet_mask is None:
-                    missing_ipv4_messages.append(f"NIC {mac} ({network_name}) does not provide a subnet mask.")
-                else:
-                    nic_record = {
-                        'device_type': type(device),
-                        'mac_address': mac,
-                        'network_name': network_name,
-                        'ip_address': nic_ip_address,
-                        'subnet_mask': subnet_mask,
-                        'is_gateway_nic': False,
-                    }
-                if sdk_interface_index is not None:
-                    nic_record['sdk_interface_index'] = sdk_interface_index
-                if sdk_nic_id:
-                    nic_record['sdk_nic_id'] = sdk_nic_id
-                original_nic_info.append(nic_record)
-            else:
-                missing_ipv4_messages.append(
-                    f"NIC {mac} ({network_name}) data could not be retrieved from API/VMware Tools.")
-                default_gateway_owner_idx: Optional[int] = None
-        if source_routes:
-            original_static_routes.clear()
-            default_route_candidates: List[Dict[str, Any]] = []
-        for route in source_routes:
-            network = route.get('network')
-            prefix = route.get('prefix_length')
-            gateway = route.get('gateway_address')
-            interface_index = route.get('interface_index')
-            if network is None or prefix is None:
-                continue
-            resolved_owner: Optional[int] = None
-            if interface_index is not None and 0 <= interface_index < len(original_nic_info):
-                resolved_owner = interface_index
-            elif gateway:
-                resolved_owner = _find_gateway_owner_index(original_nic_info, gateway)
-            entry = {
-                'network': route_network,
-                'prefix': prefix,
-                'gateway': gateway,
-            }
-            if resolved_owner is not None:
-                entry['owner_index'] = resolved_owner
-            original_static_routes.append(entry)
-            if gateway and (network == '0.0.0.0' or prefix == 0):
-                default_route_candidates.append({'gateway': gateway, 'owner_index': resolved_owner})
-                if original_default_gateway is None:
-                    original_default_gateway = gateway
-                    default_gateway_owner_idx = resolved_owner
-        selected_default = _select_default_gateway_route(default_route_candidates, original_nic_info)
-        if selected_default:
-            original_default_gateway, default_gateway_owner_idx = selected_default
-            for idx, nic in enumerate(original_nic_info):
-                nic['is_gateway_nic'] = (idx == default_gateway_owner_idx)
-            owner_display = default_gateway_owner_idx + 1 if default_gateway_owner_idx is not None else "?"
-            print(f"   -> Detected default gateway {original_default_gateway} (NIC {owner_display}).")
-        elif default_route_candidates and original_default_gateway is not None:
-            owner_candidate = default_gateway_owner_idx
-            if owner_candidate is None:
-                owner_candidate = default_route_candidates[0].get('owner_index')
-                if owner_candidate is None and original_default_gateway:
-                    owner_candidate = _find_gateway_owner_index(original_nic_info, original_default_gateway)
-            if owner_candidate is not None and 0 <= owner_candidate < len(original_nic_info):
-                default_gateway_owner_idx = owner_candidate
-                for idx, nic in enumerate(original_nic_info):
-                    nic['is_gateway_nic'] = (idx == owner_candidate)
-                print(f"   -> Detected default gateway {original_default_gateway} (NIC {owner_candidate + 1}).")
-    if not source_routes and target_vm.guest.ipStack and target_vm.guest.ipStack[0].ipRouteConfig:
-        for route in target_vm.guest.ipStack[0].ipRouteConfig.ipRoute:
-            if route.network == '0.0.0.0' and route.prefixLength == 0:
-                original_default_gateway = route.gateway.ipAddress
-                print(f"   Default gateway '{original_default_gateway}' retrieved from VMware Tools.")
-                for idx, nic in enumerate(original_nic_info):
-                    try:
-                        nic_iface = ipaddress.IPv4Interface(f"{nic['ip_address']}/{nic['subnet_mask']}")
-                        gw_addr = ipaddress.IPv4Address(original_default_gateway)
-                        if gw_addr in nic_iface.network:
-                            for j, nic_record in enumerate(original_nic_info):
-                                nic_record['is_gateway_nic'] = (j == idx)
-                            print(f"   -> Marked NIC with IP {nic['ip_address']} as the gateway owner.")
-                            break
-                    except (ValueError, ipaddress.AddressValueError):
-                        continue
-            else:
-                route_network = getattr(route, 'network', None)
-                prefix = getattr(route, 'prefixLength', None)
-                gateway_obj = getattr(route, 'gateway', None)
-                gateway = getattr(gateway_obj, 'ipAddress', None) if gateway_obj else None
-                if route_network and prefix is not None:
-                    original_static_routes.append({
-                        'network': route_network,
-                        'prefix': prefix,
-                        'gateway': gateway,
-                    })
-                if original_default_gateway is None:
-                    inferred_gateway = _infer_gateway_from_routes(original_nic_info, original_static_routes)
-                    chosen_gateway = inferred_gateway or _derive_fallback_gateway(original_nic_info)
-                if chosen_gateway:
-                    original_default_gateway, default_gateway_owner_idx = chosen_gateway
-                for idx, nic in enumerate(original_nic_info):
-                    nic['is_gateway_nic'] = (idx == default_gateway_owner_idx)
-                    print(
-                        f"   -> Default gateway not reported; inferred {original_default_gateway} (NIC {default_gateway_owner_idx + 1}).")
-                if original_static_routes:
-                    print("   Retrieved static routes (STG):")
-            for route in original_static_routes:
-                gw_disp = route['gateway'] or '(none)'
-                print(f"      - {route['network']}/{route['prefix']} via {gw_disp}")
 
-        if source_networking_state:
-            dns_info = source_networking_state.get('dns') or {}
-            original_dns_servers = [
-                dns for dns in (dns_info.get('ip_addresses') or [])
-                if dns and not str(dns).startswith('127.')
-            ]
-    if not original_dns_servers and target_vm.guest.ipStack and target_vm.guest.ipStack[0].dnsConfig:
-        original_dns_servers = [
-            dns for dns in target_vm.guest.ipStack[0].dnsConfig.ipAddress if not dns.startswith('127.')]
-    print(f"   [OK] Retrieved {len(original_nic_info)} NIC configuration entries.")
-    target_datastore = next((ds for ds in content_source.viewManager.CreateContainerView(
-        content_source.rootFolder, [vim.Datastore], True).view if ds.name == TARGET_DATASTORE_NAME), None)
-    if not target_datastore:
-        raise FileNotFoundError(f"Datastore '{TARGET_DATASTORE_NAME}' was not found.")
-    print(f"   [OK] Datastore '{target_datastore.name}' confirmed.")
-    date_suffix = datetime.now().strftime('%Y%m%d')
-    clone_name = f"{target_vm.name}-{date_suffix}"
+    workflow._preflight_check()
+    workflow._collect_source_vm_details()
+    workflow._confirm_clone_plan()
+    workflow._perform_source_clone_operations()
 
-    # --- Pre-execution confirmation (1/4) ---
-    print("\n" + "=" * 25 + " Pre-execution Check (1/4) " + "=" * 25)
-    print("Review the details below before creating the clone and starting the migration.")
-    print("\n  [Source VM details]")
-    print(f"    - VM name       : {target_vm.name}")
-    print(f"    - OS            : {target_vm.summary.config.guestFullName}")
-    print("\n  [Source NIC details]")
-    if original_nic_info:
-        for i, nic in enumerate(original_nic_info):
-            print(f"    - NIC {i+1} ({nic['mac_address']})")
-            print(f"      - Network     : {nic['network_name']}")
-            print(f"      - IP Address  : {nic['ip_address']}")
-            print(f"      - Subnet Mask : {nic['subnet_mask']}")
-    else:
-        print("    - No NIC information was found.")
-    if original_default_gateway:
-        print(f"    - Gateway     : {original_default_gateway}")
-    else:
-        print("    - Default gateway not detected.")
-    print("\n  [Clone VM specification]")
-    print(f"    - New VM name   : {clone_name}")
-    print(f"    - Placement datastore: {TARGET_DATASTORE_NAME}")
-    print("=" * 64)
-    user_approval = input("\nProceed with this clone operation? (y/n): ")
-    if user_approval.lower() != 'y':
-        raise InterruptedError("Operation cancelled by the user.")
-
-    # --- Clone, NIC removal, and unregister operations ---
-    relocate_spec = vim.vm.RelocateSpec(datastore=target_datastore)
-    clone_spec = vim.vm.CloneSpec(location=relocate_spec, powerOn=False, template=False)
-    print("\nStarting clone task...")
-    task = target_vm.Clone(folder=target_vm.parent, name=clone_name, spec=clone_spec)
-    while task.info.state not in [vim.TaskInfo.State.success, vim.TaskInfo.State.error]:
-        progress = task.info.progress or 0
-        print(f"   Clone progress: {progress}%", end='\r')
-        time.sleep(5)
-    print(" " * 40, end='\r')
-    if task.info.state != vim.TaskInfo.State.success:
-        raise RuntimeError(f"Clone task failed: {task.info.error.msg}")
-    print(f"\n[OK] Clone completed: '{clone_name}'")
-
-    new_vm_on_source = task.info.result
-
-    # NIC removal
-    print(f"   Removing NICs from cloned VM '{new_vm_on_source.name}'...")
-    nic_devices_to_remove = [dev for dev in new_vm_on_source.config.hardware.device if isinstance(
-        dev, vim.vm.device.VirtualEthernetCard)]
-    if nic_devices_to_remove:
-        nic_change_spec = [vim.vm.device.VirtualDeviceSpec(
-            operation='remove', device=nic) for nic in nic_devices_to_remove]
-        config_spec = vim.vm.ConfigSpec(deviceChange=nic_change_spec)
-        task = new_vm_on_source.ReconfigVM_Task(spec=config_spec)
-        while task.info.state not in [vim.TaskInfo.State.success, vim.TaskInfo.State.error]:
-            time.sleep(2)
-        if task.info.state != vim.TaskInfo.State.success:
-            raise RuntimeError(f"NIC removal failed: {task.info.error.msg}")
-        print("   [OK] Removed NICs.")
-
-    vmx_path = new_vm_on_source.config.files.vmPathName
-    print(f"   Unregistering VM '{clone_name}' from the source vCenter...")
-    new_vm_on_source.UnregisterVM()
-    unregistered_from_source = True
-    print("   [OK] Unregistration completed.")
-    _stop_keepalive_thread(source_keepalive_handle)
-    source_keepalive_handle = None
-    Disconnect(si_source)
-    si_source = None
-    new_vm_on_source = None
+    state = workflow.state
+    target_vm = workflow.target_vm
+    clone_name = state.clone_name
+    vmx_path = state.vmx_path
+    original_nic_info = list(state.original_nic_info)
+    original_dns_servers = list(state.original_dns_servers)
+    original_default_gateway = state.original_default_gateway
+    original_static_routes = list(state.original_static_routes)
+    unregistered_from_source = state.unregistered_from_source
+    source_keepalive_handle = state.source_keepalive_handle
+    si_source = workflow.si_source
+    sdk_network_client = state.sdk_network_client
+    new_vm_on_source = state.new_vm_on_source
 
     # --- [Phase 2/7] ~ [Phase 7/7]: Destination vCenter operations ---
     print("\n--- [Phase 2/7] Destination vCenter: Connect & Pre-check ---")
@@ -2440,9 +2486,8 @@ try:
     dest_keepalive_handle = None
     Disconnect(si_dest)
     si_dest = None
-    except Exception as e:
-        print(f"\n[ERROR] An error occurred during processing: {e}")
-
+except Exception as e:
+    print(f"\n[ERROR] An error occurred during processing: {e}")
     if migrated_vm_for_rollback:
         print("\n" + "=" * 20 + " Rollback Confirmation (Destination VM Removal) " + "=" * 20)
         print("The process stopped, leaving a partially migrated VM on the destination vCenter.")
