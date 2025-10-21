@@ -14,10 +14,15 @@ from vsphere_sdk_network import VsphereGuestNetworkSDK
 LOGGER = logging.getLogger(__name__)
 
 PRD_STATIC_ROUTE_SEGMENTS = {160, 161, 162, 163, 164}
+MNG_SEGMENT_THIRD_OCTETS = {161, 163}
 NMCLI_FIELDS_WITH_TYPE = ["UUID", "NAME", "DEVICE", "TYPE"]
 NMCLI_FIELDS_NO_TYPE = ["UUID", "NAME", "DEVICE"]
 SSH_ALLOWED_SOURCE_IP = "172.16.164.7"
 LEGACY_INTERFACE_PATTERN = re.compile(r"^(ens|eno|enp|enx|eth|em)[0-9a-z\-]*$", re.IGNORECASE)
+IPV4_PATTERN = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}(?:/\d{1,2})?\b")
+STG_HOST_SUFFIX_DIGIT_PATTERN = re.compile(r"(?<=\d)s\b")
+STG_HOST_ZERO_NS_PATTERN = re.compile(r"0ns\b")
+STG_IPET_DOMAIN_PATTERN = re.compile(r"ipet-ins(?=\.com\b)", re.IGNORECASE)
 
 
 @dataclass
@@ -190,6 +195,47 @@ def calculate_ip_stg_to_prd(ip_address: Optional[str]) -> Optional[str]:
         octets[2] -= 10
         return ".".join(str(octet) for octet in octets)
     return ip_address
+
+
+def transform_text_to_prd(content: str) -> Tuple[str, bool]:
+    """Replace STG-style IPv4 addresses and hostnames with their PRD counterparts."""
+    changed = False
+
+    def _replace_ip(match: re.Match[str]) -> str:
+        nonlocal changed
+        ip_value = match.group(0)
+        ip_only, slash, suffix = ip_value.partition("/")
+        try:
+            converted = calculate_ip_stg_to_prd(ip_only)
+        except ValueError:
+            return ip_value
+        if converted is not None and converted != ip_only:
+            changed = True
+            return f"{converted}{slash}{suffix}" if slash else converted
+        return ip_value
+
+    updated = IPV4_PATTERN.sub(_replace_ip, content)
+
+    def _replace_zero_ns(match: re.Match[str]) -> str:
+        nonlocal changed
+        changed = True
+        return "0np"
+
+    updated = STG_HOST_ZERO_NS_PATTERN.sub(_replace_zero_ns, updated)
+
+    def _replace_hostname(match: re.Match[str]) -> str:
+        nonlocal changed
+        changed = True
+        return "p"
+
+    updated = STG_HOST_SUFFIX_DIGIT_PATTERN.sub(_replace_hostname, updated)
+    def _replace_domain(match: re.Match[str]) -> str:
+        nonlocal changed
+        changed = True
+        return "ipet-inp"
+
+    updated = STG_IPET_DOMAIN_PATTERN.sub(_replace_domain, updated)
+    return updated, changed
 
 
 def mask_to_prefix(netmask: Optional[str]) -> Optional[int]:
@@ -626,21 +672,87 @@ def ensure_firewall_allows_ssh(
             )
             firewalld_active = exit_code == 0 and (firewalld_status or "").strip() == "active"
     if firewalld_active:
-        _, default_zone, _ = command_executor(
+        zones: List[str] = []
+        _, default_zone_raw, _ = command_executor(
             "firewall-cmd --get-default-zone",
             check_exit_code=False,
         )
-        zone = (default_zone or "public").splitlines()[0].strip() or "public"
-        rich_rule = (
-            f"firewall-cmd --permanent --zone={zone} "
-            f"--add-rich-rule='rule family=\"ipv4\" source address=\"{source_ip}\" service name=\"ssh\" accept'"
+        default_zone = (default_zone_raw or "").splitlines()[0].strip()
+        if default_zone:
+            zones.append(default_zone)
+        active_exit, active_stdout, _ = command_executor(
+            "firewall-cmd --get-active-zones",
+            check_exit_code=False,
         )
-        exit_code, _, cmd_err = command_executor(rich_rule, check_exit_code=False)
-        if exit_code == 0:
+        if active_exit == 0 and active_stdout:
+            for line in active_stdout.splitlines():
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                if ":" in stripped:
+                    continue
+                if stripped not in zones:
+                    zones.append(stripped)
+        if not zones:
+            zones.append("public")
+        rich_rule_def = f"rule family=\"ipv4\" source address=\"{source_ip}\" service name=\"ssh\" accept"
+        restricted_zones = {"heartbeat"}
+        added_zones: List[str] = []
+        missing_zones: List[str] = []
+        removed_zones: List[str] = []
+        for zone in zones:
+            zone_lower = zone.lower()
+            if zone_lower in restricted_zones:
+                removal_cmd = (
+                    f"firewall-cmd --permanent --zone={zone} "
+                    f"--query-rich-rule='{rich_rule_def}'"
+                )
+                removal_exit, _, _ = command_executor(removal_cmd, check_exit_code=False)
+                if removal_exit == 0:
+                    delete_cmd = (
+                        f"firewall-cmd --permanent --zone={zone} "
+                        f"--remove-rich-rule='{rich_rule_def}'"
+                    )
+                    delete_exit, _, delete_err = command_executor(delete_cmd, check_exit_code=False)
+                    if delete_exit == 0:
+                        removed_zones.append(zone)
+                    else:
+                        LOGGER.debug("Failed to remove SSH rich rule in zone '%s': %s", zone, delete_err)
+                continue
+            if zone_lower == "public":
+                continue
+            list_cmd = (
+                f"firewall-cmd --permanent --zone={zone} --list-rich-rules"
+            )
+            list_exit, list_stdout, list_err = command_executor(list_cmd, check_exit_code=False)
+            if list_exit != 0:
+                LOGGER.debug("Failed to read firewalld rich rules for zone '%s': %s", zone, list_err)
+                missing_zones.append(zone)
+                continue
+            existing_rules = [line.strip() for line in (list_stdout or "").splitlines() if line.strip()]
+            if rich_rule_def in existing_rules:
+                print(f"      - firewalld: SSH allow rule already present in zone '{zone}' ({source_ip})")
+                continue
+            rich_rule_cmd = (
+                f"firewall-cmd --permanent --zone={zone} "
+                f"--add-rich-rule='{rich_rule_def}'"
+            )
+            add_exit, _, add_err = command_executor(rich_rule_cmd, check_exit_code=False)
+            if add_exit == 0:
+                added_zones.append(zone)
+            else:
+                LOGGER.debug("Failed to add firewalld rich rule in zone '%s': %s", zone, add_err)
+        if removed_zones or added_zones:
             command_executor("firewall-cmd --reload", check_exit_code=False)
-            print(f"      - firewalld: added SSH allow rule in zone '{zone}' ({source_ip})")
+        if removed_zones:
+            print(f"      - firewalld: removed SSH allow rule from zones {', '.join(sorted(removed_zones))}")
+        if missing_zones:
+            print(f"      - firewalld: skipped zones without rule updates due to query errors: {', '.join(sorted(missing_zones))}")
+        if added_zones:
+            print(f"      - firewalld: added SSH allow rule in zones {', '.join(sorted(added_zones))} ({source_ip})")
             return
-        LOGGER.debug("Failed to add firewalld rich rule: %s", cmd_err)
+        if not missing_zones:
+            return
     exit_code, _, _ = command_executor("command -v iptables", check_exit_code=False)
     if exit_code == 0:
         health_code, iptables_state, health_err = command_executor("iptables -S", check_exit_code=False)
@@ -888,6 +1000,13 @@ def determine_prd_static_routes(
     local_networks: Dict[int, ipaddress.IPv4Network] = {}
     manage_nic_index: Optional[int] = None
     odd_octet_candidate: Optional[int] = None
+    owner_histogram: Dict[int, int] = {}
+    mng_candidates: List[int] = []
+    manage_locked_by_name = False
+    for route in original_routes:
+        owner_idx = route.get("owner_index")
+        if isinstance(owner_idx, int) and 0 <= owner_idx < len(nic_infos):
+            owner_histogram[owner_idx] = owner_histogram.get(owner_idx, 0) + 1
     for idx, nic in enumerate(nic_infos):
         prd_ip = nic.get("prd_ip_address") or calculate_ip_stg_to_prd(nic.get("ip_address"))
         subnet_mask = nic.get("subnet_mask")
@@ -899,15 +1018,33 @@ def determine_prd_static_routes(
         except (ValueError, ipaddress.AddressValueError):
             continue
         dest_network_name = (nic.get("dest_network_name") or nic.get("network_name") or "").lower()
-        if manage_nic_index is None and ("-mng-" in dest_network_name or "manage" in dest_network_name):
+        if not manage_locked_by_name and ("-mng-" in dest_network_name or "manage" in dest_network_name):
             manage_nic_index = idx
-        if odd_octet_candidate is None:
-            try:
-                third_octet = int(str(ipaddress.IPv4Address(prd_ip)).split(".")[2])
-                if third_octet % 2 == 1:
-                    odd_octet_candidate = idx
-            except (ValueError, ipaddress.AddressValueError, IndexError):
-                pass
+            manage_locked_by_name = True
+        third_octet_value: Optional[int] = None
+        try:
+            third_octet_value = int(str(ipaddress.IPv4Address(prd_ip)).split(".")[2])
+        except (ValueError, ipaddress.AddressValueError, IndexError):
+            third_octet_value = None
+        if third_octet_value in MNG_SEGMENT_THIRD_OCTETS:
+            mng_candidates.append(idx)
+            if manage_nic_index is None:
+                manage_nic_index = idx
+        if odd_octet_candidate is None and third_octet_value is not None:
+            if third_octet_value % 2 == 1:
+                odd_octet_candidate = idx
+    if not manage_locked_by_name and mng_candidates:
+        if owner_histogram:
+            ranked_candidates = sorted(
+                mng_candidates,
+                key=lambda i: owner_histogram.get(i, 0),
+                reverse=True,
+            )
+            manage_nic_index = ranked_candidates[0]
+        else:
+            manage_nic_index = mng_candidates[0]
+    if manage_nic_index is None and owner_histogram:
+        manage_nic_index = max(owner_histogram.items(), key=lambda item: item[1])[0]
     if manage_nic_index is None and odd_octet_candidate is not None:
         manage_nic_index = odd_octet_candidate
     for route in original_routes:
@@ -935,7 +1072,17 @@ def determine_prd_static_routes(
             continue
         if any(prd_network == net for net in local_networks.values()):
             continue
-        prd_gateway = calculate_ip_stg_to_prd(gateway) if gateway else default_gateway
+        derived_gateway: Optional[str] = None
+        try:
+            if prd_network.prefixlen > 0:
+                host_addresses = list(prd_network.hosts())
+                if host_addresses:
+                    derived_gateway = str(host_addresses[0])
+        except (ipaddress.AddressValueError, ValueError):
+            derived_gateway = None
+        prd_gateway = calculate_ip_stg_to_prd(gateway) if gateway else None
+        if not prd_gateway:
+            prd_gateway = derived_gateway or default_gateway
         if not prd_gateway:
             continue
         route_owner_idx: Optional[int] = route.get("owner_index")

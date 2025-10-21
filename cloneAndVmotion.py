@@ -9,6 +9,9 @@ import time
 import threading
 import logging
 import ipaddress
+import shlex
+import uuid as uuid_module
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 import importlib.util
@@ -125,6 +128,7 @@ try:
         extract_ipv4_from_sdk_interface,
         extract_dns_servers_from_state,
         extract_routes_from_sdk_payload,
+        transform_text_to_prd,
     )
 except ModuleNotFoundError as import_error:
     try:
@@ -157,6 +161,7 @@ except ModuleNotFoundError as import_error:
     extract_ipv4_from_sdk_interface = network_utils.extract_ipv4_from_sdk_interface
     extract_dns_servers_from_state = network_utils.extract_dns_servers_from_state
     extract_routes_from_sdk_payload = network_utils.extract_routes_from_sdk_payload
+    transform_text_to_prd = network_utils.transform_text_to_prd
 
 
 # ------------------------------------------------
@@ -171,6 +176,22 @@ LOGGER = logging.getLogger("cloneAndVmotion")
 LOGGER.setLevel(LOG_LEVEL)
 
 workflow_had_warnings = False
+
+NTP_CONFIG_PATHS: Tuple[str, ...] = (
+    "/etc/chrony.conf",
+    "/etc/chrony/chrony.conf",
+    "/etc/ntp.conf",
+    "/etc/ntp/ntp.conf",
+)
+NTP_SERVER_DIRECTIVE_PATTERN = re.compile(r"^\s*(?:server|pool)\s+(\S+)", re.IGNORECASE | re.MULTILINE)
+CENTOS_REPO_GLOB = "/etc/yum.repos.d/*.repo"
+CENTOS_REPO_DIR = "/etc/yum.repos.d"
+CENTOS_VAULT_BASE = "https://vault.centos.org/centos/"
+MIRRORLIST_PATTERN = re.compile(r"^(\s*)mirrorlist\s*=\s*(\S.*)$", re.IGNORECASE)
+BASEURL_PATTERN = re.compile(r"^(\s*)#?\s*baseurl\s*=\s*(\S.*)$", re.IGNORECASE)
+TD_AGENT_REPO_PATH = "/etc/yum.repos.d/td.repo"
+TD_AGENT_GPG_KEY = "https://packages.treasuredata.com/GPG-KEY-td-agent"
+TD_AGENT_BASEURL_TEMPLATE = "https://packages.treasuredata.com/{major}/redhat/$releasever/$basearch"
 
 
 def authenticate_vcenter(host: str, user: str, password: str, ssl_ctx: ssl.SSLContext):
@@ -427,6 +448,814 @@ def prepare_guest_interface(  # pylint: disable=redefined-outer-name
     )
 
 
+def _is_service_active(guest_executor, service_name: str) -> bool:
+    """Return True if the specified service is active on the guest."""
+    service_quoted = shlex.quote(service_name)
+    exit_code, _, _ = guest_executor("command -v systemctl", check_exit_code=False)
+    if exit_code == 0:
+        exit_code, stdout, _ = guest_executor(f"systemctl is-active {service_quoted}", check_exit_code=False)
+        if exit_code == 0 and (stdout or "").strip() == "active":
+            return True
+    exit_code, _, _ = guest_executor(f"service {service_quoted} status >/dev/null 2>&1", check_exit_code=False)
+    return exit_code == 0
+
+
+def _write_guest_file(guest_executor, remote_path: str, content: str) -> Tuple[int, str, str]:
+    """Write content to a file inside the guest using a temporary file and atomic move."""
+    token = f"__VSPHERE_EOF_{uuid_module.uuid4().hex}__"
+    normalized = content.replace("\r\n", "\n")
+    if not normalized.endswith("\n"):
+        normalized += "\n"
+    command = (
+        "set -euo pipefail\n"
+        f"remote_path={shlex.quote(remote_path)}\n"
+        "remote_dir=$(dirname \"$remote_path\")\n"
+        "if [ -z \"$remote_dir\" ]; then remote_dir='.'; fi\n"
+        "if [ ! -d \"$remote_dir\" ]; then\n"
+        "  echo \"Target directory $remote_dir does not exist\" >&2\n"
+        "  exit 1\n"
+        "fi\n"
+        "tmpfile=$(mktemp \"$remote_dir/.vsphere_tmp.XXXXXX\" 2>/dev/null || mktemp /tmp/.vsphere_tmp.XXXXXX)\n"
+        "if [ -z \"$tmpfile\" ]; then\n"
+        "  echo \"Failed to allocate temporary file\" >&2\n"
+        "  exit 1\n"
+        "fi\n"
+        f"cat <<'{token}' > \"$tmpfile\"\n"
+        f"{normalized}"
+        f"{token}\n"
+        "perm_spec=644\n"
+        "owner_spec=$(id -u)\n"
+        "group_spec=$(id -g)\n"
+        "if [ -e \"$remote_path\" ]; then\n"
+        "  perm_spec=$(stat -c '%a' \"$remote_path\" 2>/dev/null || echo 644)\n"
+        "  owner_spec=$(stat -c '%u' \"$remote_path\" 2>/dev/null || echo $(id -u))\n"
+        "  group_spec=$(stat -c '%g' \"$remote_path\" 2>/dev/null || echo $(id -g))\n"
+        "fi\n"
+        "chmod \"$perm_spec\" \"$tmpfile\" 2>/dev/null || true\n"
+        "chown \"$owner_spec\":\"$group_spec\" \"$tmpfile\" 2>/dev/null || true\n"
+        "mv \"$tmpfile\" \"$remote_path\"\n"
+        "exit 0\n"
+    )
+    return guest_executor(command, check_exit_code=False)
+
+
+def _extract_ntp_server_tokens(config_text: str) -> List[str]:
+    """Return the list of server/pool targets from an NTP configuration."""
+    tokens: List[str] = []
+    for match in NTP_SERVER_DIRECTIVE_PATTERN.finditer(config_text or ""):
+        token = match.group(1)
+        if token:
+            tokens.append(token.strip())
+    return tokens
+
+
+def _identify_stage_ntp_servers(tokens: Iterable[str]) -> List[str]:
+    """Return NTP servers that still reside in the STG (170-179 third octet) address space."""
+    stage_servers: List[str] = []
+    for token in tokens:
+        try:
+            ipv4 = ipaddress.IPv4Address(token)
+        except (ValueError, ipaddress.AddressValueError):
+            continue
+        third_octet = int(str(ipv4).split(".")[2])
+        if 170 <= third_octet <= 179:
+            stage_servers.append(str(ipv4))
+    return stage_servers
+
+
+def _rewrite_centos_repo_content(repo_content: str) -> Tuple[str, bool]:
+    """Rewrite CentOS repo definitions to point to vault.centos.org."""
+    lines = repo_content.splitlines()
+    updated_lines: List[str] = []
+    changed = False
+
+    for line in lines:
+        mirror_match = MIRRORLIST_PATTERN.match(line)
+        if mirror_match:
+            indent, definition = mirror_match.groups()
+            disabled_line = f"{indent}# mirrorlist={definition} (disabled: vault.centos.org)"
+            if disabled_line != line:
+                updated_lines.append(disabled_line)
+                changed = True
+            else:
+                updated_lines.append(line)
+            continue
+        base_match = BASEURL_PATTERN.match(line)
+        if base_match:
+            indent, url_definition = base_match.groups()
+            lower_def = url_definition.lower()
+            if "centos" in lower_def:
+                new_definition = re.sub(
+                    r"^https?://[^/]*centos\.org/centos/",
+                    CENTOS_VAULT_BASE,
+                    url_definition,
+                    flags=re.IGNORECASE,
+                )
+                if not new_definition.lower().startswith(CENTOS_VAULT_BASE):
+                    if not new_definition.startswith("$"):
+                        new_definition = f"{CENTOS_VAULT_BASE}{new_definition.lstrip('/')}"
+                new_line = f"{indent}baseurl={new_definition}"
+                if new_line != line:
+                    updated_lines.append(new_line)
+                    changed = True
+                else:
+                    updated_lines.append(line)
+                continue
+        updated_lines.append(line)
+
+    updated_content = "\n".join(updated_lines)
+    if repo_content.endswith("\n"):
+        updated_content += "\n"
+    elif updated_content and not updated_content.endswith("\n"):
+        updated_content += "\n"
+    return updated_content, changed
+
+
+def _is_tls_error(exit_code: int, stderr_text: Optional[str]) -> bool:
+    """Return True if the curl exit code / stderr indicates a TLS handshake problem."""
+    if exit_code in (35, 51, 52, 56, 58, 60, 77, 83):
+        return True
+    stderr_normalized = (stderr_text or "").lower()
+    if not stderr_normalized:
+        return False
+    tls_markers = (
+        "ssl",
+        "tls",
+        "certificate",
+        "handshake",
+        "unknown ca",
+        "expired",
+        "verify",
+        "alert",
+    )
+    return any(marker in stderr_normalized for marker in tls_markers)
+
+
+def _refresh_tls_trust_bundles(guest_executor) -> None:
+    """Attempt to refresh CA trust stores and related packages."""
+    commands = [
+        "command -v update-ca-trust >/dev/null 2>&1 && update-ca-trust force-enable >/dev/null 2>&1",
+        "command -v update-ca-trust >/dev/null 2>&1 && update-ca-trust extract >/dev/null 2>&1",
+        (
+            "command -v yum >/dev/null 2>&1 && "
+            "yum -y reinstall ca-certificates nss curl >/dev/null 2>&1 || true"
+        ),
+        (
+            "command -v yum >/dev/null 2>&1 && "
+            "yum -y install ca-certificates --disablerepo='*' --enablerepo='base,updates,extras' >/dev/null 2>&1 || true"
+        ),
+    ]
+    for repair_cmd in commands:
+        guest_executor(repair_cmd, check_exit_code=False)
+
+
+def _attempt_curl_openssl_upgrade(guest_executor) -> None:
+    """Try to install an OpenSSL-enabled curl as a last resort."""
+    commands = [
+        (
+            "command -v yum >/dev/null 2>&1 && "
+            "yum -y install curl-openssl >/dev/null 2>&1 || true"
+        ),
+        (
+            "command -v yum >/dev/null 2>&1 && "
+            "yum -y reinstall curl --disablerepo='*' --enablerepo='base,updates,extras' "
+            "--setopt=tsflags=reinstall >/dev/null 2>&1 || true"
+        ),
+    ]
+    for repair_cmd in commands:
+        guest_executor(repair_cmd, check_exit_code=False)
+
+
+def _run_curl_with_tls_repairs(
+    guest_executor,
+    url: str,
+    *,
+    extra_args: Optional[str] = None,
+    max_attempts: int = 3,
+) -> Tuple[bool, Optional[str]]:
+    """Run curl with basic TLS repair attempts for legacy environments."""
+    attempted_ca_refresh = False
+    attempted_openssl_upgrade = False
+    args = extra_args or "--fail --location --head"
+    last_error: Optional[str] = None
+    for _ in range(max_attempts):
+        curl_cmd = (
+            f"curl -Is --max-time 10 --retry 2 --retry-delay 2 {args} {shlex.quote(url)} >/dev/null"
+        )
+        exit_code, _, stderr_text = guest_executor(curl_cmd, check_exit_code=False)
+        if exit_code == 0:
+            return True, None
+        last_error = (stderr_text or "").strip() or f"curl exit status {exit_code}"
+        if _is_tls_error(exit_code, stderr_text):
+            if not attempted_ca_refresh:
+                _refresh_tls_trust_bundles(guest_executor)
+                attempted_ca_refresh = True
+                continue
+            if not attempted_openssl_upgrade:
+                _attempt_curl_openssl_upgrade(guest_executor)
+                attempted_openssl_upgrade = True
+                continue
+        break
+    return False, last_error
+
+
+def _sync_hosts_file_to_prd(guest_executor, timestamp: str) -> bool:
+    """Update /etc/hosts to PRD equivalents."""
+    exit_code, hosts_content, hosts_err = guest_executor("cat /etc/hosts", check_exit_code=False)
+    if exit_code != 0:
+        print(f"   [WARN] Unable to read /etc/hosts: {(hosts_err or '').strip() or exit_code}")
+        return False
+    updated_hosts = hosts_content
+    changed = False
+    for _ in range(3):
+        updated_hosts, iteration_changed = transform_text_to_prd(updated_hosts)
+        if iteration_changed:
+            changed = True
+        else:
+            break
+    if not changed:
+        indicators = []
+        if "ipet-ins" in hosts_content:
+            indicators.append("stage domain tokens (ipet-ins)")
+        if " line-" in hosts_content and re.search(r"\bline-[^ \t\n]*s\b", hosts_content):
+            indicators.append("hostnames ending with 's'")
+        if re.search(r"\b172\.16\.17[0-9]\.", hosts_content):
+            indicators.append("stage IP ranges (172.16.17x.x)")
+        if indicators:
+            print(f"   [WARN] Detected residual STG markers in /etc/hosts ({', '.join(indicators)}).")
+        else:
+            print("   -> /etc/hosts already aligned with PRD entries.")
+        return not indicators
+    backup_path = f"/etc/hosts-{timestamp}.bak"
+    backup_cmd = (
+        f"[ -f {shlex.quote(backup_path)} ] || "
+        f"cp /etc/hosts {shlex.quote(backup_path)}"
+    )
+    backup_exit, _, backup_err = guest_executor(backup_cmd, check_exit_code=False)
+    if backup_exit != 0:
+        print(f"   [WARN] Unable to create /etc/hosts backup: {(backup_err or '').strip() or backup_exit}")
+        return False
+    write_exit, _, write_err = _write_guest_file(guest_executor, "/etc/hosts", updated_hosts)
+    if write_exit != 0:
+        print(f"   [WARN] Failed to update /etc/hosts: {(write_err or '').strip() or write_exit}")
+        return False
+    print(f"   -> Updated /etc/hosts for PRD environment (backup: {backup_path}).")
+    return True
+
+
+def _sync_firewalld_configuration_to_prd(guest_executor, timestamp: str) -> bool:
+    """Update firewalld configuration to PRD equivalents when the service is active."""
+    exit_code, _, _ = guest_executor("command -v firewall-cmd", check_exit_code=False)
+    if exit_code != 0:
+        print("   -> firewall-cmd not available; skipping firewalld configuration sync.")
+        return True
+    if not _is_service_active(guest_executor, "firewalld"):
+        print("   -> firewalld inactive; skipping firewalld configuration sync.")
+        return True
+    zone_names: Set[str] = set()
+    exit_code, zones_output, zones_err = guest_executor("firewall-cmd --get-zones", check_exit_code=False)
+    if exit_code == 0 and zones_output:
+        for token in zones_output.split():
+            token_clean = token.strip()
+            if token_clean:
+                zone_names.add(token_clean)
+    if not zone_names:
+        exit_code, dir_listing, dir_err = guest_executor("ls /etc/firewalld/zones", check_exit_code=False)
+        if exit_code == 0 and dir_listing:
+            for line in dir_listing.splitlines():
+                name = line.strip()
+                if name.endswith(".xml"):
+                    zone_names.add(name[:-4])
+        else:
+            print(f"   [WARN] Unable to enumerate firewalld zones: {(dir_err or dir_listing or '').strip() or exit_code}")
+            return False
+    overall_success = True
+    zones_updated: List[str] = []
+
+    for zone in sorted(zone_names):
+        zone_file = f"/etc/firewalld/zones/{zone}.xml"
+        backup_path = f"{zone_file}-{timestamp}.bak"
+        backup_created = False
+
+        def _ensure_zone_backup() -> bool:
+            nonlocal backup_created, overall_success
+            if backup_created:
+                return True
+            backup_cmd = (
+                f"[ -f {shlex.quote(backup_path)} ] || "
+                f"cp {shlex.quote(zone_file)} {shlex.quote(backup_path)}"
+            )
+            backup_exit, _, backup_err = guest_executor(backup_cmd, check_exit_code=False)
+            if backup_exit != 0:
+                print(
+                    f"   [WARN] Unable to back up firewalld zone file '{zone_file}': "
+                    f"{(backup_err or '').strip() or backup_exit}"
+                )
+                overall_success = False
+                return False
+            backup_created = True
+            return True
+
+        zone_changed = False
+
+        interfaces_exit, interfaces_stdout, interfaces_err = guest_executor(
+            f"firewall-cmd --permanent --zone={shlex.quote(zone)} --list-interfaces",
+            check_exit_code=False,
+        )
+        interface_list: List[str] = []
+        if interfaces_exit == 0:
+            interface_list = [entry.strip() for entry in (interfaces_stdout or "").split() if entry.strip()]
+        elif interfaces_err:
+            LOGGER.debug("Failed to list firewalld interfaces for zone '%s': %s", zone, interfaces_err.strip())
+
+        # Synchronise sources
+        sources_exit, sources_stdout, sources_err = guest_executor(
+            f"firewall-cmd --permanent --zone={shlex.quote(zone)} --list-sources",
+            check_exit_code=False,
+        )
+        if sources_exit != 0:
+            if sources_err:
+                LOGGER.debug("Failed to list firewalld sources for zone '%s': %s", zone, sources_err.strip())
+        else:
+            sources = [entry.strip() for entry in (sources_stdout or "").split() if entry.strip()]
+            for source_entry in sources:
+                transformed_source, transformed_changed = transform_text_to_prd(source_entry)
+                transformed_source = transformed_source.strip()
+                if not transformed_changed or not transformed_source or transformed_source == source_entry:
+                    continue
+                if not _ensure_zone_backup():
+                    break
+                remove_cmd = (
+                    f"firewall-cmd --permanent --zone={shlex.quote(zone)} "
+                    f"--remove-source={shlex.quote(source_entry)}"
+                )
+                remove_exit, _, remove_err = guest_executor(remove_cmd, check_exit_code=False)
+                if remove_exit != 0:
+                    LOGGER.debug(
+                        "Failed to remove firewalld source '%s' from zone '%s': %s",
+                        source_entry,
+                        zone,
+                        (remove_err or "").strip() or remove_exit,
+                    )
+                    overall_success = False
+                    continue
+                query_cmd = (
+                    f"firewall-cmd --permanent --zone={shlex.quote(zone)} "
+                    f"--query-source={shlex.quote(transformed_source)}"
+                )
+                query_exit, _, _ = guest_executor(query_cmd, check_exit_code=False)
+                if query_exit != 0:
+                    add_cmd = (
+                        f"firewall-cmd --permanent --zone={shlex.quote(zone)} "
+                        f"--add-source={shlex.quote(transformed_source)}"
+                    )
+                    add_exit, _, add_err = guest_executor(add_cmd, check_exit_code=False)
+                    if add_exit != 0:
+                        LOGGER.debug(
+                            "Failed to add firewalld source '%s' to zone '%s': %s",
+                            transformed_source,
+                            zone,
+                            (add_err or "").strip() or add_exit,
+                        )
+                        overall_success = False
+                        continue
+                zone_changed = True
+
+        # Synchronise rich rules
+        list_exit, list_stdout, list_err = guest_executor(
+            f"firewall-cmd --permanent --zone={shlex.quote(zone)} --list-rich-rules",
+            check_exit_code=False,
+        )
+        if list_exit != 0:
+            if list_err:
+                LOGGER.debug("Failed to list firewalld rich rules for zone '%s': %s", zone, list_err.strip())
+            continue
+        rich_rules = [rule.strip() for rule in (list_stdout or "").splitlines() if rule.strip()]
+        for rule in rich_rules:
+            transformed_rule, changed = transform_text_to_prd(rule)
+            transformed_rule = transformed_rule.strip()
+            if not changed or not transformed_rule or transformed_rule == rule:
+                continue
+            if not _ensure_zone_backup():
+                break
+            remove_cmd = (
+                f"firewall-cmd --permanent --zone={shlex.quote(zone)} "
+                f"--remove-rich-rule={shlex.quote(rule)}"
+            )
+            remove_exit, _, remove_err = guest_executor(remove_cmd, check_exit_code=False)
+            if remove_exit != 0:
+                LOGGER.debug(
+                    "Failed to remove firewalld rich rule from zone '%s': %s",
+                    zone,
+                    (remove_err or "").strip() or remove_exit,
+                )
+                overall_success = False
+                continue
+            query_cmd = (
+                f"firewall-cmd --permanent --zone={shlex.quote(zone)} "
+                f"--query-rich-rule={shlex.quote(transformed_rule)}"
+            )
+            query_exit, _, _ = guest_executor(query_cmd, check_exit_code=False)
+            if query_exit != 0:
+                add_cmd = (
+                    f"firewall-cmd --permanent --zone={shlex.quote(zone)} "
+                    f"--add-rich-rule={shlex.quote(transformed_rule)}"
+                )
+                add_exit, _, add_err = guest_executor(add_cmd, check_exit_code=False)
+                if add_exit != 0:
+                    LOGGER.debug(
+                        "Failed to add firewalld rich rule to zone '%s': %s",
+                        zone,
+                        (add_err or "").strip() or add_exit,
+                    )
+                    overall_success = False
+                    continue
+            zone_changed = True
+
+        # Remove SSH rich rule from zones where it should not exist
+        if zone.lower() in {"heartbeat"}:
+            restricted_rule = f"rule family=\"ipv4\" source address=\"{SSH_ALLOWED_SOURCE_IP}\" service name=\"ssh\" accept"
+            query_cmd = (
+                f"firewall-cmd --permanent --zone={shlex.quote(zone)} "
+                f"--query-rich-rule={shlex.quote(restricted_rule)}"
+            )
+            query_exit, _, _ = guest_executor(query_cmd, check_exit_code=False)
+            if query_exit == 0:
+                if _ensure_zone_backup():
+                    remove_cmd = (
+                        f"firewall-cmd --permanent --zone={shlex.quote(zone)} "
+                        f"--remove-rich-rule={shlex.quote(restricted_rule)}"
+                    )
+                    remove_exit, _, remove_err = guest_executor(remove_cmd, check_exit_code=False)
+                    if remove_exit != 0:
+                        LOGGER.debug(
+                            "Failed to remove SSH rich rule from restricted zone '%s': %s",
+                            zone,
+                            (remove_err or "").strip() or remove_exit,
+                        )
+                        overall_success = False
+                    else:
+                        zone_changed = True
+                        if zone not in zones_updated:
+                            zones_updated.append(zone)
+        # Ensure captured interfaces remain assigned to the zone
+        for interface_name in interface_list:
+            if not interface_name:
+                continue
+            query_iface_exit, _, _ = guest_executor(
+                f"firewall-cmd --permanent --zone={shlex.quote(zone)} "
+                f"--query-interface={shlex.quote(interface_name)}",
+                check_exit_code=False,
+            )
+            if query_iface_exit != 0:
+                if _ensure_zone_backup():
+                    add_iface_exit, _, add_iface_err = guest_executor(
+                        f"firewall-cmd --permanent --zone={shlex.quote(zone)} "
+                        f"--add-interface={shlex.quote(interface_name)}",
+                        check_exit_code=False,
+                    )
+                    if add_iface_exit == 0:
+                        zone_changed = True
+                    else:
+                        LOGGER.debug(
+                            "Failed to reattach interface '%s' to zone '%s': %s",
+                            interface_name,
+                            zone,
+                            (add_iface_err or "").strip() or add_iface_exit,
+                        )
+                        overall_success = False
+        if zone_changed and zone not in zones_updated:
+            zones_updated.append(zone)
+
+    if zones_updated:
+        reload_exit, _, reload_err = guest_executor("firewall-cmd --reload", check_exit_code=False)
+        if reload_exit != 0:
+            print(
+                f"   [WARN] Firewalld reload failed after configuration updates: "
+                f"{(reload_err or '').strip() or reload_exit}"
+            )
+            overall_success = False
+        else:
+            print(f"   -> Firewalld zones updated: {', '.join(sorted(zones_updated))}")
+    else:
+        print("   -> Firewalld zones already aligned with PRD entries.")
+    return overall_success
+
+
+def _sync_ntp_configuration_to_prd(guest_executor, timestamp: str) -> bool:
+    """Update chrony/ntp configuration so NTP servers align with PRD DNS mappings."""
+    success = True
+    found_config = False
+    for config_path in NTP_CONFIG_PATHS:
+        exit_code, config_content, config_err = guest_executor(
+            f"cat {shlex.quote(config_path)}",
+            check_exit_code=False,
+        )
+        if exit_code != 0:
+            detail = (config_err or "").lower()
+            if "no such file" in detail or "not found" in detail or "cannot access" in detail:
+                continue
+            # Permission or other error
+            print(f"   [WARN] Unable to read {config_path}: {(config_err or '').strip() or exit_code}")
+            success = False
+            continue
+        found_config = True
+        server_tokens_before = _extract_ntp_server_tokens(config_content)
+        stage_servers_before = _identify_stage_ntp_servers(server_tokens_before)
+        expected_conversions: Dict[str, str] = {}
+        conversion_anomalies: List[str] = []
+        for server in stage_servers_before:
+            converted = calculate_ip_stg_to_prd(server)
+            if not converted or converted == server:
+                conversion_anomalies.append(server)
+            else:
+                expected_conversions[server] = converted
+        updated_config = config_content
+        changed = False
+        for _ in range(3):
+            updated_config, iteration_changed = transform_text_to_prd(updated_config)
+            if iteration_changed:
+                changed = True
+            else:
+                break
+        server_tokens_after = _extract_ntp_server_tokens(updated_config)
+        stage_servers_after = _identify_stage_ntp_servers(server_tokens_after)
+        if stage_servers_after and expected_conversions:
+            for stage_ip in stage_servers_after:
+                replacement = expected_conversions.get(stage_ip) or calculate_ip_stg_to_prd(stage_ip)
+                if replacement and replacement != stage_ip:
+                    pattern = re.compile(rf"\b{re.escape(stage_ip)}\b")
+                    updated_config, count = pattern.subn(replacement, updated_config)
+                    if count > 0:
+                        changed = True
+            server_tokens_after = _extract_ntp_server_tokens(updated_config)
+            stage_servers_after = _identify_stage_ntp_servers(server_tokens_after)
+        conversion_failures = [
+            f"{original}→{expected}"
+            for original, expected in expected_conversions.items()
+            if expected not in server_tokens_after
+        ]
+        if conversion_anomalies:
+            print(
+                f"   [WARN] {config_path} contains NTP addresses that cannot be converted automatically: "
+                f"{', '.join(conversion_anomalies)}"
+            )
+            success = False
+        if stage_servers_after:
+            print(
+                f"   [WARN] {config_path} still references STG NTP servers after transformation: "
+                f"{', '.join(stage_servers_after)}"
+            )
+            success = False
+        if conversion_failures:
+            print(
+                f"   [WARN] Failed to confirm NTP server updates in {config_path}: "
+                f"{', '.join(conversion_failures)}"
+            )
+            success = False
+        if not changed:
+            if not stage_servers_after and not conversion_failures and not conversion_anomalies:
+                print(f"   -> {config_path} already aligned with PRD entries.")
+            continue
+        backup_path = f"{config_path}-{timestamp}.bak"
+        backup_cmd = (
+            f"[ -f {shlex.quote(backup_path)} ] || "
+            f"cp {shlex.quote(config_path)} {shlex.quote(backup_path)}"
+        )
+        backup_exit, _, backup_err = guest_executor(backup_cmd, check_exit_code=False)
+        if backup_exit != 0:
+            print(f"   [WARN] Unable to back up {config_path}: {(backup_err or '').strip() or backup_exit}")
+            success = False
+            continue
+        write_exit, _, write_err = _write_guest_file(guest_executor, config_path, updated_config)
+        if write_exit != 0:
+            print(f"   [WARN] Failed to update {config_path}: {(write_err or '').strip() or write_exit}")
+            success = False
+            continue
+        print(f"   -> Updated {config_path} NTP servers for PRD environment (backup: {backup_path}).")
+    if not found_config:
+        print("   -> No chrony/ntp configuration found; skipping NTP sync.")
+    return success
+
+
+def _sync_centos_repo_configuration(guest_executor, timestamp: str) -> bool:
+    """Rewrite CentOS repo files to use vault.centos.org."""
+    repo_dir_check, _, _ = guest_executor(f"test -d {shlex.quote(CENTOS_REPO_DIR)}", check_exit_code=False)
+    if repo_dir_check != 0:
+        print("   -> /etc/yum.repos.d not present; skipping CentOS repo sync.")
+        return True
+    curl_ok, curl_error = _run_curl_with_tls_repairs(
+        guest_executor,
+        "https://vault.centos.org/centos/",
+    )
+    if not curl_ok:
+        print(f"   [WARN] Unable to reach vault.centos.org even after TLS repairs: {curl_error or 'no details'}")
+    list_cmd = f"ls -1 {CENTOS_REPO_GLOB} 2>/dev/null"
+    ls_exit, ls_stdout, ls_err = guest_executor(list_cmd, check_exit_code=False)
+    if ls_exit != 0 or not ls_stdout.strip():
+        if ls_exit == 0:
+            print("   -> No CentOS repo files detected; skipping repo sync.")
+            return True
+        detail = (ls_err or "").strip() or ls_exit
+        print(f"   [WARN] Unable to enumerate CentOS repo files: {detail}")
+        return False
+    success = True
+    for repo_path in ls_stdout.splitlines():
+        repo_path = repo_path.strip()
+        if not repo_path:
+            continue
+        exit_code, repo_content, repo_err = guest_executor(f"cat {shlex.quote(repo_path)}", check_exit_code=False)
+        if exit_code != 0:
+            print(f"   [WARN] Unable to read {repo_path}: {(repo_err or '').strip() or exit_code}")
+            success = False
+            continue
+        updated_content, changed = _rewrite_centos_repo_content(repo_content)
+        if not changed:
+            continue
+        backup_path = f"{repo_path}-{timestamp}.bak"
+        backup_cmd = (
+            f"[ -f {shlex.quote(backup_path)} ] || "
+            f"cp {shlex.quote(repo_path)} {shlex.quote(backup_path)}"
+        )
+        backup_exit, _, backup_err = guest_executor(backup_cmd, check_exit_code=False)
+        if backup_exit != 0:
+            print(f"   [WARN] Unable to back up {repo_path}: {(backup_err or '').strip() or backup_exit}")
+            success = False
+            continue
+        write_exit, _, write_err = _write_guest_file(guest_executor, repo_path, updated_content)
+        if write_exit != 0:
+            print(f"   [WARN] Failed to update {repo_path}: {(write_err or '').strip() or write_exit}")
+            success = False
+            continue
+        print(f"   -> Updated CentOS repo file '{repo_path}' to use vault.centos.org (backup: {backup_path}).")
+    return success
+
+
+def _ensure_td_agent_repo(guest_executor, timestamp: str) -> bool:
+    """Ensure td-agent repo definition exists and points to a working major version."""
+    guest_executor(f"mkdir -p {shlex.quote(CENTOS_REPO_DIR)}", check_exit_code=False)
+    release_macros = ("%centos_ver", "%rhel")
+    release_ver = "7"
+    for macro in release_macros:
+        exit_code, stdout, _ = guest_executor(f"rpm -E {macro}", check_exit_code=False)
+        value = (stdout or "").strip()
+        if exit_code == 0 and value and not value.startswith("%"):
+            release_ver = value
+            break
+    arch_exit, arch_stdout, _ = guest_executor("rpm -E %_arch", check_exit_code=False)
+    base_arch = (arch_stdout or "x86_64").strip() or "x86_64"
+
+    def _test_major(major: int) -> bool:
+        evaluated_url = f"https://packages.treasuredata.com/{major}/redhat/{release_ver}/{base_arch}/"
+        ok, _ = _run_curl_with_tls_repairs(
+            guest_executor,
+            evaluated_url,
+        )
+        return ok
+
+    selected_major = 4
+    if not _test_major(selected_major):
+        print("   [WARN] td-agent v4 repository unreachable; falling back to v3.")
+        selected_major = 3
+        if not _test_major(selected_major):
+            print("   [WARN] td-agent v3 repository check failed as well; proceeding with v3 definition.")
+
+    repo_content = (
+        "[treasuredata]\n"
+        "name=TreasureData\n"
+        f"baseurl={TD_AGENT_BASEURL_TEMPLATE.format(major=selected_major)}\n"
+        "gpgcheck=1\n"
+        f"gpgkey={TD_AGENT_GPG_KEY}\n"
+    )
+    backup_path = f"{TD_AGENT_REPO_PATH}-{timestamp}.bak"
+    backup_cmd = (
+        f"if [ -f {shlex.quote(TD_AGENT_REPO_PATH)} ]; then "
+        f"[ -f {shlex.quote(backup_path)} ] || "
+        f"cp {shlex.quote(TD_AGENT_REPO_PATH)} {shlex.quote(backup_path)}; "
+        "fi"
+    )
+    guest_executor(backup_cmd, check_exit_code=False)
+    write_exit, _, write_err = _write_guest_file(guest_executor, TD_AGENT_REPO_PATH, repo_content)
+    if write_exit != 0:
+        print(f"   [WARN] Failed to write td-agent repo file: {(write_err or '').strip() or write_exit}")
+        return False
+    print(f"   -> td-agent repository configured for major v{selected_major} (path: {TD_AGENT_REPO_PATH}).")
+    return True
+
+
+def _sync_iptables_configuration_to_prd(guest_executor, timestamp: str) -> bool:
+    """Update /etc/sysconfig/iptables to PRD equivalents when the iptables service is active."""
+    if not _is_service_active(guest_executor, "iptables"):
+        print("   -> iptables service inactive; skipping iptables configuration sync.")
+        return True
+    config_path = "/etc/sysconfig/iptables"
+    exit_code, config_content, config_err = guest_executor(f"cat {shlex.quote(config_path)}", check_exit_code=False)
+    if exit_code != 0:
+        print(f"   [WARN] Unable to read iptables configuration '{config_path}': {(config_err or '').strip() or exit_code}")
+        return False
+    updated_config, changed = transform_text_to_prd(config_content)
+    if not changed:
+        print(f"   -> {config_path} already aligned with PRD entries.")
+        return True
+    backup_path = f"{config_path}-{timestamp}.bak"
+    backup_cmd = (
+        f"[ -f {shlex.quote(backup_path)} ] || "
+        f"cp {shlex.quote(config_path)} {shlex.quote(backup_path)}"
+    )
+    backup_exit, _, backup_err = guest_executor(backup_cmd, check_exit_code=False)
+    if backup_exit != 0:
+        print(f"   [WARN] Unable to back up iptables configuration '{config_path}': {(backup_err or '').strip() or backup_exit}")
+        return False
+    write_exit, _, write_err = _write_guest_file(guest_executor, config_path, updated_config)
+    if write_exit != 0:
+        print(f"   [WARN] Failed to update iptables configuration '{config_path}': {(write_err or '').strip() or write_exit}")
+        return False
+    reload_exit, _, reload_err = guest_executor("systemctl reload iptables", check_exit_code=False)
+    if reload_exit != 0:
+        reload_exit, _, reload_err = guest_executor("service iptables reload >/dev/null 2>&1", check_exit_code=False)
+    if reload_exit != 0:
+        print(f"   [WARN] Unable to reload iptables after configuration update: {(reload_err or '').strip() or reload_exit}")
+        return False
+    print(f"   -> Updated iptables configuration for PRD environment (backup: {backup_path}).")
+    return True
+
+
+def _sync_prd_system_configuration(guest_executor) -> bool:
+    """Synchronise hosts and firewall configurations inside the guest with PRD expectations."""
+    print("   -> Synchronising guest hosts and firewall configuration with PRD mappings...")
+    timestamp = datetime.now().strftime("%Y%m%d")
+    success = True
+    if not _sync_hosts_file_to_prd(guest_executor, timestamp):
+        success = False
+    if not _sync_firewalld_configuration_to_prd(guest_executor, timestamp):
+        success = False
+    if not _sync_ntp_configuration_to_prd(guest_executor, timestamp):
+        success = False
+    if not _sync_centos_repo_configuration(guest_executor, timestamp):
+        success = False
+    if not _ensure_td_agent_repo(guest_executor, timestamp):
+        success = False
+    if not _sync_iptables_configuration_to_prd(guest_executor, timestamp):
+        success = False
+    if not _ensure_http_proxy_configuration(guest_executor, timestamp):
+        success = False
+    return success
+
+
+def _ensure_http_proxy_configuration(guest_executor, timestamp: str) -> bool:
+    """Ensure /etc/profile exports http/https proxy variables when they are missing."""
+    proxy_url = "http://172.16.162.6:3128"
+    profile_path = "/etc/profile"
+    backup_path = f"{profile_path}-{timestamp}.bak"
+    profile_exit, profile_content, profile_err = guest_executor(
+        f"cat {shlex.quote(profile_path)}",
+        check_exit_code=False,
+    )
+    if profile_exit != 0:
+        print(f"   [WARN] Unable to read {profile_path}: {(profile_err or '').strip() or profile_exit}")
+        return False
+    proxy_lines = [
+        f"export http_proxy={proxy_url}",
+        f"export https_proxy={proxy_url}",
+        f"export HTTP_PROXY={proxy_url}",
+        f"export HTTPS_PROXY={proxy_url}",
+    ]
+    profile_has_proxies = all(line in profile_content for line in proxy_lines)
+    env_exit, env_stdout, _ = guest_executor("env | grep -i http", check_exit_code=False)
+    has_proxy_env = env_exit == 0 and bool(env_stdout and env_stdout.strip())
+    if profile_has_proxies:
+        if not has_proxy_env:
+            guest_executor(f". {profile_path}", check_exit_code=False)
+        return True
+    if has_proxy_env:
+        print("   -> Proxy environment variables detected but /etc/profile lacks persistent exports; updating profile.")
+    backup_cmd = (
+        f"[ -f {shlex.quote(backup_path)} ] || "
+        f"cp {shlex.quote(profile_path)} {shlex.quote(backup_path)}"
+    )
+    backup_exit, _, backup_err = guest_executor(backup_cmd, check_exit_code=False)
+    if backup_exit != 0:
+        print(f"   [WARN] Unable to back up {profile_path}: {(backup_err or '').strip() or backup_exit}")
+        return False
+    block = "# PRD proxy configuration\n" + "\n".join(proxy_lines) + "\n"
+    base_profile = profile_content.rstrip("\n")
+    if base_profile:
+        base_profile += "\n\n"
+    updated_profile = base_profile + block
+    write_exit, _, write_err = _write_guest_file(guest_executor, profile_path, updated_profile)
+    if write_exit != 0:
+        print(f"   [WARN] Failed to update {profile_path}: {(write_err or '').strip() or write_exit}")
+        return False
+    verify_exit, verify_content, _ = guest_executor(f"cat {shlex.quote(profile_path)}", check_exit_code=False)
+    if verify_exit != 0 or not all(line in (verify_content or "") for line in proxy_lines):
+        print(f"   [WARN] Verification failed after updating {profile_path}; proxy exports may be missing.")
+        return False
+    guest_executor(f". {profile_path}", check_exit_code=False)
+    print(f"   -> Added proxy exports to {profile_path} (backup: {backup_path}).")
+    env_verify_exit, env_verify_stdout, _ = guest_executor("env | grep -i http", check_exit_code=False)
+    if env_verify_exit != 0 or proxy_url not in (env_verify_stdout or ""):
+        print("   [WARN] Proxy environment variables may not be active in the current session; please re-login.")
+    return True
 
 
 @dataclass
@@ -2159,6 +2988,8 @@ try:
                     applied_static_routes.copy(),
                     expected_dns_servers[:] if expected_dns_servers else []
                 ))
+        if not _sync_prd_system_configuration(guest_command_executor):
+            workflow_had_warnings = True
         ensure_firewall_allows_ssh(guest_command_executor, SSH_ALLOWED_SOURCE_IP)
         print("   [OK] Completed IP configuration for all NICs.")
     expected_dns_overall = dedupe_preserving_order(expected_dns_overall)
