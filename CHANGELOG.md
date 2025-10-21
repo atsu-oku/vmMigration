@@ -1,4 +1,12 @@
-﻿# Version History
+# Version History
+
+## 2025-10-20 (Legacy guest tooling support)
+
+- Reworked the legacy guest network configurator to detect `ip`, `ifconfig`, and `route`, falling back to net-tools when NetworkManager is absent.
+- Added detailed verification/diagnostics so failed legacy commands surface explicit warnings and the caller can reuse the exact verification command.
+- Updated the migration workflow to honour the expanded return signature, abort on legacy failures, and reuse the helper-provided verification when checking configured IPs.
+- Marked static route and persistence write errors as non-fatal so legacy guests keep progressing while still logging warnings.
+- Captured source interface names via guest operations and renamed destination NICs to match (including udev/ifcfg updates) before applying network settings.
 
 ## 2025-10-19 (Gateway fallback & auth hardening)
 
