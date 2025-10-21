@@ -547,6 +547,7 @@ original_default_gateway: str | None = None
 original_default_gateway_source: str | None = None
 original_static_routes: List[Dict[str, Any]] = []
 si_source = None
+content_source = None
 si_dest = None
 sdk_network_client: VsphereGuestNetworkSDK | None = None
 source_keepalive_handle: Optional[Tuple[threading.Thread, threading.Event]] = None
@@ -561,6 +562,18 @@ try:
         guest_root_pwd=GUEST_ROOT_PWD,
         guest_admin_pwd=GUEST_ADMIN_PWD,
     )
+    si_source = SmartConnect(
+        host=VCSA_HOST_SOURCE,
+        user=VCSA_USER,
+        pwd=VCSA_PWD_SOURCE,
+        port=VCSA_PORT,
+        sslContext=ctx,
+    )
+    if not si_source:
+        raise ConnectionError(f"Unable to connect to source vCenter ({VCSA_HOST_SOURCE}).")
+    source_keepalive_handle = _start_keepalive_thread(si_source, "source-vcenter")
+    content_source = si_source.RetrieveContent()
+    target_vm = find_vm_by_name(content_source, target_vm_name)
     if not target_vm:
         raise FileNotFoundError(f"VM '{target_vm_name}' was not found.")
     print(f"[OK] Located VM '{target_vm.name}'.")
