@@ -46,12 +46,12 @@
 2. **firewalld**
    - ゾーン XML を取得し、sources / rich rules を PRD アドレスへ変換。  
    - Heartbeat ゾーンの SSH ルールを撤去。  
-   - ゾーンに紐付く interface を保持し、変換後に再アタッチ。  
+   - ゾーンに紐付く interface を保持し、変換後に再アタッチ。（これできてない）
    - `firewall-cmd --reload` で反映。
 
 3. **chrony / ntpd**
    - 代表的な設定ファイル（`/etc/chrony.conf`, `/etc/ntp.conf` など）を走査。  
-   - `transform_text_to_prd` + 正規表現置換で 172.16.17x.*を 172.16.16x.* へ強制変換。  
+   - `transform_text_to_prd` + 正規表現置換で 172.16.17x.*を 172.16.16x.* へ強制変換。（これできてない）
    - バックアップ作成後に書換え。
 
 4. **CentOS repo**
@@ -69,7 +69,7 @@
    - `systemctl reload iptables`（または `service iptables reload`）をリトライ実行。
 
 7. **プロキシ設定 (`/etc/profile`)**
-   - PRD 用 proxy export を追記。  
+   - PRD 用 proxy export を追記。（これできてない）
    - 反映後 `. /etc/profile` を呼び出し、`env | grep -i http` で検証。  
    - 未反映なら警告。
 
