@@ -676,58 +676,205 @@ def configure_interface_without_nmcli(
     expected_gateway: Optional[str],
     routes_for_nic: Sequence[Tuple[int, Dict[str, Any]]],
     dns_servers: Optional[Sequence[str]] = None,
-) -> Tuple[List[int], List[str]]:
+) -> Tuple[List[int], List[str], bool, Optional[str]]:
     """Configure a guest interface when nmcli is unavailable."""
     selected_route_indices: List[int] = []
     selected_route_lines: List[str] = []
-    route_commands: List[str] = []
-    if new_ip and prefix is not None:
-        route_commands.append(f"ip addr flush dev {interface_name}")
-        route_commands.append(f"ip addr add {new_ip}/{prefix} dev {interface_name}")
-    else:
-        route_commands.append(f"ip addr flush dev {interface_name}")
-    if expected_gateway:
-        route_commands.append(f"ip route replace default via {expected_gateway} dev {interface_name}")
-    for route_idx, route_info in routes_for_nic:
-        gateway = route_info["gateway"]
-        prefix_value = route_info.get("prefix")
-        network_base = route_info["network"]
-        if prefix_value is None:
-            continue
-        selected_route_indices.append(route_idx)
-        selected_route_lines.append(f"{network_base}/{prefix_value} via {gateway}")
-        route_commands.append(f"ip route replace {network_base}/{prefix_value} via {gateway} dev {interface_name}")
+    command_failures: List[Tuple[str, int, str, bool]] = []
+    verification_command: Optional[str] = None
+
+    deduped_dns_servers: List[str] = []
     if dns_servers:
-        resolv_lines = "\n".join(f"nameserver {dns}" for dns in dns_servers if dns)
-        if resolv_lines:
-            route_commands.append(
-                "cat <<'EOF' > /etc/resolv.conf\n"
-                f"{resolv_lines}\n"
-                "EOF"
+        seen_dns: Set[str] = set()
+        for server in dns_servers:
+            if not server or server in seen_dns:
+                continue
+            deduped_dns_servers.append(server)
+            seen_dns.add(server)
+
+    netmask_from_prefix: Optional[str] = None
+    if prefix is not None:
+        try:
+            netmask_from_prefix = prefix_to_subnet_mask(prefix)
+        except ValueError:
+            netmask_from_prefix = None
+
+    def _run_guest_command(
+        cmd: str,
+        *,
+        record_failure: bool = True,
+        fatal: bool = True,
+    ) -> Tuple[int, str, str]:
+        exit_code, stdout, stderr = command_executor(cmd, check_exit_code=False)
+        if record_failure:
+            stderr_clean = (stderr or "").strip()
+            if exit_code != 0 or stderr_clean:
+                command_failures.append((cmd, exit_code, stderr_clean, fatal))
+        return exit_code, stdout, stderr
+
+    def _check_command_exists(cmd: str) -> bool:
+        exit_result, _, _ = command_executor(f"command -v {cmd} >/dev/null 2>&1", check_exit_code=False)
+        return exit_result == 0
+
+    ip_available = _check_command_exists("ip")
+    ifconfig_available = _check_command_exists("ifconfig")
+    route_available = _check_command_exists("route")
+
+    if ip_available:
+        _run_guest_command(f"ip addr flush dev {interface_name}", record_failure=False, fatal=False)
+        if new_ip and prefix is not None:
+            _run_guest_command(f"ip addr replace {new_ip}/{prefix} dev {interface_name}")
+            verification_command = f"ip addr show {interface_name} | grep -q '{new_ip}'"
+        elif new_ip:
+            _run_guest_command(f"ip addr add {new_ip} dev {interface_name}")
+            verification_command = f"ip addr show {interface_name} | grep -q '{new_ip}'"
+        else:
+            _run_guest_command(f"ip addr flush dev {interface_name}", record_failure=False, fatal=False)
+        _run_guest_command(f"ip link set {interface_name} up")
+        if expected_gateway:
+            _run_guest_command(f"ip route replace default via {expected_gateway} dev {interface_name}")
+        for route_idx, route_info in routes_for_nic:
+            gateway = route_info.get("gateway")
+            prefix_value = route_info.get("prefix")
+            network_base = route_info.get("network")
+            if prefix_value is None or not gateway or not network_base:
+                continue
+            exit_code, _, _ = _run_guest_command(
+                f"ip route replace {network_base}/{prefix_value} via {gateway} dev {interface_name}",
+                fatal=False,
             )
-    config_script = "\n".join(route_commands) + "\n"
-    command_executor(config_script, check_exit_code=False)
-    if routes_for_nic:
-        route_content = "\n".join(
-            f"{line} dev {interface_name}" if " dev " not in line else line for line in selected_route_lines
-        ) + "\n"
-        persist_routes_script = (
-            "if [ -d /etc/sysconfig/network-scripts ]; then\n"
-            f"  cat <<'EOF' > /etc/sysconfig/network-scripts/route-{interface_name}\n"
-            f"{route_content}"
-            "EOF\n"
-            "fi\n"
-        )
-        command_executor(persist_routes_script, check_exit_code=False)
+            if exit_code == 0:
+                selected_route_indices.append(route_idx)
+                selected_route_lines.append(f"{network_base}/{prefix_value} via {gateway}")
+    elif ifconfig_available:
+        _run_guest_command(f"ifconfig {interface_name} down || true", record_failure=False, fatal=False)
+        if new_ip:
+            if netmask_from_prefix:
+                _run_guest_command(f"ifconfig {interface_name} {new_ip} netmask {netmask_from_prefix} up")
+            else:
+                if prefix is not None:
+                    print(f"   [WARN] Unable to derive netmask for prefix {prefix}; continuing without netmask.")
+                _run_guest_command(f"ifconfig {interface_name} {new_ip} up")
+            verification_command = f"ifconfig {interface_name} | grep -q '{new_ip}'"
+        else:
+            _run_guest_command(f"ifconfig {interface_name} up")
+        if expected_gateway and route_available:
+            _run_guest_command("route del default >/dev/null 2>&1 || true", record_failure=False, fatal=False)
+            _run_guest_command(f"route add default gw {expected_gateway} dev {interface_name}")
+        elif expected_gateway and not route_available:
+            print("   [WARN] Unable to configure default gateway: 'route' command not available.")
+        if routes_for_nic and not route_available:
+            print("   [WARN] Static routes skipped: 'route' command not available.")
+        for route_idx, route_info in routes_for_nic:
+            gateway = route_info.get("gateway")
+            prefix_value = route_info.get("prefix")
+            network_base = route_info.get("network")
+            if prefix_value is None or not gateway or not network_base:
+                continue
+            if route_available:
+                try:
+                    route_netmask = prefix_to_subnet_mask(prefix_value)
+                except ValueError:
+                    print(f"   [WARN] Skipping route {network_base}/{prefix_value}: invalid prefix.")
+                    continue
+                _run_guest_command(
+                    f"route del -net {network_base} netmask {route_netmask} dev {interface_name} >/dev/null 2>&1 || true",
+                    record_failure=False,
+                    fatal=False,
+                )
+                exit_code, _, _ = _run_guest_command(
+                    f"route add -net {network_base} netmask {route_netmask} gw {gateway} dev {interface_name}",
+                    fatal=False,
+                )
+                if exit_code == 0:
+                    selected_route_indices.append(route_idx)
+                    selected_route_lines.append(f"{network_base}/{prefix_value} via {gateway}")
     else:
-        cleanup_routes_script = (
-            "if [ -d /etc/sysconfig/network-scripts ]; then\n"
-            f"  rm -f /etc/sysconfig/network-scripts/route-{interface_name}\n"
-            "fi\n"
+        print("   [WARN] Neither 'ip' nor 'ifconfig' is available; unable to configure interface.")
+    if deduped_dns_servers:
+        resolv_lines = "\n".join(f"nameserver {dns}" for dns in deduped_dns_servers if dns)
+        if resolv_lines:
+            resolv_payload = "\\n".join(resolv_lines.splitlines())
+            command = (
+                "printf '%b\\n' '" + resolv_payload.replace("'", "'\"'\"'") + "\\n' | tee /etc/resolv.conf >/dev/null"
+            )
+            _run_guest_command(command)
+    route_dir = "/etc/sysconfig/network-scripts"
+    if selected_route_lines:
+        route_lines_with_dev = [
+            f"{line} dev {interface_name}" if " dev " not in line else line
+            for line in selected_route_lines
+        ]
+        route_payload = "\\n".join(route_lines_with_dev)
+        write_routes_command = (
+            f"if [ -d {route_dir} ]; then "
+            f"printf '%b\\n' '{route_payload}\\n' | tee {route_dir}/route-{interface_name} >/dev/null; "
+            "fi"
         )
-        command_executor(cleanup_routes_script, check_exit_code=False)
-    print("   -> Applied legacy network configuration (nmcli unavailable).")
-    return selected_route_indices, selected_route_lines
+        _run_guest_command(write_routes_command, fatal=False)
+    else:
+        cleanup_routes_command = (
+            f"if [ -d {route_dir} ]; then "
+            f"rm -f {route_dir}/route-{interface_name}; "
+            "fi"
+        )
+        _run_guest_command(cleanup_routes_command, fatal=False)
+
+    ifcfg_dir = "/etc/sysconfig/network-scripts"
+    ifcfg_updates: List[str] = []
+    if new_ip:
+        ifcfg_updates.append(f"echo \"IPADDR={new_ip}\" >> \"$cfg\"; ")
+        if prefix is not None:
+            ifcfg_updates.append(f"echo \"PREFIX={prefix}\" >> \"$cfg\"; ")
+        if netmask_from_prefix:
+            ifcfg_updates.append(f"echo \"NETMASK={netmask_from_prefix}\" >> \"$cfg\"; ")
+    if expected_gateway:
+        ifcfg_updates.append(f"echo \"GATEWAY={expected_gateway}\" >> \"$cfg\"; ")
+    if deduped_dns_servers:
+        for dns_index, dns_value in enumerate(deduped_dns_servers, start=1):
+            ifcfg_updates.append(f"echo \"DNS{dns_index}={dns_value}\" >> \"$cfg\"; ")
+    if ifcfg_updates or (new_ip is None or expected_gateway is None or deduped_dns_servers):
+        update_ifcfg_command = (
+            f"if [ -d {ifcfg_dir} ]; then "
+            f"cfg={ifcfg_dir}/ifcfg-{interface_name}; "
+            "if [ -f \"$cfg\" ]; then "
+            "sed -i '/^IPADDR=/d;/^PREFIX=/d;/^NETMASK=/d;/^GATEWAY=/d;/^DNS[0-9]*=/d' \"$cfg\"; "
+            + "".join(ifcfg_updates)
+            + "fi; "
+            "fi"
+        )
+        _run_guest_command(update_ifcfg_command, fatal=False)
+
+    fatal_failures = [entry for entry in command_failures if entry[3]]
+    config_success = not fatal_failures
+    if command_failures:
+        print("   [WARN] Legacy command execution reported issues:")
+        for failed_cmd, exit_code, stderr_text, fatal in command_failures:
+            detail = f"exit={exit_code}"
+            if stderr_text:
+                detail += f", stderr='{stderr_text}'"
+            severity = "fatal" if fatal else "non-fatal"
+            print(f"      - {failed_cmd} ({detail}, {severity})")
+    else:
+        if ip_available or ifconfig_available:
+            print("   -> Applied legacy network configuration (nmcli unavailable).")
+
+    if new_ip:
+        if verification_command:
+            verify_exit, verify_stdout, verify_stderr = _run_guest_command(verification_command)
+            if verify_exit == 0:
+                print(f"   -> Confirmed IPv4 {new_ip} on {interface_name}.")
+            else:
+                verification_error = (verify_stderr or "").strip()
+                verification_output = (verify_stdout or "").strip()
+                detail = verification_error or verification_output or "verification command failed"
+                config_success = False
+                print(f"   [WARN] Unable to confirm IPv4 {new_ip} on {interface_name}: {detail}.")
+        else:
+            config_success = False
+            print(f"   [WARN] Cannot verify IPv4 {new_ip}: no suitable command available.")
+
+    return selected_route_indices, selected_route_lines, config_success, verification_command
 
 
 def determine_prd_static_routes(
@@ -739,6 +886,8 @@ def determine_prd_static_routes(
     routes: List[Dict[str, Any]] = []
     seen: Set[Tuple[str, int, str, Optional[int]]] = set()
     local_networks: Dict[int, ipaddress.IPv4Network] = {}
+    manage_nic_index: Optional[int] = None
+    odd_octet_candidate: Optional[int] = None
     for idx, nic in enumerate(nic_infos):
         prd_ip = nic.get("prd_ip_address") or calculate_ip_stg_to_prd(nic.get("ip_address"))
         subnet_mask = nic.get("subnet_mask")
@@ -749,6 +898,18 @@ def determine_prd_static_routes(
             local_networks[idx] = network
         except (ValueError, ipaddress.AddressValueError):
             continue
+        dest_network_name = (nic.get("dest_network_name") or nic.get("network_name") or "").lower()
+        if manage_nic_index is None and ("-mng-" in dest_network_name or "manage" in dest_network_name):
+            manage_nic_index = idx
+        if odd_octet_candidate is None:
+            try:
+                third_octet = int(str(ipaddress.IPv4Address(prd_ip)).split(".")[2])
+                if third_octet % 2 == 1:
+                    odd_octet_candidate = idx
+            except (ValueError, ipaddress.AddressValueError, IndexError):
+                pass
+    if manage_nic_index is None and odd_octet_candidate is not None:
+        manage_nic_index = odd_octet_candidate
     for route in original_routes:
         network = route.get("network")
         prefix = route.get("prefix")
@@ -796,6 +957,8 @@ def determine_prd_static_routes(
                         break
             except (ValueError, ipaddress.AddressValueError):
                 pass
+        if manage_nic_index is not None:
+            route_owner_idx = manage_nic_index
         route_key = (str(prd_network.network_address), prd_network.prefixlen, prd_gateway, route_owner_idx)
         if route_key in seen:
             continue
@@ -914,12 +1077,9 @@ def verify_destination_network_with_sdk(
             continue
         expected_route_set.add((network_str, prefix_int, str(gateway)))
     missing_routes = expected_route_set - actual_route_set
-    extra_routes = actual_route_set - expected_route_set
     if missing_routes:
         print(f"   [WARN] Missing expected routes: {sorted(missing_routes)}")
         success = False
-    if extra_routes:
-        print(f"   -> Additional routes (for reference): {sorted(extra_routes)}")
     return success
 
 

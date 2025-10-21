@@ -61,9 +61,13 @@ class RouteConfig:
 
     network: str
     gateway: str
+    prefix: Optional[int] = None
 
     def as_dict(self) -> Mapping[str, object]:
-        return {"network": self.network, "gateway": self.gateway}
+        data: dict[str, object] = {"network": self.network, "gateway": self.gateway}
+        if self.prefix is not None:
+            data["prefix"] = self.prefix
+        return data
 
 
 class VsphereGuestNetworkSDK:
