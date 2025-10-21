@@ -361,6 +361,51 @@ try:
                 f"NIC {mac} ({network_name}) data could not be retrieved from API/VMware Tools."
             )
 
+    source_interface_names: Dict[str, str] = {}
+    if original_nic_info:
+        try:
+            reset_root_login_disabled()
+            source_guest_operations_manager = content_source.guestOperationsManager
+            if source_guest_operations_manager:
+                source_root_credentials = vim.vm.guest.NamePasswordAuthentication(
+                    username=GUEST_ROOT_USER,
+                    password=GUEST_ROOT_PWD,
+                )
+                source_admin_credentials = None
+                if GUEST_ADMIN_USER and GUEST_ADMIN_PWD:
+                    source_admin_credentials = vim.vm.guest.NamePasswordAuthentication(
+                        username=GUEST_ADMIN_USER,
+                        password=GUEST_ADMIN_PWD,
+                    )
+
+                def source_guest_command_executor(command: str, check_exit_code: bool = True):
+                    return execute_command_in_guest(
+                        source_guest_operations_manager,
+                        target_vm,
+                        source_root_credentials,
+                        source_admin_credentials,
+                        GUEST_ADMIN_PWD,
+                        command,
+                        check_exit_code=check_exit_code,
+                    )
+
+                try:
+                    source_inventory = collect_interface_inventory(source_guest_command_executor)
+                except Exception as inventory_error:  # pylint: disable=broad-exception-caught
+                    LOGGER.debug("Unable to collect source interface inventory: %s", inventory_error, exc_info=True)
+                else:
+                    for entry in source_inventory:
+                        mac_candidate = (entry.get("mac") or "").lower()
+                        ifname_candidate = entry.get("ifname")
+                        if mac_candidate and ifname_candidate:
+                            source_interface_names[mac_candidate] = ifname_candidate
+                    for nic_entry in original_nic_info:
+                        mac_lower = (nic_entry.get("mac_address") or "").lower()
+                        if mac_lower and mac_lower in source_interface_names:
+                            nic_entry["original_ifname"] = source_interface_names[mac_lower]
+        finally:
+            reset_root_login_disabled()
+
     default_gateway_owner_idx: Optional[int] = None
     route_keys: Set[Tuple[str, int, str]] = set()
     chosen_gateway: Optional[Tuple[str, Optional[int]]] = None
@@ -985,6 +1030,71 @@ try:
                 new_mac,
                 nic_info.get('mac_address'),
             )
+            desired_ifname = (nic_info.get('original_ifname') or "").strip()
+            if desired_ifname and desired_ifname.lower() != device_name.lower():
+                desired_lower = desired_ifname.lower()
+                if desired_lower in available_interfaces:
+                    print(
+                        f"   [WARN] Intended interface name '{desired_ifname}' already in use; keeping '{device_name}'."
+                    )
+                else:
+                    previous_device_name = device_name
+                    print(f"   -> Renaming guest interface '{device_name}' to '{desired_ifname}' to match source.")
+                    rename_failed = False
+                    down_exit, _, down_stderr = guest_command_executor(
+                        f"ip link set {device_name} down",
+                        check_exit_code=False,
+                    )
+                    if down_exit != 0:
+                        rename_failed = True
+                        print(
+                            f"   [WARN] Failed to bring interface '{device_name}' down before rename "
+                            f"(exit={down_exit}, stderr='{down_stderr or '(none)'}')."
+                        )
+                    else:
+                        rename_exit, _, rename_stderr = guest_command_executor(
+                            f"ip link set {device_name} name {desired_ifname}",
+                            check_exit_code=False,
+                        )
+                        if rename_exit != 0:
+                            rename_failed = True
+                            print(
+                                f"   [WARN] Unable to rename '{device_name}' to '{desired_ifname}' "
+                                f"(exit={rename_exit}, stderr='{rename_stderr or '(none)'}')."
+                            )
+                            guest_command_executor(f"ip link set {device_name} up", check_exit_code=False)
+                        else:
+                            guest_command_executor(f"ip link set {desired_ifname} up", check_exit_code=False)
+                            mac_upper = (new_mac or nic_info.get('mac_address') or "").upper()
+                            guest_command_executor(
+                                (
+                                    "if [ -f /etc/udev/rules.d/70-persistent-net.rules ]; then "
+                                    f"sed -i '/ATTR{{address}}==\"{mac_upper}\"/Is/NAME=\"[^\"]*\"/NAME=\"{desired_ifname}\"/' "
+                                    "/etc/udev/rules.d/70-persistent-net.rules; "
+                                    "fi"
+                                ),
+                                check_exit_code=False,
+                            )
+                            guest_command_executor(
+                                (
+                                    f"for cfg in /etc/sysconfig/network-scripts/ifcfg-{previous_device_name} "
+                                    f"/etc/sysconfig/network-scripts/ifcfg-{desired_ifname}; do "
+                                    "if [ -f \"$cfg\" ]; then "
+                                    f"sed -i 's/^DEVICE=.*/DEVICE=\"{desired_ifname}\"/' \"$cfg\"; "
+                                    "fi; "
+                                    "done"
+                                ),
+                                check_exit_code=False,
+                            )
+                            available_interfaces.discard(previous_device_name.lower())
+                            available_interfaces_compact.discard(compact_interface_name(previous_device_name))
+                            available_interfaces.add(desired_lower)
+                            available_interfaces_compact.add(compact_interface_name(desired_ifname))
+                            device_name = desired_ifname
+                            print(f"   -> Interface rename completed; proceeding with '{device_name}'.")
+                    if rename_failed:
+                        guest_command_executor(f"ip link set {device_name} up", check_exit_code=False)
+                        device_name = previous_device_name
             con_name = device_name
             print(f"   -> Guest OS interface '{device_name}' located.")
             nmcli_check_exit, _, _ = guest_command_executor("command -v nmcli", check_exit_code=False)
@@ -1075,6 +1185,8 @@ try:
                     use_sdk_networking = False
             selected_route_indices: List[int] = []
             selected_route_lines: List[str] = []
+            legacy_config_success = True
+            legacy_verification_command: Optional[str] = None
             if rest_configured:
                 selected_route_indices = [route_idx for route_idx, _ in routes_for_nic]
                 selected_route_lines = []
@@ -1217,7 +1329,7 @@ try:
                                 print(f"      - Added: {network_cidr} via {gateway}")
                     except NmcliNotAvailableError:
                         print("   -> nmcli command unavailable; applying legacy network configuration.")
-                        selected_route_indices, selected_route_lines = configure_interface_without_nmcli(
+                        selected_route_indices, selected_route_lines, legacy_config_success, legacy_verification_command = configure_interface_without_nmcli(
                             guest_command_executor,
                             device_name,
                             new_ip,
@@ -1229,7 +1341,7 @@ try:
                         use_nmcli_connection = False
                 except NmcliNotAvailableError:
                     print("   -> nmcli command unavailable; applying legacy network configuration.")
-                    selected_route_indices, selected_route_lines = configure_interface_without_nmcli(
+                    selected_route_indices, selected_route_lines, legacy_config_success, legacy_verification_command = configure_interface_without_nmcli(
                         guest_command_executor,
                         device_name,
                         new_ip,
@@ -1241,7 +1353,7 @@ try:
                     use_nmcli_connection = False
             else:
                 print("   -> nmcli unavailable; applying legacy network configuration.")
-                selected_route_indices, selected_route_lines = configure_interface_without_nmcli(
+                selected_route_indices, selected_route_lines, legacy_config_success, legacy_verification_command = configure_interface_without_nmcli(
                     guest_command_executor,
                     device_name,
                     new_ip,
@@ -1253,6 +1365,8 @@ try:
                 use_nmcli_connection = False
             if selected_route_lines:
                 applied_static_routes.extend(selected_route_lines)
+            if not use_nmcli_connection and not legacy_config_success:
+                raise RuntimeError("Legacy network configuration failed inside the guest OS. See log output above.")
             for route_idx in selected_route_indices:
                 configured_route_indices.add(route_idx)
             # 4. Bring up the new connection
@@ -1264,15 +1378,33 @@ try:
                 guest_command_executor(f"nmcli connection up '{con_name}'")
             guest_command_executor(f"ip -6 addr flush dev {device_name}", check_exit_code=False)
             guest_command_executor(
-                f"sysctl -w net.ipv6.conf.{device_name}.disable_ipv6=1",
+                (
+                    f"if [ -f /proc/sys/net/ipv6/conf/{device_name}/disable_ipv6 ]; then "
+                    f"sysctl -w net.ipv6.conf.{device_name}.disable_ipv6=1; "
+                    "fi"
+                ),
                 check_exit_code=False,
             )
             guest_command_executor(
-                f"sysctl -w net.ipv6.conf.{device_name}.autoconf=0",
+                (
+                    f"if [ -f /proc/sys/net/ipv6/conf/{device_name}/autoconf ]; then "
+                    f"sysctl -w net.ipv6.conf.{device_name}.autoconf=0; "
+                    "fi"
+                ),
                 check_exit_code=False,
             )
             # 4.5. Broadcast gratuitous ARP to refresh neighbor caches
             if new_ip:
+                guest_command_executor(
+                    (
+                        "if command -v ip >/dev/null 2>&1; then "
+                        f"ip link set {device_name} up; "
+                        "elif command -v ifconfig >/dev/null 2>&1; then "
+                        f"ifconfig {device_name} up; "
+                        "fi"
+                    ),
+                    check_exit_code=False,
+                )
                 arping_commands = [
                     f"arping -c 3 -A -I {device_name} {new_ip}",
                     f"arping -c 3 -U -I {device_name} {new_ip}",
@@ -1282,7 +1414,13 @@ try:
 
             # 5. Final verification
             time.sleep(5)
-            guest_command_executor(f"ip addr show {device_name} | grep -q '{new_ip}'")
+            if new_ip:
+                verification_cmd = None
+                if use_nmcli_connection:
+                    verification_cmd = f"ip addr show {device_name} | grep -q '{new_ip}'"
+                else:
+                    verification_cmd = legacy_verification_command or f"ip addr show {device_name} | grep -q '{new_ip}'"
+                guest_command_executor(verification_cmd)
             ping_targets = []
             candidate_gateways = []
             if expected_gateway_value:
@@ -1356,12 +1494,17 @@ try:
                 LOGGER.warning("Failed to initialise SDK client for post-migration verification: %s", sdk_error)
         if validation_vm_id and validation_client:
             try:
+                configured_route_payload = [
+                    route_entry
+                    for idx, route_entry in enumerate(prd_static_routes)
+                    if idx in configured_route_indices
+                ]
                 sdk_verification_succeeded = verify_destination_network_with_sdk(
                     validation_client,
                     validation_vm_id,
                     original_nic_info,
                     expected_dns_overall,
-                    prd_static_routes,
+                    configured_route_payload,
                 )
             except Exception as sdk_error:
                 LOGGER.warning("SDK verification encountered an error: %s", sdk_error)
