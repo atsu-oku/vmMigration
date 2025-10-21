@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 import importlib.util
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, TypeVar
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, TypeVar, TYPE_CHECKING
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -75,6 +75,11 @@ except ModuleNotFoundError as import_error:
     IPv4Config = vsphere_sdk_network.IPv4Config
     DnsConfig = vsphere_sdk_network.DnsConfig
     RouteConfig = vsphere_sdk_network.RouteConfig
+
+if TYPE_CHECKING:
+    from vsphere_sdk_network import VsphereGuestNetworkSDK as VsphereGuestNetworkSDKType
+else:
+    VsphereGuestNetworkSDKType = VsphereGuestNetworkSDK
 
 
 try:
@@ -438,7 +443,7 @@ class WorkflowState:
     original_default_gateway: Optional[str] = None
     original_static_routes: List[Dict[str, Any]] = field(default_factory=list)
     prd_static_routes: List[Dict[str, Any]] = field(default_factory=list)
-    sdk_network_client: Optional[VsphereGuestNetworkSDK] = None
+    sdk_network_client: Optional[VsphereGuestNetworkSDKType] = None
     source_keepalive_handle: Optional[Tuple[threading.Thread, threading.Event]] = None
     dest_keepalive_handle: Optional[Tuple[threading.Thread, threading.Event]] = None
     target_datastore: Optional[Any] = None
@@ -480,6 +485,7 @@ class CloneAndVmotionWorkflow:
         self.target_vm = None
 
     def run(self) -> None:
+        """Execute the full staged-to-production migration workflow."""
         try:
             self._preflight_check()
             self._collect_source_vm_details()
@@ -841,7 +847,7 @@ original_static_routes: List[Dict[str, Any]] = []
 si_source = None
 content_source = None
 si_dest = None
-sdk_network_client: Optional[VsphereGuestNetworkSDK] = None
+sdk_network_client: Optional[VsphereGuestNetworkSDKType] = None
 source_keepalive_handle: Optional[Tuple[threading.Thread, threading.Event]] = None
 dest_keepalive_handle: Optional[Tuple[threading.Thread, threading.Event]] = None
 workflow: Optional[CloneAndVmotionWorkflow] = None
