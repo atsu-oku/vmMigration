@@ -513,9 +513,9 @@ reset_root_login_disabled()
 # ------------------------------------------------
 # 2. Configure SSL context
 # ------------------------------------------------
-ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-ctx.check_hostname = False
-ctx.verify_mode = ssl.CERT_NONE
+ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+ssl_context.check_hostname = False
+ssl_context.verify_mode = ssl.CERT_NONE
 
 # ------------------------------------------------
 # 3. Collect target VM name and guest credentials
@@ -555,7 +555,7 @@ dest_keepalive_handle: Optional[Tuple[threading.Thread, threading.Event]] = None
 workflow: Optional[CloneAndVmotionWorkflow] = None
 try:
     workflow = CloneAndVmotionWorkflow(
-        ctx=ctx,
+        ctx=ssl_context,
         vcsa_pwd_source=VCSA_PWD_SOURCE,
         vcsa_pwd_dest=VCSA_PWD_DEST,
         target_vm_name=target_vm_name,
@@ -567,7 +567,7 @@ try:
         user=VCSA_USER,
         pwd=VCSA_PWD_SOURCE,
         port=VCSA_PORT,
-        sslContext=ctx,
+        sslContext=ssl_context,
     )
     if not si_source:
         raise ConnectionError(f"Unable to connect to source vCenter ({VCSA_HOST_SOURCE}).")
@@ -969,7 +969,7 @@ try:
 
     # --- [Phase 2/7] ~ [Phase 7/7]: Destination vCenter operations ---
     print("\n--- [Phase 2/7] Destination vCenter: Connect & Pre-check ---")
-    si_dest = SmartConnect(host=VCSA_HOST_DEST, user=VCSA_USER, pwd=VCSA_PWD_DEST, port=VCSA_PORT, sslContext=ctx)
+    si_dest = SmartConnect(host=VCSA_HOST_DEST, user=VCSA_USER, pwd=VCSA_PWD_DEST, port=VCSA_PORT, sslContext=ssl_context)
     if not si_dest:
         raise ConnectionError(f"Unable to connect to destination vCenter ({VCSA_HOST_DEST}).")
     print("[OK] Connected to destination vCenter.")
@@ -1924,7 +1924,7 @@ except Exception as error:
                             user=VCSA_USER,
                             pwd=VCSA_PWD_DEST,
                             port=VCSA_PORT,
-                            sslContext=ctx,
+                            sslContext=ssl_context,
                         )
                     except Exception as reconnect_error:
                         raise ConnectionError("Failed to reconnect to the destination vCenter.") from reconnect_error
@@ -1972,7 +1972,7 @@ except Exception as error:
             try:
                 print("\nApproved. Reconnecting to the source vCenter for cleanup...")
                 si_source_cleanup = SmartConnect(
-                    host=VCSA_HOST_SOURCE, user=VCSA_USER, pwd=VCSA_PWD_SOURCE, port=VCSA_PORT, sslContext=ctx)
+                    host=VCSA_HOST_SOURCE, user=VCSA_USER, pwd=VCSA_PWD_SOURCE, port=VCSA_PORT, sslContext=ssl_context)
                 if not si_source_cleanup:
                     raise ConnectionError("Failed to reconnect to the source vCenter.")
                 print("   [OK] Reconnected successfully.")
