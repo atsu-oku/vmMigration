@@ -683,6 +683,22 @@ def configure_interface_without_nmcli(
     command_failures: List[Tuple[str, int, str, bool]] = []
     verification_command: Optional[str] = None
 
+    deduped_dns_servers: List[str] = []
+    if dns_servers:
+        seen_dns: Set[str] = set()
+        for server in dns_servers:
+            if not server or server in seen_dns:
+                continue
+            deduped_dns_servers.append(server)
+            seen_dns.add(server)
+
+    netmask_from_prefix: Optional[str] = None
+    if prefix is not None:
+        try:
+            netmask_from_prefix = prefix_to_subnet_mask(prefix)
+        except ValueError:
+            netmask_from_prefix = None
+
     def _run_guest_command(
         cmd: str,
         *,
@@ -731,16 +747,10 @@ def configure_interface_without_nmcli(
                 selected_route_indices.append(route_idx)
                 selected_route_lines.append(f"{network_base}/{prefix_value} via {gateway}")
     elif ifconfig_available:
-        netmask: Optional[str] = None
-        if prefix is not None:
-            try:
-                netmask = prefix_to_subnet_mask(prefix)
-            except ValueError:
-                netmask = None
         _run_guest_command(f"ifconfig {interface_name} down || true", record_failure=False, fatal=False)
         if new_ip:
-            if netmask:
-                _run_guest_command(f"ifconfig {interface_name} {new_ip} netmask {netmask} up")
+            if netmask_from_prefix:
+                _run_guest_command(f"ifconfig {interface_name} {new_ip} netmask {netmask_from_prefix} up")
             else:
                 if prefix is not None:
                     print(f"   [WARN] Unable to derive netmask for prefix {prefix}; continuing without netmask.")
@@ -781,8 +791,8 @@ def configure_interface_without_nmcli(
                     selected_route_lines.append(f"{network_base}/{prefix_value} via {gateway}")
     else:
         print("   [WARN] Neither 'ip' nor 'ifconfig' is available; unable to configure interface.")
-    if dns_servers:
-        resolv_lines = "\n".join(f"nameserver {dns}" for dns in dns_servers if dns)
+    if deduped_dns_servers:
+        resolv_lines = "\n".join(f"nameserver {dns}" for dns in deduped_dns_servers if dns)
         if resolv_lines:
             resolv_payload = "\\n".join(resolv_lines.splitlines())
             command = (
@@ -809,6 +819,31 @@ def configure_interface_without_nmcli(
             "fi"
         )
         _run_guest_command(cleanup_routes_command, fatal=False)
+
+    ifcfg_dir = "/etc/sysconfig/network-scripts"
+    ifcfg_updates: List[str] = []
+    if new_ip:
+        ifcfg_updates.append(f"echo \"IPADDR={new_ip}\" >> \"$cfg\"; ")
+        if prefix is not None:
+            ifcfg_updates.append(f"echo \"PREFIX={prefix}\" >> \"$cfg\"; ")
+        if netmask_from_prefix:
+            ifcfg_updates.append(f"echo \"NETMASK={netmask_from_prefix}\" >> \"$cfg\"; ")
+    if expected_gateway:
+        ifcfg_updates.append(f"echo \"GATEWAY={expected_gateway}\" >> \"$cfg\"; ")
+    if deduped_dns_servers:
+        for dns_index, dns_value in enumerate(deduped_dns_servers, start=1):
+            ifcfg_updates.append(f"echo \"DNS{dns_index}={dns_value}\" >> \"$cfg\"; ")
+    if ifcfg_updates or (new_ip is None or expected_gateway is None or deduped_dns_servers):
+        update_ifcfg_command = (
+            f"if [ -d {ifcfg_dir} ]; then "
+            f"cfg={ifcfg_dir}/ifcfg-{interface_name}; "
+            "if [ -f \"$cfg\" ]; then "
+            "sed -i '/^IPADDR=/d;/^PREFIX=/d;/^NETMASK=/d;/^GATEWAY=/d;/^DNS[0-9]*=/d' \"$cfg\"; "
+            + "".join(ifcfg_updates)
+            + "fi; "
+            "fi"
+        )
+        _run_guest_command(update_ifcfg_command, fatal=False)
 
     fatal_failures = [entry for entry in command_failures if entry[3]]
     config_success = not fatal_failures
@@ -851,6 +886,8 @@ def determine_prd_static_routes(
     routes: List[Dict[str, Any]] = []
     seen: Set[Tuple[str, int, str, Optional[int]]] = set()
     local_networks: Dict[int, ipaddress.IPv4Network] = {}
+    manage_nic_index: Optional[int] = None
+    odd_octet_candidate: Optional[int] = None
     for idx, nic in enumerate(nic_infos):
         prd_ip = nic.get("prd_ip_address") or calculate_ip_stg_to_prd(nic.get("ip_address"))
         subnet_mask = nic.get("subnet_mask")
@@ -861,6 +898,18 @@ def determine_prd_static_routes(
             local_networks[idx] = network
         except (ValueError, ipaddress.AddressValueError):
             continue
+        dest_network_name = (nic.get("dest_network_name") or nic.get("network_name") or "").lower()
+        if manage_nic_index is None and ("-mng-" in dest_network_name or "manage" in dest_network_name):
+            manage_nic_index = idx
+        if odd_octet_candidate is None:
+            try:
+                third_octet = int(str(ipaddress.IPv4Address(prd_ip)).split(".")[2])
+                if third_octet % 2 == 1:
+                    odd_octet_candidate = idx
+            except (ValueError, ipaddress.AddressValueError, IndexError):
+                pass
+    if manage_nic_index is None and odd_octet_candidate is not None:
+        manage_nic_index = odd_octet_candidate
     for route in original_routes:
         network = route.get("network")
         prefix = route.get("prefix")
@@ -908,6 +957,8 @@ def determine_prd_static_routes(
                         break
             except (ValueError, ipaddress.AddressValueError):
                 pass
+        if manage_nic_index is not None:
+            route_owner_idx = manage_nic_index
         route_key = (str(prd_network.network_address), prd_network.prefixlen, prd_gateway, route_owner_idx)
         if route_key in seen:
             continue
