@@ -1,0 +1,23 @@
+﻿{
+  "": "https://json-schema.org/draft/2020-12/schema",
+  "title": "IptablesConfig",
+  "type": "object",
+  "properties": {
+    "table": {"type": "string"},
+    "chains": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {"type": "string"},
+          "policy": {"type": ["string", "null"]},
+          "rules": {"type": "array", "items": {"type": "string"}}
+        },
+        "required": ["name", "rules"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["table", "chains"],
+  "additionalProperties": false
+}

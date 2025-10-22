@@ -132,7 +132,7 @@ class NicSchemaValidator:
 
 
 def load_environment_mapping(path: Path) -> Dict[str, Any]:
-    with path.open(encoding="utf-8") as handle:
+    with path.open(encoding="utf-8-sig") as handle:
         return json.load(handle)
 
 
@@ -142,4 +142,5 @@ ENV_MAPPING_PATH = SCHEMA_DIR / 'environment_mapping.json'
 
 NIC_PLAN_VALIDATOR = NicSchemaValidator(NIC_PLAN_SCHEMA_PATH)
 ENVIRONMENT_MAPPING = load_environment_mapping(ENV_MAPPING_PATH)
+
 

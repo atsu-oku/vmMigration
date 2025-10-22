@@ -1,0 +1,14 @@
+﻿{
+  "\u0024schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "FirewalldZone",
+  "type": "object",
+  "properties": {
+    "name": {"type": "string"},
+    "interfaces": {"type": "array", "items": {"type": "string"}},
+    "sources": {"type": "array", "items": {"type": "string"}},
+    "ports": {"type": "array", "items": {"type": "string"}},
+    "rich_rules": {"type": "array", "items": {"type": "string"}}
+  },
+  "required": ["name"],
+  "additionalProperties": false
+}
