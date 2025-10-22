@@ -13,7 +13,7 @@ from vsphere_sdk_network import VsphereGuestNetworkSDK
 
 LOGGER = logging.getLogger(__name__)
 
-PRD_STATIC_ROUTE_SEGMENTS = {160, 161, 162, 163, 164}
+PRD_STATIC_ROUTE_SEGMENTS = {160, 161, 162, 163, 164, 168}
 MNG_SEGMENT_THIRD_OCTETS = {161, 163}
 NMCLI_FIELDS_WITH_TYPE = ["UUID", "NAME", "DEVICE", "TYPE"]
 NMCLI_FIELDS_NO_TYPE = ["UUID", "NAME", "DEVICE"]
@@ -21,7 +21,7 @@ SSH_ALLOWED_SOURCE_IP = "172.16.164.7"
 LEGACY_INTERFACE_PATTERN = re.compile(r"^(ens|eno|enp|enx|eth|em)[0-9a-z\-]*$", re.IGNORECASE)
 IPV4_PATTERN = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}(?:/\d{1,2})?\b")
 STG_HOST_SUFFIX_DIGIT_PATTERN = re.compile(r"(?<=\d)s\b")
-STG_HOST_ZERO_NS_PATTERN = re.compile(r"0ns\b")
+STG_HOST_ZERO_NS_PATTERN = re.compile(r"0(\d+)s\b")
 STG_IPET_DOMAIN_PATTERN = re.compile(r"ipet-ins(?=\.com\b)", re.IGNORECASE)
 
 
