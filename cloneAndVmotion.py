@@ -2595,7 +2595,7 @@ try:
                         if expected_dns_servers
                         else None
                     )
-                    route_specs: List[RouteConfig] = []
+                    route_specs: List["RouteConfig"] = []
                     for route_idx, route_info in routes_for_nic:
                         route_network = route_info.get('network')
                         route_gateway = route_info.get('gateway')
