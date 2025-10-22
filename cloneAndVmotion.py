@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """Automates the staged-to-production VM migration workflow between vCenters."""
 from __future__ import annotations
 import os
@@ -17,6 +17,8 @@ from datetime import datetime
 import importlib.util
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, TypeVar, TYPE_CHECKING
+
+from nic_schema import NicPlan
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -737,13 +739,16 @@ def _sync_firewalld_configuration_to_prd(guest_executor, timestamp: str) -> bool
         backup_path = f"{zone_file}-{timestamp}.bak"
         backup_created = False
 
-        def _ensure_zone_backup() -> bool:
+        def _ensure_zone_backup(
+            backup_path: str = backup_path,
+            zone_file_path: str = zone_file,
+        ) -> bool:
             nonlocal backup_created, overall_success
             if backup_created:
                 return True
             backup_cmd = (
                 f"[ -f {shlex.quote(backup_path)} ] || "
-                f"cp {shlex.quote(zone_file)} {shlex.quote(backup_path)}"
+                f"cp {shlex.quote(zone_file_path)} {shlex.quote(backup_path)}"
             )
             backup_exit, _, backup_err = guest_executor(backup_cmd, check_exit_code=False)
             if backup_exit != 0:
@@ -1267,7 +1272,7 @@ class WorkflowState:
     migrated_vm_name_for_rollback: Optional[str] = None
     migrated_vm: Optional[Any] = None
     unregistered_from_source: bool = False
-    original_nic_info: List[Dict[str, Any]] = field(default_factory=list)
+    original_nic_info: List[NicPlan] = field(default_factory=list)
     original_dns_servers: List[str] = field(default_factory=list)
     original_default_gateway: Optional[str] = None
     original_static_routes: List[Dict[str, Any]] = field(default_factory=list)
@@ -1428,42 +1433,40 @@ class CloneAndVmotionWorkflow:
             networking_state = {}
 
         guest_net_lookup = {nic.macAddress: nic for nic in self.target_vm.guest.net if nic.macAddress}
-        collected_nic_details: List[Dict[str, Any]] = []
+        collected_nic_details: List[NicPlan] = []
         missing_ipv4_reports: List[str] = []
 
         for vm_device in self.target_vm.config.hardware.device:
             if not isinstance(vm_device, vim.vm.device.VirtualEthernetCard):
                 continue
             mac_address = vm_device.macAddress
-            nic_summary: Dict[str, Any] = {
-                "mac_address": mac_address,
-                "label": getattr(vm_device.deviceInfo, "label", ""),
-                "network_name": (
-                    getattr(vm_device.backing, "network", None).name
-                    if getattr(vm_device.backing, "network", None)
-                    else ""
-                ),
-                "device_key": vm_device.key,
-                "device_type": type(vm_device),
-            }
+            backing = getattr(vm_device.backing, 'network', None)
+            network_name = backing.name if backing and getattr(backing, 'name', None) else ''
+            nic_summary = NicPlan(
+                index=len(collected_nic_details),
+                mac_address=mac_address,
+                label=getattr(vm_device.deviceInfo, 'label', '') or '',
+                network_name=network_name,
+                device_key=vm_device.key,
+                device_type=type(vm_device),
+            )
+            ipv4_found = False
             if mac_address in guest_net_lookup:
                 guest_iface = guest_net_lookup[mac_address]
                 if guest_iface.ipConfig and guest_iface.ipConfig.ipAddress:
                     for ip_entry in guest_iface.ipConfig.ipAddress:
                         if ':' in ip_entry.ipAddress:
                             continue
-                        nic_summary["ip_address"] = ip_entry.ipAddress
-                        nic_summary["prefix"] = ip_entry.prefixLength
-                        nic_summary["subnet_mask"] = prefix_to_subnet_mask(ip_entry.prefixLength)
+                        nic_summary.ip_address = ip_entry.ipAddress
+                        nic_summary.subnet_mask = getattr(ip_entry, 'netmask', None)
+                        ipv4_found = True
                         break
-                    else:
-                        missing_ipv4_reports.append(mac_address)
-                else:
-                    missing_ipv4_reports.append(mac_address)
+            if not ipv4_found:
+                missing_ipv4_reports.append(mac_address)
             if mac_address.lower() in source_sdk_mac_lookup:
                 iface_info, source_iface_idx = source_sdk_mac_lookup[mac_address.lower()]
-                nic_summary["sdk_interface_index"] = source_iface_idx
-                nic_summary["sdk_interface"] = iface_info
+                nic_summary.sdk_interface_index = source_iface_idx
+                nic_summary.sdk_interface = iface_info
             collected_nic_details.append(nic_summary)
 
         if missing_ipv4_reports:
@@ -1668,7 +1671,7 @@ migrated_vm_for_rollback = None
 migrated_vm_name_for_rollback = None
 migrated_vm: Any | None = None
 unregistered_from_source = False
-original_nic_info: List[Dict[str, Any]] = []
+original_nic_info: List[NicPlan] = []
 original_dns_servers: List[str] = []
 original_default_gateway: str | None = None
 original_default_gateway_source: str | None = None
@@ -1803,19 +1806,20 @@ try:
             subnet_mask = ip_v4_info.netmask
 
         if nic_ip_address and subnet_mask:
-            nic_record = {
-                'device_type': type(device),
-                'mac_address': mac,
-                'network_name': network_name,
-                'ip_address': nic_ip_address,
-                'subnet_mask': subnet_mask,
-                'is_gateway_nic': False,
-            }
+            nic_plan = NicPlan(
+                index=len(original_nic_info),
+                device_type=type(device),
+                mac_address=mac,
+                network_name=network_name,
+                ip_address=nic_ip_address,
+                subnet_mask=subnet_mask,
+                subnet_prefix=prefix_len,
+            )
             if sdk_interface_index is not None:
-                nic_record['sdk_interface_index'] = sdk_interface_index
+                nic_plan.sdk_interface_index = sdk_interface_index
             if sdk_nic_id:
-                nic_record['sdk_nic_id'] = sdk_nic_id
-            original_nic_info.append(nic_record)
+                nic_plan.sdk_nic_id = sdk_nic_id
+            original_nic_info.append(nic_plan)
         else:
             missing_ipv4_messages.append(
                 f"NIC {mac} ({network_name}) data could not be retrieved from API/VMware Tools."
@@ -2595,7 +2599,7 @@ try:
                         if expected_dns_servers
                         else None
                     )
-                    route_specs: List[RouteConfig] = []
+                    route_specs: List["RouteConfig"] = []
                     for route_idx, route_info in routes_for_nic:
                         route_network = route_info.get('network')
                         route_gateway = route_info.get('gateway')
@@ -3269,3 +3273,4 @@ finally:
     except Exception:
         pass
     print("Processing finished.")
+
