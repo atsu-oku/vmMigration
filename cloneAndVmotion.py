@@ -2658,11 +2658,16 @@ try:
                             _, nmcli_output, _ = guest_command_executor(nmcli_list_cmd)
                         parsed_connections = parse_nmcli_connection_output(nmcli_output, nmcli_fields)
                         existing_connections = []
+                        uuid_to_device: Dict[str, str] = {}
                         for entry in parsed_connections:
                             normalized_entry = {}
                             for nmcli_field in nmcli_fields:
                                 normalized_entry[nmcli_field.lower()] = entry.get(nmcli_field, "")
                             existing_connections.append(normalized_entry)
+                            uuid_value = (normalized_entry.get('uuid') or "").strip()
+                            if uuid_value:
+                                uuid_to_device[uuid_value] = (normalized_entry.get('device') or "").strip().lower()
+                        target_device_lower = device_name.lower()
                         alias_targets = {value for value in (device_name_normalized, con_name.lower()) if value}
                         alias_targets_compact = {value.replace(
                             '-', '').replace('_', '').replace(' ', '') for value in alias_targets}
@@ -2683,6 +2688,8 @@ try:
                                 continue
                             name_norm = (conn.get('name') or "").strip().lower()
                             device_norm = (conn.get('device') or "").strip().lower()
+                            if device_norm and device_norm != target_device_lower:
+                                continue
                             type_norm = (conn.get('type') or "").strip().lower()
                             name_compact = compact_interface_name(name_norm)
                             device_compact = compact_interface_name(device_norm)
@@ -2735,6 +2742,9 @@ try:
                         if stale_connection_uuids:
                             print(f"   -> Removing stale nmcli connections ({len(stale_connection_uuids)} entries).")
                             for uuid in sorted(stale_connection_uuids):
+                                mapped_device = uuid_to_device.get(uuid, "")
+                                if mapped_device and mapped_device != target_device_lower:
+                                    continue
                                 guest_command_executor(f"nmcli connection delete uuid {uuid}")
                         guest_command_executor(
                             f"ip addr flush dev {device_name}",

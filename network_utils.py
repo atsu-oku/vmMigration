@@ -480,7 +480,6 @@ def derive_gateway_from_octet_rule(
 def collect_interface_inventory(command_executor: Callable[..., Tuple[int, str, str]]):
     """Return a list of interface metadata dictionaries for the guest OS."""
     attempts = [
-        ("ip -j -p addr", parse_ip_json_output),
         ("ip -d addr", parse_ip_addr_text),
         ("ip addr", parse_ip_addr_text),
         ("ifconfig -a", parse_ifconfig_output),
