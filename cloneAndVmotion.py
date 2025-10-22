@@ -294,7 +294,7 @@ def wait_for_vm_availability(content, name, retries=30, delay_seconds=2):
     raise RuntimeError(f"Destination vCenter did not contain VM '{name}' (timed out).")
 
 
-def prepare_guest_interface(  # pylint: disable=redefined-outer-name
+def prepare_guest_interface(  # pylint: disable=redefined-outer-name,too-many-locals
     _nic_index: int,
     nic_details: Dict[str, Any],
     guest_executor,
