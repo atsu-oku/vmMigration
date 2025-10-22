@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "NicPlan",
+  "type": "object",
+  "properties": {
+    "index": {"type": "integer", "minimum": 0},
+    "network_name": {"type": "string"},
+    "mac_address": {"type": "string"},
+    "label": {"type": "string"},
+    "device_key": {"type": ["integer", "null"]},
+    "device_type": {"type": "string"},
+    "ip_address": {"type": ["string", "null"]},
+    "subnet_mask": {"type": ["string", "null"]},
+    "subnet_prefix": {"type": ["integer", "null"]},
+    "prd_ip_address": {"type": ["string", "null"]},
+    "prd_ip_segment": {"type": ["integer", "null"]},
+    "new_mac_address": {"type": ["string", "null"]},
+    "original_ifname": {"type": ["string", "null"]},
+    "desired_ifname": {"type": ["string", "null"]},
+    "sdk_interface_index": {"type": ["integer", "null"]},
+    "sdk_nic_id": {"type": ["string", "null"]},
+    "sdk_interface": {"type": ["object", "null"]},
+    "dns_servers": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "routes": {
+      "type": "array",
+      "items": {"type": "object"}
+    },
+    "is_gateway_nic": {"type": "boolean"},
+    "gateway": {"type": ["string", "null"]}
+  },
+  "required": ["index", "network_name", "mac_address"],
+  "additionalProperties": false
+}

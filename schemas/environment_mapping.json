@@ -1,0 +1,16 @@
+{
+  "stg_to_prd": {
+    "ip_third_octet": {
+      "173": "163",
+      "172": "162",
+      "178": "168"
+    },
+    "host_suffix": {
+      "s": "p"
+    }
+  },
+  "prd_defaults": {
+    "dns_servers": ["172.16.163.4", "172.16.163.5"],
+    "gateway_fallback": "172.16.162.1"
+  }
+}
