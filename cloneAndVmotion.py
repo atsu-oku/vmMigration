@@ -737,13 +737,16 @@ def _sync_firewalld_configuration_to_prd(guest_executor, timestamp: str) -> bool
         backup_path = f"{zone_file}-{timestamp}.bak"
         backup_created = False
 
-        def _ensure_zone_backup() -> bool:
+        def _ensure_zone_backup(
+            backup_path: str = backup_path,
+            zone_file_path: str = zone_file,
+        ) -> bool:
             nonlocal backup_created, overall_success
             if backup_created:
                 return True
             backup_cmd = (
                 f"[ -f {shlex.quote(backup_path)} ] || "
-                f"cp {shlex.quote(zone_file)} {shlex.quote(backup_path)}"
+                f"cp {shlex.quote(zone_file_path)} {shlex.quote(backup_path)}"
             )
             backup_exit, _, backup_err = guest_executor(backup_cmd, check_exit_code=False)
             if backup_exit != 0:
