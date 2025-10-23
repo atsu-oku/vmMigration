@@ -1,23 +1,47 @@
 ﻿# -*- coding: utf-8 -*-
 import unittest
-from unittest import mock
 
-from firewalld_parser import FirewalldZone, parse_firewalld_zone, resolve_service_ports
-
-ZONE_XML = """<zone name=\"public\">\n  <interface name=\"ens160\"/>\n  <source address=\"172.16.163.0/24\"/>\n  <rule family=\"ipv4\"><source address=\"10.0.0.1\"/>\n    <port protocol=\"tcp\" port=\"22\"/>\n    <accept/>\n  </rule>\n</zone>"""
+from firewalld_manager import apply_zone_ports, apply_zone_sources, apply_service_ports
 
 
-class FirewalldParserTests(unittest.TestCase):
-    def test_parse_zone(self) -> None:
-        zone = parse_firewalld_zone(ZONE_XML)
-        self.assertIsInstance(zone, FirewalldZone)
-        self.assertEqual(zone.allowed_networks(), ["10.0.0.1/32", "172.16.163.0/24"])
+class FirewalldManagerTests(unittest.TestCase):
+    def test_apply_zone_ports(self) -> None:
+        executed = []
 
-    def test_resolve_service_ports(self) -> None:
-        executor = mock.Mock(return_value=(0, "ports: 80/tcp 443/tcp\n", ""))
-        ports = resolve_service_ports("https", executor)
-        executor.assert_called_once()
-        self.assertEqual(ports, ["80/tcp", "443/tcp"])
+        def executor(cmd: str, check_exit_code: bool = True) -> tuple[int, str, str]:
+            executed.append(cmd)
+            if "--list-ports" in cmd:
+                return 0, "80/tcp\n", ""
+            return 0, "", ""
+
+        apply_zone_ports("public", ["80/tcp", "443/tcp"], executor)
+        self.assertIn("firewall-cmd --zone public --add-port 443/tcp --permanent", executed)
+
+    def test_apply_zone_sources(self) -> None:
+        executed = []
+
+        def executor(cmd: str, check_exit_code: bool = True) -> tuple[int, str, str]:
+            executed.append(cmd)
+            if "--list-sources" in cmd:
+                return 0, "172.16.163.0/24\n", ""
+            return 0, "", ""
+
+        apply_zone_sources("public", ["172.16.163.0/24", "10.0.0.0/8"], executor)
+        self.assertIn("firewall-cmd --zone public --add-source 10.0.0.0/8 --permanent", executed)
+
+    def test_apply_service_ports(self) -> None:
+        executed = []
+
+        def executor(cmd: str, check_exit_code: bool = True) -> tuple[int, str, str]:
+            executed.append(cmd)
+            if "--info-service" in cmd:
+                return 0, "ports: 443/tcp\n", ""
+            if "--list-ports" in cmd:
+                return 0, "80/tcp\n", ""
+            return 0, "", ""
+
+        apply_service_ports("public", ["https"], executor)
+        self.assertIn("firewall-cmd --zone public --add-port 443/tcp --permanent", executed)
 
 
 if __name__ == "__main__":

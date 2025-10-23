@@ -73,4 +73,3 @@ def diff_cluster_status(
         extra_resources=sorted(current_resources - desired_resources),
         stonith_enabled_mismatch=current.stonith_enabled != desired.stonith_enabled,
     )
-
