@@ -1,0 +1,49 @@
+﻿{
+  "": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PCSCluster",
+  "type": "object",
+  "properties": {
+    "cluster_name": {"type": "string"},
+    "stonith_enabled": {"type": "boolean"},
+    "stonith_resources": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {"type": "string"},
+          "type": {"type": "string"},
+          "state": {"type": "string"}
+        },
+        "required": ["id", "type", "state"],
+        "additionalProperties": false
+      }
+    },
+    "nodes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {"type": "string"},
+          "state": {"type": "string"}
+        },
+        "required": ["name", "state"],
+        "additionalProperties": false
+      }
+    },
+    "resources": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {"type": "string"},
+          "type": {"type": "string"},
+          "state": {"type": "string"}
+        },
+        "required": ["id", "type", "state"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["cluster_name", "nodes", "resources"],
+  "additionalProperties": false
+}

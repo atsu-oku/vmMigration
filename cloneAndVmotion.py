@@ -1,4 +1,4 @@
-Ôªø# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """Automates the staged-to-production VM migration workflow between vCenters."""
 from __future__ import annotations
 import os
@@ -18,7 +18,7 @@ import importlib.util
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, TypeVar, TYPE_CHECKING
 
-from nic_schema import NicPlan
+from nic_schema import NicPlan, NIC_PLAN_VALIDATOR
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -996,7 +996,7 @@ def _sync_ntp_configuration_to_prd(guest_executor, timestamp: str) -> bool:
             server_tokens_after = _extract_ntp_server_tokens(updated_config)
             stage_servers_after = _identify_stage_ntp_servers(server_tokens_after)
         conversion_failures = [
-            f"{original}‚Üí{expected}"
+            f"{original}Å®{expected}"
             for original, expected in expected_conversions.items()
             if expected not in server_tokens_after
         ]
@@ -1442,13 +1442,14 @@ class CloneAndVmotionWorkflow:
             mac_address = vm_device.macAddress
             backing = getattr(vm_device.backing, 'network', None)
             network_name = backing.name if backing and getattr(backing, 'name', None) else ''
-            nic_summary = NicPlan(
+            nic_plan = NicPlan(
+            NIC_PLAN_VALIDATOR.validate(nic_plan.to_dict())
                 index=len(collected_nic_details),
                 mac_address=mac_address,
                 label=getattr(vm_device.deviceInfo, 'label', '') or '',
                 network_name=network_name,
                 device_key=vm_device.key,
-                device_type=type(vm_device),
+                device_type=type(vm_device).__name__,
             )
             ipv4_found = False
             if mac_address in guest_net_lookup:
@@ -1457,17 +1458,17 @@ class CloneAndVmotionWorkflow:
                     for ip_entry in guest_iface.ipConfig.ipAddress:
                         if ':' in ip_entry.ipAddress:
                             continue
-                        nic_summary.ip_address = ip_entry.ipAddress
-                        nic_summary.subnet_mask = getattr(ip_entry, 'netmask', None)
+                        nic_plan.ip_address = ip_entry.ipAddress
+                        nic_plan.subnet_mask = getattr(ip_entry, 'netmask', None)
                         ipv4_found = True
                         break
             if not ipv4_found:
                 missing_ipv4_reports.append(mac_address)
             if mac_address.lower() in source_sdk_mac_lookup:
                 iface_info, source_iface_idx = source_sdk_mac_lookup[mac_address.lower()]
-                nic_summary.sdk_interface_index = source_iface_idx
-                nic_summary.sdk_interface = iface_info
-            collected_nic_details.append(nic_summary)
+                nic_plan.sdk_interface_index = source_iface_idx
+                nic_plan.sdk_interface = iface_info
+            collected_nic_details.append(nic_plan)
 
         if missing_ipv4_reports:
             LOGGER.debug("NICs without IPv4 info from guest tools: %s", missing_ipv4_reports)
@@ -1807,8 +1808,9 @@ try:
 
         if nic_ip_address and subnet_mask:
             nic_plan = NicPlan(
+            NIC_PLAN_VALIDATOR.validate(nic_plan.to_dict())
                 index=len(original_nic_info),
-                device_type=type(device),
+                device_type=type(device).__name__,
                 mac_address=mac,
                 network_name=network_name,
                 ip_address=nic_ip_address,
@@ -1880,47 +1882,18 @@ try:
     chosen_gateway: Optional[Tuple[str, Optional[int]]] = None
     if source_routes:
         original_static_routes.clear()
-        default_route_candidates: List[Dict[str, Any]] = []
-        for route in source_routes:
-            network = route.get('network')
-            prefix = route.get('prefix')
-            gateway = route.get('gateway')
-            interface_index = route.get('owner_index')
-            if interface_index is None:
-                raw_entry = route.get('raw')
-                if isinstance(raw_entry, dict):
-                    interface_index = raw_entry.get('interface_index')
-            if network is None or prefix is None:
-                continue
-            try:
-                prefix_int = int(prefix)
-            except (TypeError, ValueError):
-                continue
-            network_str = str(network)
-            gateway_key = str(gateway or "")
-            key = (network_str, prefix_int, gateway_key)
-            if key in route_keys:
-                continue
-            route_keys.add(key)
-            resolved_owner: Optional[int] = None
-            if interface_index is not None and 0 <= interface_index < len(original_nic_info):
-                resolved_owner = interface_index
-            elif gateway:
-                resolved_owner = find_gateway_owner_index(original_nic_info, gateway)
-            entry = {
-                'network': network_str,
-                'prefix': prefix_int,
-                'gateway': gateway,
-            }
-            if resolved_owner is not None:
-                entry['owner_index'] = resolved_owner
-            original_static_routes.append(entry)
-            if gateway and (network == '0.0.0.0' or prefix == 0):
-                default_route_candidates.append({'gateway': gateway, 'owner_index': resolved_owner})
-                if original_default_gateway is None:
-                    original_default_gateway = gateway
-                    default_gateway_owner_idx = resolved_owner
-                    original_default_gateway_source = "rest-default-route"
+        (
+            computed_routes,
+            default_route_candidates,
+            default_gateway_candidate,
+            default_owner_candidate,
+        ) = build_static_route_entries(source_routes, original_nic_info)
+        original_static_routes.extend(computed_routes)
+        if default_gateway_candidate and original_default_gateway is None:
+            original_default_gateway = default_gateway_candidate
+            default_gateway_owner_idx = default_owner_candidate
+            original_default_gateway_source = "rest-default-route"
+        selected_default = select_default_gateway_route(default_route_candidates, original_nic_info)
         selected_default = select_default_gateway_route(default_route_candidates, original_nic_info)
         if selected_default:
             original_default_gateway, default_gateway_owner_idx = selected_default
@@ -2630,13 +2603,13 @@ try:
                         expected_dns_overall = dedupe_preserving_order(expected_dns_servers)
                     for route_idx, _ in routes_for_nic:
                         configured_route_indices.add(route_idx)
-                    print("   -> REST API„ÅßÂÆ¢ÂÖà„ÅÆNIC„Çí„Åó„Å£„Å®„ÇäÊõ¥Êñ∞„Åß„Åç„Åü„Çà„ÄÇ")
+                    print("   -> REST APIÇ≈ãqêÊÇÃNICÇÇµÇ¡Ç∆ÇËçXêVÇ≈Ç´ÇΩÇÊÅB")
                 except Exception as sdk_update_error:  # pylint: disable=broad-exception-caught
                     LOGGER.warning(
                         "REST guest networking update failed; falling back to guest operations: %s",
                         sdk_update_error,
                     )
-                    print("   -> REST„Åæ„Çè„Çä„ÅåÊ©üÂ´å„ÇíÊêç„Å≠„Åü„Åø„Åü„ÅÑ„ÄÇ„ÅÑ„Å§„ÇÇ„ÅÆÂÆ¢Êìç‰Ωú„Åß‰ªïÁ´ã„Å¶Áõ¥„Åô„Å≠„ÄÇ")
+                    print("   -> RESTÇ‹ÇÌÇËÇ™ã@åôÇëπÇÀÇΩÇ›ÇΩÇ¢ÅBÇ¢Ç¬Ç‡ÇÃãqëÄçÏÇ≈édóßÇƒíºÇ∑ÇÀÅB")
                     use_sdk_networking = False
             selected_route_indices: List[int] = []
             selected_route_lines: List[str] = []
@@ -3273,4 +3246,9 @@ finally:
     except Exception:
         pass
     print("Processing finished.")
+
+
+
+
+
 
