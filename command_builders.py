@@ -16,6 +16,14 @@ def build_firewall_list_services(zone: str) -> List[str]:
 
 def build_firewall_list_ports(zone: str) -> List[str]:
     return ["firewall-cmd", "--zone", zone, "--list-ports"]
+
+
+def build_firewall_list_sources(zone: str) -> List[str]:
+    return ["firewall-cmd", "--zone", zone, "--list-sources"]
+
+
+def build_firewall_reload() -> List[str]:
+    return ["firewall-cmd", "--reload"]
 def build_firewall_add_port(zone: str, port_spec: str) -> List[str]:
     return ["firewall-cmd", "--zone", zone, "--add-port", port_spec, "--permanent"]
 

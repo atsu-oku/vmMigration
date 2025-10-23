@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RepoDefinition",
+  "type": "object",
+  "properties": {
+    "id": {"type": "string"},
+    "baseurl": {"type": "string"},
+    "enabled": {"type": "boolean"},
+    "gpgcheck": {"type": "boolean"},
+    "gpgkey": {"type": "string"}
+  },
+  "required": ["id", "baseurl"],
+  "additionalProperties": false
+}
