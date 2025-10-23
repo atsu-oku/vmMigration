@@ -16,9 +16,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 import importlib.util
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, TypeVar, TYPE_CHECKING
-
-from nic_schema import NicPlan, NIC_PLAN_VALIDATOR
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple, TypeVar, TYPE_CHECKING
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -164,6 +162,8 @@ except ModuleNotFoundError as import_error:
     extract_dns_servers_from_state = network_utils.extract_dns_servers_from_state
     extract_routes_from_sdk_payload = network_utils.extract_routes_from_sdk_payload
     transform_text_to_prd = network_utils.transform_text_to_prd
+from nic_schema import NicPlan, NIC_PLAN_VALIDATOR
+from route_selector import build_static_route_entries
 
 
 # ------------------------------------------------
@@ -301,6 +301,152 @@ def wait_for_vm_availability(content, name, retries=30, delay_seconds=2):
     raise RuntimeError(f"Destination vCenter did not contain VM '{name}' (timed out).")
 
 
+def _collect_interface_lookup(
+    interface_inventory: Iterable[Dict[str, Any]],
+) -> Tuple[Set[str], Set[str], Dict[str, Any]]:
+    """Return interface name candidates, compact names, and MAC lookup from guest inventory."""
+    iface_name_candidates: Set[str] = set()
+    iface_name_compact_candidates: Set[str] = set()
+    iface_mac_lookup: Dict[str, Any] = {}
+    for entry in interface_inventory:
+        ifname = entry.get("ifname")
+        if not ifname:
+            continue
+        lowered_ifname = ifname.lower()
+        iface_name_candidates.add(lowered_ifname)
+        iface_name_compact_candidates.add(compact_interface_name(ifname))
+        mac_candidate = (entry.get("mac") or "").lower()
+        if mac_candidate:
+            iface_mac_lookup[mac_candidate] = entry
+    return iface_name_candidates, iface_name_compact_candidates, iface_mac_lookup
+
+
+def _resolve_guest_device_name(
+    iface_mac_lookup: Mapping[str, Any],
+    target_new_mac: Optional[str],
+    original_mac: Optional[str],
+) -> str:
+    """Return the best candidate interface name based on new or original MAC addresses."""
+    new_mac_lower = (target_new_mac or "").lower()
+    if new_mac_lower:
+        matching_entry = iface_mac_lookup.get(new_mac_lower)
+        if matching_entry:
+            candidate_ifname = matching_entry.get("ifname", "")
+            if candidate_ifname:
+                return str(candidate_ifname)
+    original_mac_lower = (original_mac or "").lower()
+    if original_mac_lower:
+        matching_entry = iface_mac_lookup.get(original_mac_lower)
+        if matching_entry:
+            candidate_ifname = matching_entry.get("ifname", "")
+            if candidate_ifname:
+                return str(candidate_ifname)
+    return ""
+
+
+def _maybe_rename_guest_interface(
+    guest_executor,
+    device_name: str,
+    desired_ifname: Optional[str],
+    target_new_mac: Optional[str],
+    nic_details: Mapping[str, Any],
+    iface_name_candidates: Set[str],
+    iface_name_compact_candidates: Set[str],
+) -> str:
+    """Attempt to rename the guest interface to the desired name when feasible."""
+    desired_ifname_clean = (desired_ifname or "").strip()
+    if not desired_ifname_clean or desired_ifname_clean.lower() == device_name.lower():
+        return device_name
+    desired_lower = desired_ifname_clean.lower()
+    if desired_lower in iface_name_candidates:
+        print(
+            f"   [WARN] Intended interface name '{desired_ifname_clean}' already in use; keeping '{device_name}'."
+        )
+        return device_name
+    previous_device_name = device_name
+    print(f"   -> Renaming guest interface '{device_name}' to '{desired_ifname_clean}' to match source.")
+    rename_failed = False
+    down_exit, _, down_stderr = guest_executor(
+        f"ip link set {device_name} down",
+        check_exit_code=False,
+    )
+    if down_exit != 0:
+        rename_failed = True
+        print(
+            f"   [WARN] Failed to bring interface '{device_name}' down before rename "
+            f"(exit={down_exit}, stderr='{down_stderr or '(none)'}')."
+        )
+    else:
+        rename_exit, _, rename_stderr = guest_executor(
+            f"ip link set {device_name} name {desired_ifname_clean}",
+            check_exit_code=False,
+        )
+        if rename_exit != 0:
+            rename_failed = True
+            print(
+                f"   [WARN] Unable to rename '{device_name}' to '{desired_ifname_clean}' "
+                f"(exit={rename_exit}, stderr='{rename_stderr or '(none)'}')."
+            )
+            guest_executor(
+                f"ip link set {device_name} up",
+                check_exit_code=False,
+            )
+    if rename_failed:
+        print("   -> Proceeding with the runtime interface name reported by the guest.")
+        return previous_device_name
+    guest_executor(
+        f"ip link set {desired_ifname_clean} up",
+        check_exit_code=False,
+    )
+    mac_upper = (target_new_mac or nic_details.get('mac_address') or "").upper()
+    udev_rule_update = (
+        "if [ -f /etc/udev/rules.d/70-persistent-net.rules ]; then "
+        f"sed -i '/ATTR{{address}}==\"{mac_upper}\"/Is/"
+        f"NAME=\"[^\"]*\"/NAME=\"{desired_ifname_clean}\"/' "
+        "/etc/udev/rules.d/70-persistent-net.rules; "
+        "fi"
+    )
+    guest_executor(
+        udev_rule_update,
+        check_exit_code=False,
+    )
+    nm_update_script = (
+        f"for cfg in /etc/sysconfig/network-scripts/ifcfg-{previous_device_name} "
+        f"/etc/sysconfig/network-scripts/ifcfg-{desired_ifname_clean}; do "
+        "if [ -f \"$cfg\" ]; then "
+        f"sed -i 's/^DEVICE=.*/DEVICE=\"{desired_ifname_clean}\"/' \"$cfg\"; "
+        "fi; "
+        "done"
+    )
+    guest_executor(
+        nm_update_script,
+        check_exit_code=False,
+    )
+    guest_executor(
+        (
+            "if [ -d /etc/sysconfig/network-scripts ]; then "
+            f"if [ -f /etc/sysconfig/network-scripts/ifcfg-{previous_device_name} ]; then "
+            f"if [ ! -f /etc/sysconfig/network-scripts/ifcfg-{desired_ifname_clean} ]; then "
+            f"mv /etc/sysconfig/network-scripts/ifcfg-{previous_device_name} "
+            f"/etc/sysconfig/network-scripts/ifcfg-{desired_ifname_clean}; "
+            "else "
+            f"cp /etc/sysconfig/network-scripts/ifcfg-{previous_device_name} "
+            f"/etc/sysconfig/network-scripts/ifcfg-{desired_ifname_clean}; "
+            f"rm -f /etc/sysconfig/network-scripts/ifcfg-{previous_device_name}; "
+            "fi; "
+            "fi; "
+            "fi"
+        ),
+        check_exit_code=False,
+    )
+    iface_name_candidates.discard(previous_device_name.lower())
+    iface_name_compact_candidates.discard(compact_interface_name(previous_device_name))
+    iface_name_candidates.add(desired_lower)
+    iface_name_compact_candidates.add(compact_interface_name(desired_ifname_clean))
+    print(f"   -> Interface rename completed; proceeding with '{desired_ifname_clean}'.")
+    return desired_ifname_clean
+
+
 def prepare_guest_interface(  # pylint: disable=redefined-outer-name,too-many-locals
     _nic_index: int,
     nic_details: Dict[str, Any],
@@ -313,30 +459,19 @@ def prepare_guest_interface(  # pylint: disable=redefined-outer-name,too-many-lo
     Returns a GuestInterfaceContext holding the resolved device name and interface inventories.
     """
     interface_inventory = collect_interface_inventory(guest_executor)
-    iface_name_candidates: Set[str] = set()
-    iface_name_compact_candidates: Set[str] = set()
-    iface_mac_lookup: Dict[str, Any] = {}
+    (
+        iface_name_candidates,
+        iface_name_compact_candidates,
+        iface_mac_lookup,
+    ) = _collect_interface_lookup(interface_inventory)
+    original_mac = nic_details.get('mac_address')
+    device_name = _resolve_guest_device_name(
+        iface_mac_lookup,
+        target_new_mac,
+        original_mac,
+    )
     new_mac_lower = (target_new_mac or "").lower()
-    original_mac_lower = (nic_details.get('mac_address') or "").lower()
-    device_name = ""
-
-    for entry in interface_inventory:
-        ifname = entry.get("ifname")
-        if not ifname:
-            continue
-        lowered_ifname = ifname.lower()
-        iface_name_candidates.add(lowered_ifname)
-        iface_name_compact_candidates.add(compact_interface_name(ifname))
-        mac_candidate = (entry.get("mac") or "").lower()
-        if mac_candidate:
-            iface_mac_lookup[mac_candidate] = entry
-            if new_mac_lower and mac_candidate == new_mac_lower:
-                device_name = ifname
-
-    if not device_name and original_mac_lower:
-        match_entry = iface_mac_lookup.get(original_mac_lower)
-        if match_entry:
-            device_name = match_entry.get("ifname", "")
+    original_mac_lower = (original_mac or "").lower()
 
     if not device_name:
         target_mac = target_new_mac or nic_details.get('mac_address') or '?'
@@ -349,96 +484,16 @@ def prepare_guest_interface(  # pylint: disable=redefined-outer-name,too-many-lo
         nic_details.get('mac_address'),
     )
 
-    desired_ifname = (nic_details.get('original_ifname') or "").strip()
-    if desired_ifname and desired_ifname.lower() != device_name.lower():
-        desired_lower = desired_ifname.lower()
-        if desired_lower in iface_name_candidates:
-            print(
-                f"   [WARN] Intended interface name '{desired_ifname}' already in use; keeping '{device_name}'."
-            )
-        else:
-            previous_device_name = device_name
-            print(f"   -> Renaming guest interface '{device_name}' to '{desired_ifname}' to match source.")
-            rename_failed = False
-            down_exit, _, down_stderr = guest_executor(
-                f"ip link set {device_name} down",
-                check_exit_code=False,
-            )
-            if down_exit != 0:
-                rename_failed = True
-                print(
-                    f"   [WARN] Failed to bring interface '{device_name}' down before rename "
-                    f"(exit={down_exit}, stderr='{down_stderr or '(none)'}')."
-                )
-            else:
-                rename_exit, _, rename_stderr = guest_executor(
-                    f"ip link set {device_name} name {desired_ifname}",
-                    check_exit_code=False,
-                )
-                if rename_exit != 0:
-                    rename_failed = True
-                    print(
-                        f"   [WARN] Unable to rename '{device_name}' to '{desired_ifname}' "
-                        f"(exit={rename_exit}, stderr='{rename_stderr or '(none)'}')."
-                    )
-                    guest_executor(
-                        f"ip link set {device_name} up",
-                        check_exit_code=False,
-                    )
-            if rename_failed:
-                print("   -> Proceeding with the runtime interface name reported by the guest.")
-            else:
-                guest_executor(
-                    f"ip link set {desired_ifname} up",
-                    check_exit_code=False,
-                )
-                mac_upper = (target_new_mac or nic_details.get('mac_address') or "").upper()
-                udev_rule_update = (
-                    "if [ -f /etc/udev/rules.d/70-persistent-net.rules ]; then "
-                    f"sed -i '/ATTR{{address}}==\"{mac_upper}\"/Is/"
-                    f"NAME=\"[^\"]*\"/NAME=\"{desired_ifname}\"/' "
-                    "/etc/udev/rules.d/70-persistent-net.rules; "
-                    "fi"
-                )
-                guest_executor(
-                    udev_rule_update,
-                    check_exit_code=False,
-                )
-                nm_update_script = (
-                    f"for cfg in /etc/sysconfig/network-scripts/ifcfg-{previous_device_name} "
-                    f"/etc/sysconfig/network-scripts/ifcfg-{desired_ifname}; do "
-                    "if [ -f \"$cfg\" ]; then "
-                    f"sed -i 's/^DEVICE=.*/DEVICE=\"{desired_ifname}\"/' \"$cfg\"; "
-                    "fi; "
-                    "done"
-                )
-                guest_executor(
-                    nm_update_script,
-                    check_exit_code=False,
-                )
-                guest_executor(
-                    (
-                        "if [ -d /etc/sysconfig/network-scripts ]; then "
-                        f"if [ -f /etc/sysconfig/network-scripts/ifcfg-{previous_device_name} ]; then "
-                        f"if [ ! -f /etc/sysconfig/network-scripts/ifcfg-{desired_ifname} ]; then "
-                        f"mv /etc/sysconfig/network-scripts/ifcfg-{previous_device_name} "
-                        f"/etc/sysconfig/network-scripts/ifcfg-{desired_ifname}; "
-                        "else "
-                        f"cp /etc/sysconfig/network-scripts/ifcfg-{previous_device_name} "
-                        f"/etc/sysconfig/network-scripts/ifcfg-{desired_ifname}; "
-                        f"rm -f /etc/sysconfig/network-scripts/ifcfg-{previous_device_name}; "
-                        "fi; "
-                        "fi; "
-                        "fi"
-                    ),
-                    check_exit_code=False,
-                )
-                iface_name_candidates.discard(previous_device_name.lower())
-                iface_name_compact_candidates.discard(compact_interface_name(previous_device_name))
-                iface_name_candidates.add(desired_lower)
-                iface_name_compact_candidates.add(compact_interface_name(desired_ifname))
-                device_name = desired_ifname
-                print(f"   -> Interface rename completed; proceeding with '{device_name}'.")
+    desired_ifname = nic_details.get('original_ifname')
+    device_name = _maybe_rename_guest_interface(
+        guest_executor,
+        device_name,
+        desired_ifname,
+        target_new_mac,
+        nic_details,
+        iface_name_candidates,
+        iface_name_compact_candidates,
+    )
 
     return GuestInterfaceContext(
         device_name=device_name,
@@ -715,7 +770,7 @@ def _sync_firewalld_configuration_to_prd(guest_executor, timestamp: str) -> bool
         print("   -> firewalld inactive; skipping firewalld configuration sync.")
         return True
     zone_names: Set[str] = set()
-    exit_code, zones_output, zones_err = guest_executor("firewall-cmd --get-zones", check_exit_code=False)
+    exit_code, zones_output, _ = guest_executor("firewall-cmd --get-zones", check_exit_code=False)
     if exit_code == 0 and zones_output:
         for token in zones_output.split():
             token_clean = token.strip()
@@ -996,7 +1051,7 @@ def _sync_ntp_configuration_to_prd(guest_executor, timestamp: str) -> bool:
             server_tokens_after = _extract_ntp_server_tokens(updated_config)
             stage_servers_after = _identify_stage_ntp_servers(server_tokens_after)
         conversion_failures = [
-            f"{original}→{expected}"
+            f"{original} expected {expected}"
             for original, expected in expected_conversions.items()
             if expected not in server_tokens_after
         ]
@@ -1443,7 +1498,6 @@ class CloneAndVmotionWorkflow:
             backing = getattr(vm_device.backing, 'network', None)
             network_name = backing.name if backing and getattr(backing, 'name', None) else ''
             nic_plan = NicPlan(
-            NIC_PLAN_VALIDATOR.validate(nic_plan.to_dict())
                 index=len(collected_nic_details),
                 mac_address=mac_address,
                 label=getattr(vm_device.deviceInfo, 'label', '') or '',
@@ -1451,6 +1505,8 @@ class CloneAndVmotionWorkflow:
                 device_key=vm_device.key,
                 device_type=type(vm_device).__name__,
             )
+            NIC_PLAN_VALIDATOR.validate(nic_plan.to_dict())
+
             ipv4_found = False
             if mac_address in guest_net_lookup:
                 guest_iface = guest_net_lookup[mac_address]
@@ -1808,7 +1864,6 @@ try:
 
         if nic_ip_address and subnet_mask:
             nic_plan = NicPlan(
-            NIC_PLAN_VALIDATOR.validate(nic_plan.to_dict())
                 index=len(original_nic_info),
                 device_type=type(device).__name__,
                 mac_address=mac,
@@ -1817,6 +1872,8 @@ try:
                 subnet_mask=subnet_mask,
                 subnet_prefix=prefix_len,
             )
+            NIC_PLAN_VALIDATOR.validate(nic_plan.to_dict())
+
             if sdk_interface_index is not None:
                 nic_plan.sdk_interface_index = sdk_interface_index
             if sdk_nic_id:
@@ -2572,7 +2629,7 @@ try:
                         if expected_dns_servers
                         else None
                     )
-                    route_specs: List["RouteConfig"] = []
+                    route_specs: List[Any] = []
                     for route_idx, route_info in routes_for_nic:
                         route_network = route_info.get('network')
                         route_gateway = route_info.get('gateway')
@@ -2603,13 +2660,13 @@ try:
                         expected_dns_overall = dedupe_preserving_order(expected_dns_servers)
                     for route_idx, _ in routes_for_nic:
                         configured_route_indices.add(route_idx)
-                    print("   -> REST APIで客先のNICをしっとり更新できたよ。")
+                    print("   -> Updated NIC successfully via REST guest networking API.")
                 except Exception as sdk_update_error:  # pylint: disable=broad-exception-caught
                     LOGGER.warning(
                         "REST guest networking update failed; falling back to guest operations: %s",
                         sdk_update_error,
                     )
-                    print("   -> RESTまわりが機嫌を損ねたみたい。いつもの客操作で仕立て直すね。")
+                    print("   -> REST update failed; falling back to guest operations for configuration.")
                     use_sdk_networking = False
             selected_route_indices: List[int] = []
             selected_route_lines: List[str] = []
