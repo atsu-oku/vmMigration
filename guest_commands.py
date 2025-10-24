@@ -7,7 +7,7 @@ import shlex
 import ssl
 import time
 import urllib.request
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 try:
     import requests
@@ -116,25 +116,29 @@ class GuestCommandExecutor:
         command_success = (exit_code == 0) and not stderr_indicates_error
         if command_success:
             print("[GUEST-CMD] Result: success")
-        else:
-            print("[GUEST-CMD] Result: failure")
-            combined_cli_output = ((stderr or "") + "\n" + (stdout or "")).lower()
-            reason = (stderr or "").strip() or "Unknown error"
-            if "nmcli" in command and ("command not found" in combined_cli_output or exit_code == 127):
-                raise NmcliNotAvailableError(command)
-            if not check_exit_code:
-                return exit_code, stdout, stderr
+            return exit_code, stdout, stderr
+        if not check_exit_code:
+            status_tokens: List[str] = ["success"]
             if exit_code != 0:
-                reason = (stderr or "").strip() or "Exit code was not 0"
-            elif stderr_indicates_error:
-                reason = (stderr or "").strip() or "Error text found in standard error output"
-            if fallback_error is not None and auth_used == "admin":
-                raise RuntimeError(
-                    f"Failed to run command as admin user (exit code {exit_code}, reason: {reason})"
-                ) from fallback_error
-            raise RuntimeError(f"Failed to execute command (exit code {exit_code}, reason: {reason})")
-
-        return exit_code, stdout, stderr
+                status_tokens.append(f"exit={exit_code}")
+            if stderr_indicates_error:
+                status_tokens.append("stderr-noted")
+            print(f"[GUEST-CMD] Result: {'; '.join(status_tokens)}")
+            return exit_code, stdout, stderr
+        print("[GUEST-CMD] Result: failure")
+        combined_cli_output = ((stderr or "") + "\n" + (stdout or "")).lower()
+        reason = (stderr or "").strip() or "Unknown error"
+        if "nmcli" in command and ("command not found" in combined_cli_output or exit_code == 127):
+            raise NmcliNotAvailableError(command)
+        if exit_code != 0:
+            reason = (stderr or "").strip() or "Exit code was not 0"
+        elif stderr_indicates_error:
+            reason = (stderr or "").strip() or "Error text found in standard error output"
+        if fallback_error is not None and auth_used == "admin":
+            raise RuntimeError(
+                f"Failed to run command as admin user (exit code {exit_code}, reason: {reason})"
+            ) from fallback_error
+        raise RuntimeError(f"Failed to execute command (exit code {exit_code}, reason: {reason})")
 
     def _can_use_admin(self) -> bool:
         return bool(self.admin_auth and self.admin_pwd)

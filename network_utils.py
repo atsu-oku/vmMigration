@@ -752,6 +752,7 @@ def ensure_firewall_allows_ssh(
             return
         if not missing_zones:
             return
+        return
     exit_code, _, _ = command_executor("command -v iptables", check_exit_code=False)
     if exit_code == 0:
         health_code, iptables_state, health_err = command_executor("iptables -S", check_exit_code=False)
