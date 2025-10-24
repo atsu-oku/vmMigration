@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 import importlib.util
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple, TypeVar, TYPE_CHECKING
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple, Type, TypeVar, TYPE_CHECKING
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -83,6 +83,25 @@ except ModuleNotFoundError as import_error:
 
 from pyVim.connect import SmartConnect, Disconnect
 from pyVmomi import vim, vmodl  # type: ignore[import]
+
+
+def _resolve_virtual_nic_class(device_type_value: Any) -> Type[vim.vm.device.VirtualEthernetCard]:
+    """Return a callable NIC device class, defaulting to VirtualVmxnet3 when unresolved."""
+    candidate: Any = None
+    if isinstance(device_type_value, str):
+        candidate = getattr(vim.vm.device, device_type_value, None)
+    elif isinstance(device_type_value, type):
+        candidate = device_type_value
+    elif device_type_value is not None:
+        candidate = device_type_value
+    if candidate and callable(candidate):
+        return candidate
+    LOGGER.debug(
+        "Falling back to VirtualVmxnet3 for NIC device type %r (resolved=%r)",
+        device_type_value,
+        candidate,
+    )
+    return vim.vm.device.VirtualVmxnet3
 try:
     import requests  # pylint: disable=unused-import
     import urllib3
@@ -737,6 +756,10 @@ def _rewrite_centos_repo_content(repo_content: str) -> Tuple[str, bool]:
         updated_lines.append(line)
 
     updated_content = "\n".join(updated_lines)
+    transformed_content, ip_changed = transform_text_to_prd(updated_content)
+    if ip_changed:
+        updated_content = transformed_content
+        changed = True
     if repo_content.endswith("\n"):
         updated_content += "\n"
     elif updated_content and not updated_content.endswith("\n"):
@@ -1123,18 +1146,20 @@ def _sync_ntp_configuration_to_prd(guest_executor, timestamp: str) -> bool:
     success = True
     found_config = False
     for config_path in NTP_CONFIG_PATHS:
+        exists_exit, _, _ = guest_executor(
+            f"test -f {shlex.quote(config_path)}",
+            check_exit_code=False,
+        )
+        if exists_exit != 0:
+            continue
         exit_code, config_content, config_err = guest_executor(
             f"cat {shlex.quote(config_path)}",
             check_exit_code=False,
         )
         if exit_code != 0:
-            detail = (config_err or "").lower()
-            if "no such file" in detail or "not found" in detail or "cannot access" in detail:
-                continue
-            # Permission or other error
             print(f"   [WARN] Unable to read {config_path}: {(config_err or '').strip() or exit_code}")
             success = False
-            continue
+            break
         found_config = True
         server_tokens_before = _extract_ntp_server_tokens(config_content)
         stage_servers_before = _identify_stage_ntp_servers(server_tokens_before)
@@ -1192,7 +1217,7 @@ def _sync_ntp_configuration_to_prd(guest_executor, timestamp: str) -> bool:
         if not changed:
             if not stage_servers_after and not conversion_failures and not conversion_anomalies:
                 print(f"   -> {config_path} already aligned with PRD entries.")
-            continue
+            break
         backup_path = f"{config_path}-{timestamp}.bak"
         backup_cmd = (
             f"[ -f {shlex.quote(backup_path)} ] || "
@@ -1202,13 +1227,14 @@ def _sync_ntp_configuration_to_prd(guest_executor, timestamp: str) -> bool:
         if backup_exit != 0:
             print(f"   [WARN] Unable to back up {config_path}: {(backup_err or '').strip() or backup_exit}")
             success = False
-            continue
+            break
         write_exit, _, write_err = _write_guest_file(guest_executor, config_path, updated_config)
         if write_exit != 0:
             print(f"   [WARN] Failed to update {config_path}: {(write_err or '').strip() or write_exit}")
             success = False
-            continue
+            break
         print(f"   -> Updated {config_path} NTP servers for PRD environment (backup: {backup_path}).")
+        break
     if not found_config:
         print("   -> No chrony/ntp configuration found; skipping NTP sync.")
     return success
@@ -1396,15 +1422,39 @@ def _ensure_http_proxy_configuration(guest_executor, timestamp: str) -> bool:
         f"export HTTP_PROXY={proxy_url}",
         f"export HTTPS_PROXY={proxy_url}",
     ]
-    profile_has_proxies = all(line in profile_content for line in proxy_lines)
+    profile_has_prd_proxies = all(line in profile_content for line in proxy_lines)
     env_exit, env_stdout, _ = guest_executor("env | grep -i http", check_exit_code=False)
     has_proxy_env = env_exit == 0 and bool(env_stdout and env_stdout.strip())
-    if profile_has_proxies:
+    transformed_profile, proxies_rewritten = transform_text_to_prd(profile_content)
+    if profile_has_prd_proxies:
         if not has_proxy_env:
             guest_executor(f". {profile_path}", check_exit_code=False)
         return True
+    if proxies_rewritten:
+        if has_proxy_env:
+            print("   -> Updating /etc/profile proxy declarations to PRD addresses.")
+        backup_cmd = (
+            f"[ -f {shlex.quote(backup_path)} ] || "
+            f"cp {shlex.quote(profile_path)} {shlex.quote(backup_path)}"
+        )
+        backup_exit, _, backup_err = guest_executor(backup_cmd, check_exit_code=False)
+        if backup_exit != 0:
+            print(f"   [WARN] Unable to back up {profile_path}: {(backup_err or '').strip() or backup_exit}")
+            return False
+        if not transformed_profile.endswith("\n"):
+            transformed_profile += "\n"
+        write_exit, _, write_err = _write_guest_file(guest_executor, profile_path, transformed_profile)
+        if write_exit != 0:
+            print(f"   [WARN] Failed to update {profile_path}: {(write_err or '').strip() or write_exit}")
+            return False
+        print(f"   -> Updated proxy configuration in {profile_path} (backup: {backup_path}).")
+        reload_exit, _, reload_err = guest_executor(f". {profile_path}", check_exit_code=False)
+        if reload_exit != 0:
+            print(f"   [WARN] Reloading {profile_path} returned exit code {reload_exit}: {(reload_err or '').strip()}")
+        return True
+        return True
     if has_proxy_env:
-        print("   -> Proxy environment variables detected but /etc/profile lacks persistent exports; updating profile.")
+        print("   -> Proxy environment variables detected but /etc/profile lacks persistent exports; adding block.")
     backup_cmd = (
         f"[ -f {shlex.quote(backup_path)} ] || "
         f"cp {shlex.quote(profile_path)} {shlex.quote(backup_path)}"
@@ -2238,12 +2288,7 @@ class CloneAndVmotionWorkflow:
             nic_spec = vim.vm.device.VirtualDeviceSpec()
             nic_spec.operation = vim.vm.device.VirtualDeviceSpec.Operation.add
             device_cls = nic_plan.get('device_type')
-            if isinstance(device_cls, str):
-                device_class_obj = getattr(vim.vm.device, device_cls, vim.vm.device.VirtualVmxnet3)
-            elif device_cls:
-                device_class_obj = device_cls
-            else:
-                device_class_obj = vim.vm.device.VirtualVmxnet3
+            device_class_obj = _resolve_virtual_nic_class(device_cls)
             device_instance = device_class_obj()
             device_instance.key = -(100 + index)
 
@@ -2661,7 +2706,8 @@ def main() -> None:
 
                 nic_spec = vim.vm.device.VirtualDeviceSpec()
                 nic_spec.operation = vim.vm.device.VirtualDeviceSpec.Operation.add
-                nic_spec.device = nic['device_type']()
+                nic_device_class = _resolve_virtual_nic_class(nic.get('device_type'))
+                nic_spec.device = nic_device_class()
                 nic_spec.device.key = -(100 + i)
 
                 if isinstance(dest_network, vim.dvs.DistributedVirtualPortgroup):
@@ -2823,7 +2869,7 @@ def main() -> None:
             for old_dns, new_dns in zip(original_dns_servers, new_dns_servers):
                 print(f"    - {old_dns} -> {new_dns}")
         else:
-            print("  - Skipping IP configuration because no NIC information is available.")
+            print("  - No DNS server changes required.")
         print("=" * 64)
 
         user_approval_ip = input("\nApply this IP configuration and power on the VM? (y/n): ")
