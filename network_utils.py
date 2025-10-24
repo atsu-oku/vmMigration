@@ -13,6 +13,7 @@ from vsphere_sdk_network import VsphereGuestNetworkSDK
 
 LOGGER = logging.getLogger(__name__)
 
+LINK_LOCAL_PREFIX = ipaddress.ip_network("169.254.0.0/16")
 PRD_STATIC_ROUTE_SEGMENTS = {160, 161, 162, 163, 164, 168}
 MNG_SEGMENT_THIRD_OCTETS = {161, 163}
 NMCLI_FIELDS_WITH_TYPE = ["UUID", "NAME", "DEVICE", "TYPE"]
@@ -56,6 +57,26 @@ def extract_mac_from_sdk_interface(entry: Mapping[str, Any]) -> Optional[str]:
             if isinstance(value, str) and value:
                 return value
     return None
+
+
+def is_link_local_network(network_value: str, prefix: int) -> bool:
+    """Return True when the network/prefix sits inside the IPv4 link-local range."""
+    try:
+        spec = network_value if "/" in network_value else f"{network_value}/{prefix}"
+        candidate = ipaddress.ip_network(spec, strict=False)
+        return isinstance(candidate, ipaddress.IPv4Network) and candidate.subnet_of(LINK_LOCAL_PREFIX)
+    except ValueError:
+        return False
+
+
+def is_link_local_address(address: Optional[str]) -> bool:
+    """Return True when the IPv4 address is within 169.254.0.0/16."""
+    if not address:
+        return False
+    try:
+        return ipaddress.ip_address(address) in LINK_LOCAL_PREFIX
+    except ValueError:
+        return False
 
 
 def extract_ipv4_from_sdk_interface(entry: Mapping[str, Any]) -> Tuple[Optional[str], Optional[int]]:
@@ -1053,14 +1074,20 @@ def determine_prd_static_routes(
         gateway = route.get("gateway")
         if not network or prefix is None:
             continue
+        try:
+            prefix_int = int(prefix)
+        except (TypeError, ValueError):
+            continue
+        if is_link_local_network(str(network), prefix_int) or is_link_local_address(gateway):
+            continue
         if str(network) == "0.0.0.0":
             try:
-                if int(prefix) == 0:
+                if prefix_int == 0:
                     continue
             except (TypeError, ValueError):
                 pass
         try:
-            stg_network = ipaddress.IPv4Network(f"{network}/{prefix}", strict=False)
+            stg_network = ipaddress.IPv4Network(f"{network}/{prefix_int}", strict=False)
         except ValueError:
             continue
         prd_network_address = calculate_ip_stg_to_prd(str(stg_network.network_address))
