@@ -26,6 +26,8 @@ if str(PROJECT_ROOT) not in sys.path:
 
 T = TypeVar("T")
 
+LINK_LOCAL_PREFIX = ipaddress.ip_network("169.254.0.0/16")
+
 
 def _get_env_override(var_name: str, default: str) -> str:
     """Return an environment override when present, otherwise fall back to the default."""
@@ -45,6 +47,26 @@ def dedupe_preserving_order(values: Iterable[T]) -> List[T]:
             seen.add(value)
             result.append(value)
     return result
+
+
+def _is_link_local_network(network_value: str, prefix: int) -> bool:
+    """Return True when the given network/prefix falls within the IPv4 link-local range."""
+    try:
+        network_spec = network_value if "/" in network_value else f"{network_value}/{prefix}"
+        candidate = ipaddress.ip_network(network_spec, strict=False)
+        return isinstance(candidate, ipaddress.IPv4Network) and candidate.subnet_of(LINK_LOCAL_PREFIX)
+    except ValueError:
+        return False
+
+
+def _is_link_local_address(address: Optional[str]) -> bool:
+    """Return True when the given IPv4 address lives inside the link-local range."""
+    if not address:
+        return False
+    try:
+        return ipaddress.ip_address(address) in LINK_LOCAL_PREFIX
+    except ValueError:
+        return False
 
 
 def _load_local_module(module_name: str, filename: str):
@@ -1796,6 +1818,8 @@ def collect_source_vm_metadata(
                 key = (network_str, prefix_int, gateway_key)
                 if key in route_keys:
                     continue
+                if _is_link_local_network(network_str, prefix_int) or _is_link_local_address(gateway_ip):
+                    continue
                 owner_index = getattr(route, "interface", None)
                 if owner_index is None and gateway_ip:
                     owner_index = find_gateway_owner_index(nic_plans, gateway_ip)
@@ -2473,6 +2497,7 @@ def main() -> None:
     migrated_vm_name_for_rollback = None
     migrated_vm: Any | None = None
     unregistered_from_source = False
+    dest_vm_retained = False
     original_nic_info: List[NicPlan] = []
     original_dns_servers: List[str] = []
     original_default_gateway: str | None = None
@@ -3379,7 +3404,34 @@ def main() -> None:
                         f"nmcli connection modify '{con_name}' connection.autoconnect yes",
                         check_exit_code=False,
                     )
-                    guest_command_executor(f"nmcli connection up '{con_name}'")
+                    guest_command_executor(
+                        f"nmcli device connect '{device_name}'",
+                        check_exit_code=False,
+                    )
+                    up_exit, up_stdout, up_stderr = guest_command_executor(
+                        f"nmcli connection up '{con_name}'",
+                        check_exit_code=False,
+                    )
+                    if up_exit != 0:
+                        combined_output = "\n".join(filter(None, (up_stdout, up_stderr))).lower()
+                        if "base network connection was interrupted" in combined_output:
+                            print("   -> nmcli reported an interrupted base connection; retrying activation.")
+                            guest_command_executor(
+                                f"nmcli device disconnect '{device_name}' || true",
+                                check_exit_code=False,
+                            )
+                            guest_command_executor(
+                                f"nmcli device connect '{device_name}'",
+                                check_exit_code=False,
+                            )
+                            up_exit, up_stdout, up_stderr = guest_command_executor(
+                                f"nmcli connection up '{con_name}'",
+                                check_exit_code=False,
+                            )
+                        if up_exit != 0:
+                            print(
+                                "   [WARN] nmcli connection up returned a non-zero exit code; continuing with validation."
+                            )
                 guest_command_executor(f"ip -6 addr flush dev {device_name}", check_exit_code=False)
                 guest_command_executor(
                     (
@@ -3612,7 +3664,9 @@ def main() -> None:
             fatal_error = error
             print(f"\n[ERROR] An error occurred during processing: {error}")
 
+        dest_vm_retained = False
         if migrated_vm_for_rollback:
+            dest_vm_retained = True
             print("\n" + "=" * 20 + " Rollback Confirmation (Destination VM Removal) " + "=" * 20)
             print("The process stopped, leaving a partially migrated VM on the destination vCenter.")
             vm_name_display = migrated_vm_name_for_rollback or clone_name or "(unknown)"
@@ -3621,6 +3675,7 @@ def main() -> None:
             rollback_approval = input("\nDelete this VM to return to the pre-operation state? (y/n): ")
             if rollback_approval.lower() == 'y':
                 try:
+                    dest_vm_retained = False
                     if si_dest is None:
                         connection_alive = False
                     else:
@@ -3652,6 +3707,7 @@ def main() -> None:
                     if not vm_to_delete:
                         print("   [INFO] Rollback target VM not found. It may already be deleted.")
                         unregistered_from_source = True
+                        dest_vm_retained = False
                     else:
                         if vm_to_delete.runtime.powerState == 'poweredOn':
                             print(f"   Powering off VM '{vm_to_delete.name}'...")
@@ -3679,13 +3735,19 @@ def main() -> None:
                         if destroy_state == vim.TaskInfo.State.success:
                             print("[OK] Rollback complete: deleted destination VM.")
                             unregistered_from_source = False
+                            dest_vm_retained = False
                         else:
                             unregistered_from_source = True
+                            dest_vm_retained = True
                             raise RuntimeError(f"Failed to delete VM: {destroy_task.info.error.msg}") from error
                 except Exception as cleanup_error:
                     print(f"[WARN] Error during destination VM rollback: {cleanup_error}")
                     unregistered_from_source = True
-        if unregistered_from_source:
+                    dest_vm_retained = True
+            else:
+                print("Rollback was cancelled; the VM remains on the destination vCenter.")
+                dest_vm_retained = True
+        if unregistered_from_source and not dest_vm_retained:
             print("\n" + "=" * 20 + " Rollback Confirmation (Datastore Cleanup) " + "=" * 20)
             print("   Clone files remain on the source vCenter datastore and must be cleaned up.")
             print(f"   VM files may still exist on datastore '{TARGET_DATASTORE_NAME}'.")
