@@ -1,4 +1,4 @@
-# -*- coding: cp932 -*-
+# -*- coding: utf-8 -*-
 """Utilities for configuring guest networking via the vSphere Automation SDK REST APIs.
 
 This module encapsulates just enough of the /rest/vcenter/vm/guest/networking
@@ -145,7 +145,54 @@ class VsphereGuestNetworkSDK:
                     if isinstance(alt, list):
                         interfaces = alt
             if interfaces:
-                return interfaces
+                # Deduplicate entries by interface identifier or MAC address to avoid
+                # doubled NICs returned by some API variants.
+                seen_keys: set[str] = set()
+                unique: List[Mapping[str, object]] = []
+                for entry in interfaces:
+                    # Prefer a stable NIC id; fall back to normalized MAC.
+                    nic_id = None
+                    if isinstance(entry, Mapping):
+                        nic_id = (
+                            str(entry.get("nic")
+                                or entry.get("interface")
+                                or entry.get("id")
+                                or "").strip()
+                        ) or None
+                    key = None
+                    if nic_id:
+                        key = f"id:{nic_id}"
+                    else:
+                        # Try to derive a MAC-based key
+                        mac_value = None
+                        if isinstance(entry, Mapping):
+                            for k in ("mac", "mac_address", "macAddress", "hardware_address", "hardwareAddress"):
+                                val = entry.get(k)
+                                if isinstance(val, str) and val:
+                                    mac_value = val
+                                    break
+                            if mac_value is None:
+                                link = entry.get("link") or entry.get("link_info")
+                                if isinstance(link, Mapping):
+                                    for k in ("mac", "mac_address", "macAddress", "hardware_address", "hardwareAddress"):
+                                        val = link.get(k)
+                                        if isinstance(val, str) and val:
+                                            mac_value = val
+                                            break
+                        if mac_value:
+                            compact = mac_value.lower().replace(":", "").replace("-", "")
+                            key = f"mac:{compact}"
+                    if key is None:
+                        # Fallback to JSON text
+                        try:
+                            key = f"raw:{json.dumps(entry, sort_keys=True)}"
+                        except Exception:
+                            key = f"raw:{str(entry)}"
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+                    unique.append(entry)
+                return unique
             if attempt < retries:
                 self._logger.debug(
                     "Guest networking API returned no NICs for %s (attempt %s); retrying in %.1fs",
