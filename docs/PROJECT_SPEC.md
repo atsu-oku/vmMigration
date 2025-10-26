@@ -2,169 +2,92 @@
 
 ## Overview
 
-- **Objective**: Move a staging VM running on vSphere into the production environment and align the in-guest configuration with PRD standards.
-- **Key files**: cloneAndVmotion.py, 
-etwork_utils.py, helper shell script ind_and_extract_3.2.4.0.sh.
-- **Target guest OS**: RHEL / CentOS family with firewalld, chrony/ntpd, yum repos, td-agent and related tooling available.
+- **Objective**: Seamlessly migrate a staging (STG) VM to production (PRD) by automating clone, registration, guest configuration, and validation steps while enforcing PRD configuration standards.
+- **Primary entry point**: `cloneAndVmotion.py`
+- **Key supporting modules**: `network_utils.py`, `guest_commands.py`, `firewalld_schema.py`, schema definitions under `schemas/`.
+- **Supported guests**: RHEL/CentOS family with firewalld, chrony/ntpd, yum, and td-agent tooling available. Hosts must run VMware Tools with Guest Operations enabled.
 
 ---
 
-## End-to-End Flow
+## End-to-End Workflow
 
 1. **Phase 0 - Pre-flight**
-   - Exercise vCenter authentication against source and destination endpoints.
-   - Verify the target VM exists and confirm VMware Tools status.
-2. **Phase 1 - Data collection**
-   - Gather NIC, IP, DNS, route, firewall, NTP, and repository information.
-   - Validate that STG->PRD transformation rules apply cleanly.
-3. **Phase 2 - User confirmation**
-   - Present detected diffs and obtain approval to proceed.
-   - (Planned) Generate an automatic diff report via ind_and_extract.
-4. **Phase 3 - Clone and register**
-   - Create the clone, register it, rebuild NICs, and execute Storage vMotion.
-5. **Phase 4 - Guest configuration**
-   - Update /etc/hosts, firewalld, NTP, repositories, proxy exports, and iptables.
-6. **Phase 5 - Verification and wrap-up**
-   - Run SDK-based validation and collect warnings.
-   - Provide backup locations and rollback guidance.
+   - Authenticate against source and destination vCenter instances.
+   - Confirm the target VM exists and verify VMware Tools status.
+2. **Phase 1 - Data Collection**
+   - Gather NIC/IP/DNS/route data through VMware Tools and the vSphere REST SDK.
+   - Capture firewalld zone definitions, NTP configs, yum repositories, and proxy settings.
+   - Validate that STG->PRD transformation rules apply cleanly; log anomalies for follow-up.
+3. **Phase 2 - User Confirmation**
+   - Present collected metadata and planned changes.
+   - Await operator approval before mutating objects or guest configuration.
+4. **Phase 3 - Clone and Register**
+   - Clone the source VM to the staging datastore, strip NICs, and unregister.
+   - Register the clone on the destination vCenter and rebuild NICs against PRD networks.
+5. **Phase 4 - Guest Configuration**
+   - Reconfigure the guest OS (hosts file, firewalld, NTP, yum repos, proxies, td-agent repo, iptables) using the shell-based writer described below.
+6. **Phase 5 - Verification and Wrap-up**
+   - Validate configuration via SDK queries or `nmcli`, depending on availability.
+   - Run connectivity checks, ensure firewalld allows SSH from the operator subnet.
+   - Summarise results with backups and warnings to guide any manual clean-up.
 
 ---
 
-## Guest Configuration Flow (_sync_prd_system_configuration)
+## Guest Configuration Tasks
 
-1. **/etc/hosts**
-   - Repeatedly apply 	ransform_text_to_prd until staging patterns disappear.
-   - Raise a warning if STG entries remain.
-   - Use the safe mktemp -> mv replacement flow and keep /etc/hosts-YYYYMMDD.bak.
+| Component | Action | Notes |
+| --- | --- | --- |
+| `/etc/hosts` | Transform STG hostnames/IPs to PRD equivalents; warn if staging entries remain. | Uses iterative `transform_text_to_prd`. |
+| `firewalld` | Enforce zone plans (interfaces, sources, ports, rich rules) sourced from STG. | Backed by JSON schema validation; creates timestamped backups before changes. |
+| `chrony`/`ntpd` | Convert NTP servers to PRD addresses; verify staging IPs are removed. | Applies text transformations and targeted regex replacements. |
+| `yum` repos | Disable `mirrorlist`, point `baseurl` to `https://vault.centos.org`, enforce HTTPS. | Retains per-file backups and retries TLS repairs before warning. |
+| `td-agent` repo | Ensure `/etc/yum.repos.d/td.repo` exists, probing v4 then v3 endpoints. | Auto-detects release/arch via `rpm -E`. |
+| `/etc/profile` | Append PRD proxy exports when absent; verify via environment snapshot. | Keeps `-YYYYMMDD.bak` backup. |
+| `iptables` | Apply PRD rule set and reload service (systemd or legacy service command). | Warns if reload fails. |
 
-2. **firewalld**
-   - Pull zone XML, convert sources and rich rules to PRD ranges.
-   - Remove the SSH rule from the heartbeat zone.
-   - Preserve interface assignments and reattach them after conversion (pending work).
-   - Apply the changes with irewall-cmd --reload.
-
-3. **chrony / ntpd**
-   - Scan files such as /etc/chrony.conf and /etc/ntp.conf.
-   - Run 	ransform_text_to_prd plus regex replacements to flip 172.16.17x.* to 172.16.16x.* (pending implementation).
-   - Write back after generating a backup.
-
-4. **CentOS repositories**
-   - Inspect every /etc/yum.repos.d/*.repo, comment out mirrorlist entries.
-   - Force aseurl to https://vault.centos.org/centos/.
-   - On TLS errors attempt CA refresh -> curl-openssl install; fall back to warning-only if repairs fail.
-
-5. **td-agent repository (/etc/yum.repos.d/td.repo)**
-   - Resolve eleasever and rch dynamically via rpm macros.
-   - Probe the v4 repository with curl; downgrade to v3 when unreachable.
-   - Create a backup before writing the new file.
-
-6. **iptables**
-   - Rewrite /etc/sysconfig/iptables to PRD rules.
-   - Retry systemctl reload iptables (or service iptables reload) until it succeeds or exhausts attempts.
-
-7. **Proxy settings (/etc/profile)**
-   - Append PRD proxy exports (still to be implemented).
-   - Source the profile and verify with env | grep -i http.
-   - Emit warnings when the environment update fails.
-
-> All writes rely on the mktemp -> mv pattern to preserve ownership and permissions. Backups live beside the source file with a -YYYYMMDD.bak suffix.
+All file modifications are performed via the `_write_guest_file` helper, which:
+1. Verifies the target directory exists.
+2. Creates a temporary file with `mktemp` (preferring the target directory).
+3. Uses `bash -lc` with a heredoc to write the content (no Python payloads, no base64).
+4. Preserves ownership and permissions based on `stat -c '%a %u %g'` for existing files.
+5. Atomically replaces the original file via `mv` and cleans up temp files on failure.
 
 ---
 
-## Key Helpers in 
-etwork_utils.py
+## Firewalld Zone Schema Handling
 
-- calculate_ip_stg_to_prd(ip): Translate staging addresses (third octet 170-179) to PRD equivalents.
-- 	ransform_text_to_prd(text): Replace staging IPs, trailing host suffix s, and ipet-ins domains with PRD forms.
-- determine_prd_static_routes(...): Choose PRD static routes by prioritising MNG segment NICs (third octet 161/163).
-- ensure_firewall_allows_ssh(exec, source_ip): Add SSH allowance and remove it from the heartbeat zone as required.
-- ensure_connection_activation(...): Make sure the nmcli connection is up, validating connectivity with ping.
-- Additional helpers cover DNS extraction, SDK verification, and post-migration consistency checks.
-
----
-
-## TLS Error Mitigation (_run_curl_with_tls_repairs)
-
-1. Execute curl and classify TLS-related failures.
-2. Refresh CA bundles via update-ca-trust or yum reinstall ca-certificates nss curl.
-3. If problems persist, install curl-openssl or reinstall curl.
-4. When all recovery steps fail, log a warning and continue the workflow.
+- `firewalld_schema.py` defines `FirewalldZonePlan` and `FirewalldZoneSchemaValidator`. The validator consumes `schemas/firewalld_zone_schema.json` to ensure collected data only contains supported keys.
+- During data collection, each zone is read using `firewall-cmd --permanent --list-*` commands. Zones that fail validation are skipped with a debug log.
+- `_sync_firewalld_configuration_to_prd` receives the list of validated plans and enforces them on the destination VM:
+  - Interfaces: Treats the plan as authoritative (empty list removes all interfaces).
+  - Sources, ports, rich rules: Applies `transform_text_to_prd` to convert STG IPs/domains, removes unexpected entries, and adds missing ones.
+  - Zone XML backups are written once per zone before any modification (`/etc/firewalld/zones/<zone>.xml-YYYYMMDD.bak`).
+  - A single `firewall-cmd --reload` is issued when changes occur; failures downgrade the overall success flag.
+- The legacy transformation-only branch remains for environments where no source plan is available.
 
 ---
 
-## Helper Script ind_and_extract_3.2.4.0.sh
+## Command Logging and Reporting
 
-- Scans a target directory and extracts differences for **current** vs **new** infrastructure criteria.
-- Outputs hit logs under /tmp/<user>/<script_name>/ grouped into stg/prod/other buckets.
-- Intended as a precursor for automatic remediation once diff detection is stabilised.
-- Logs include hit locations (with line numbers), rule names, and category-specific lists.
+- `guest_commands.py` emits every planned command through the registered logger (`register_command_execution`). Each entry is stored with a friendly description generated by `_describe_command` or provided explicitly via `remember_command_description`.
+- The execution summary printed by `_print_execution_summary()` now lists commands in chronological order, pairing raw shell invocations with short Japanese descriptions for operators.
+- `[OK]`, `[WARN]`, and `[ERROR]` log lines are also collected throughout execution, giving operators a concise success/failure view to share after the run.
 
 ---
 
-## Handling Success vs Warning States
+## Backup Strategy and Rollback Aids
 
-- Missing target file -> skip without failing the overall run.
-- Unable to back up or write -> flag [WARN], mark the specific task failed, and lower the overall success flag.
-- STG artefacts remain after conversion -> raise [WARN] and request operator review.
-- TLS still unreachable after repair attempts -> log [WARN] while continuing execution.
-- Environment variables not applied -> [WARN] Proxy environment variables may not be active....
+- Every file mutation creates a timestamped `-YYYYMMDD.bak` copy in place (hosts, profile, firewalld zone XMLs, NTP configs, yum repos, td-agent repo, iptables).
+- Firewalld rewrites ensure only a single backup per zone per run to avoid clutter.
+- TLS repair attempts are logged step-by-step; unresolved issues downgrade to `[WARN]` while leaving the original files untouched.
+- Execution summary highlights backup paths so operators can roll back manually if required.
 
 ---
 
 ## Future Enhancements
 
-1. **Diff report before editing** - display ind_and_extract results via Python to narrow the scope.
-2. **Preview mode for automated fixes** - show the proposed diff and apply only after approval.
-3. **Rollback assistance** - list available backups with ready-to-run restore commands.
-4. **Port the logic to Python** - migrate the bash matching logic into a Python module and expose a unified CLI.
-5. **CI/CD integration** - provide dry-runs, unit tests, and SDK-level verification in automation.
-
----
-
-## ASCII Art Notes
-
-`
- _______________________
-|  VM Migration Engine  |
-|-----------------------|
-|  Clone + vMotion      |
-|  Guest Reconfigure    |
-|  Firewalld / NTP      |
-|  Repo & Proxy Sync    |
-|  Reports & Backups    |
-|_______________________|
-
-        /       /        /____\   <- PRD-ready VM
-`
-
-## Appendix: Main Outputs
-
-| File | Description |
-|-----------|-----------|
-| /etc/hosts-YYYYMMDD.bak | Backup taken before rewriting hosts |
-| /etc/firewalld/zones/*.bak | firewalld zone XML backups |
-| /etc/sysconfig/iptables-YYYYMMDD.bak | iptables backup |
-| /etc/profile-YYYYMMDD.bak | Proxy backup before editing |
-| /etc/yum.repos.d/*.repo-YYYYMMDD.bak | CentOS repo backups |
-| /etc/yum.repos.d/td.repo-YYYYMMDD.bak | td-agent repo backup |
-| /tmp/<user>/find_and_extract_3.2.4.0/ | Diff analysis logs |
-
----
-
-## Summary
-
-This project automates STG->PRD VM migrations on vSphere by coordinating network, firewall, NTP, repo, and proxy configuration changes inside the guest. It keeps backups, retries TLS fixes, surfaces warnings, and leaves room for future automation around diff detection and self-healing.
-
-`
-   ________
-  /  ____/ /__/ __\/ \  \ \_/\/
- \__\__\/   <- STG
-   ||
-   ||  (cloneAndVmotion.py)
-   \/
-  /\/\  ____
- / /\/ / __  \/ / / / _ |
-   \/ | | (_| |
-       \ \__,_|
-        \____/  <- PRD
-`
+1. **Diff preview tooling** - Integrate `find_and_extract` logic to show diffs before applying guest changes.
+2. **Automated report** - Generate HTML/Markdown run reports summarising commands, backups, and warnings.
+3. **Extended OS coverage** - Run full validation on RHEL 8/9 and Ubuntu LTS releases, adjusting scripts where necessary.
+4. **Test automation** - Add integration tests for the bash-based writer and firewalld zone reconciliation logic.
+5. **Rollback automation** - Provide helper scripts to restore from the generated backups on demand.

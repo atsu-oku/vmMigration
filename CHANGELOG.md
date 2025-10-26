@@ -1,5 +1,13 @@
 # Version History
 
+## 2025-10-27 (Command logging & firewalld schema)
+
+- Added a structured command execution log so every guest command and its description appear in the final summary.
+- Replaced guest file writes with an mktemp + bash heredoc flow, removing the need for Python payloads or base64 transfers.
+- Captured source firewalld zones via JSON-schema-validated plans and synchronised interfaces, sources, ports, and rich rules on the destination VM.
+- Authored English documentation (`docs/MIGRATION_FEATURES_EN.md`) describing the latest workflow enhancements.
+
+
 ## 2025-10-26 (Guest command resilience & reporting)
 
 - Hardened guest command file downloads to retry with urllib when `requests` fails or returns non-200 responses, ensuring stdout/stderr capture succeeds.
@@ -33,7 +41,7 @@
 ## 2025-10-18
 
 - Improved default-gateway inference to prefer vSphere route metadata and NIC subnet checks.
-- Normalised DNS verification output to remove false 窶徇issing DNS窶・warnings and clearly display actual/expected sets.
+- Normalised DNS verification output to remove false "missing DNS" warnings and clearly display actual/expected sets.
 - Filtered SDK route snapshots so only non-default discrepancies are reported.
 - Ensured `nmcli` connections remain in autoconnect mode and prevented duplicate static-route application.
 - Updated documentation (README/SETUP) to reflect the new verification behaviour and configuration options.
@@ -58,9 +66,11 @@
 
 ## 2025-10-11
 
-- Organised the flow from clone ↁEIP configuration ↁEStorage vMotion.
+- Organised the flow from clone -> IP configuration -> Storage vMotion.
 - Added connectivity verification and rollback steps using nmcli / ping inside the guest OS.
 
 ## 2025-10-10
 
 - Initial project setup, establishing the migration script foundation spanning source and destination vCenters.
+
+

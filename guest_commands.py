@@ -7,7 +7,7 @@ import shlex
 import ssl
 import time
 import urllib.request
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 try:
     import requests
@@ -30,6 +30,21 @@ STDERR_ERROR_REGEXES = (
 )
 
 ROOT_LOGIN_DISABLED = False
+COMMAND_LOGGER: Optional[Callable[[str], None]] = None
+
+
+def set_command_logger(logger: Optional[Callable[[str], None]]) -> None:
+    """Register a callback that receives every command string before execution."""
+    global COMMAND_LOGGER
+    COMMAND_LOGGER = logger
+
+
+def _emit_command_log(command: str) -> None:
+    if COMMAND_LOGGER:
+        try:
+            COMMAND_LOGGER(command)
+        except Exception:
+            pass
 
 
 class NmcliNotAvailableError(RuntimeError):
@@ -51,6 +66,7 @@ class GuestCommandExecutor:
 
         print("[GUEST-CMD] Planned command:")
         print(f"  {command}")
+        _emit_command_log(command)
 
         exit_code: int = -1
         stdout: str = ""
@@ -234,14 +250,18 @@ class GuestCommandExecutor:
         temp_password = None
         try:
             temp_password = self._create_temp_password_file(vm)
-            result = self._run_command(vm, self.admin_auth, self._build_sudo_command(command, temp_password))
+            admin_command = self._build_sudo_command(command, temp_password)
+            _emit_command_log(admin_command)
+            result = self._run_command(vm, self.admin_auth, admin_command)
             retry_exit_code, _, retry_stderr = result
             if self._requires_tty_retry(retry_exit_code, retry_stderr):
                 print("[GUEST-CMD] sudo requires a TTY; retrying via script wrapper.")
+                admin_command = self._build_sudo_command(command, temp_password, use_script_wrapper=True)
+                _emit_command_log(admin_command)
                 result = self._run_command(
                     vm,
                     self.admin_auth,
-                    self._build_sudo_command(command, temp_password, use_script_wrapper=True),
+                    admin_command,
                 )
             return result
         finally:
