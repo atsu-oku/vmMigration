@@ -747,6 +747,20 @@ def _is_service_active(guest_executor, service_name: str) -> bool:
     return exit_code == 0
 
 
+def _ensure_guest_write_privileges(guest_executor) -> bool:
+    """Verify that the guest executor runs with root privileges."""
+    exit_code, stdout, stderr = guest_executor("id -u", check_exit_code=False)
+    if exit_code == 0 and (stdout or "").strip() == "0":
+        return True
+    probe_exit, _, probe_err = guest_executor("test -w /etc && printf ok", check_exit_code=False)
+    if probe_exit == 0:
+        return True
+    detail = (stderr or "").strip() or (probe_err or "").strip() or f"id -u exit code {exit_code}"
+    print(f"   [ERROR] Guest executor lacks root access to modify system configuration: {detail}")
+    log_failure("Guest credentials do not provide root privileges; system configuration sync skipped.")
+    return False
+
+
 def _write_guest_file(guest_executor, remote_path: str, content: str) -> Tuple[int, str, str]:
     """Write content to a file inside the guest using a temporary file and atomic move."""
     token = f"__VSPHERE_EOF_{uuid_module.uuid4().hex}__"
@@ -759,17 +773,22 @@ def _write_guest_file(guest_executor, remote_path: str, content: str) -> Tuple[i
         "remote_dir=$(dirname \"$remote_path\")\n"
         "if [ -z \"$remote_dir\" ]; then remote_dir='.'; fi\n"
         "if [ ! -d \"$remote_dir\" ]; then\n"
-        "  echo \"Target directory $remote_dir does not exist\" >&2\n"
+        "  echo \"E_NO_DIRECTORY:$remote_dir\" >&2\n"
         "  exit 1\n"
         "fi\n"
         "tmpfile=$(mktemp \"$remote_dir/.vsphere_tmp.XXXXXX\" 2>/dev/null || mktemp /tmp/.vsphere_tmp.XXXXXX)\n"
         "if [ -z \"$tmpfile\" ]; then\n"
-        "  echo \"Failed to allocate temporary file\" >&2\n"
+        "  echo \"E_MKTEMP_FAILED\" >&2\n"
         "  exit 1\n"
         "fi\n"
-        f"cat <<'{token}' > \"$tmpfile\"\n"
+        f"if ! cat <<'{token}' > \"$tmpfile\"\n"
         f"{normalized}"
         f"{token}\n"
+        "then\n"
+        "  echo \"E_WRITE_TEMPFILE\" >&2\n"
+        "  rm -f \"$tmpfile\"\n"
+        "  exit 1\n"
+        "fi\n"
         "perm_spec=644\n"
         "owner_spec=$(id -u)\n"
         "group_spec=$(id -g)\n"
@@ -780,7 +799,12 @@ def _write_guest_file(guest_executor, remote_path: str, content: str) -> Tuple[i
         "fi\n"
         "chmod \"$perm_spec\" \"$tmpfile\" 2>/dev/null || true\n"
         "chown \"$owner_spec\":\"$group_spec\" \"$tmpfile\" 2>/dev/null || true\n"
-        "mv \"$tmpfile\" \"$remote_path\"\n"
+        "if ! mv \"$tmpfile\" \"$remote_path\" 2>/dev/null; then\n"
+        "  err=$?\n"
+        "  echo \"E_MOVE_FAILED:$remote_path\" >&2\n"
+        "  rm -f \"$tmpfile\"\n"
+        "  exit $err\n"
+        "fi\n"
         "exit 0\n"
     )
     return guest_executor(command, check_exit_code=False)
@@ -1547,6 +1571,8 @@ def _sync_prd_system_configuration(
     print("   -> Synchronising guest hosts and firewall configuration with PRD mappings...")
     timestamp = datetime.now().strftime("%Y%m%d")
     success = True
+    if not _ensure_guest_write_privileges(guest_executor):
+        return False
     if not _ensure_http_proxy_configuration(guest_executor, timestamp):
         success = False
     if not _sync_hosts_file_to_prd(guest_executor, timestamp):
