@@ -8,7 +8,7 @@ This document complements the quick-start section in the README and expands on e
 
 You can prepare the environment in two common ways. Choose the one that fits your organisational policy.
 
-### Pattern A – Clone first, then create venv
+### Pattern A - Clone first, then create venv
 
 ```bash
 git clone https://github.com/atsu-oku/vmMigration.git
@@ -19,7 +19,7 @@ python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-### Pattern B – Create venv first (policy-driven)
+### Pattern B - Create venv first (policy-driven)
 
 Some environments require creating the virtual environment before cloning the repository.
 
@@ -68,7 +68,7 @@ Environmental variables allow you to tune runtime behaviour:
 
 | Variable | Purpose | Default |
 | --- | --- | --- |
-| `VSPHERE_CLONE_LOG_LEVEL` | Logging level (`DEBUG`, `INFO`, `WARNING`, …) | `WARNING` |
+| `VSPHERE_CLONE_LOG_LEVEL` | Logging level (`DEBUG`, `INFO`, `WARNING`, ...) | `WARNING` |
 | `VSPHERE_CLONE_KEEPALIVE_SECONDS` | Interval for vCenter keep-alive calls | `240` |
 
 PowerShell:
@@ -92,13 +92,14 @@ export VSPHERE_CLONE_LOG_LEVEL=DEBUG
 python cloneAndVmotion.py
 ```
 
-You’ll be prompted for:
+You'll be prompted for:
 
 - Source/destination vCenter credentials.
 - Target VM name.
 - Guest OS credentials (root and/or sudo-capable admin).
 
 Each major phase displays a summary and waits for confirmation (`y` to proceed).
+After the workflow completes, review the execution summary; it now lists every guest command alongside a human-readable description.
 
 ---
 
@@ -106,7 +107,7 @@ Each major phase displays a summary and waits for confirmation (`y` to proceed).
 
 - **Connectivity failures**: Ensure ICMP is permitted for ping validation, or adjust the target list within the script.
 - **Authentication errors**: Confirm Guest Operations permissions within VMware Tools.
-- **DNS or route warnings**: Compare the logged “expected vs actual” output. The script now suppresses false positives when values match.
+- **DNS or route warnings**: Compare the logged "expected vs actual" output. The script now suppresses false positives when values match.
 - **Session drops**: Lower `VSPHERE_CLONE_KEEPALIVE_SECONDS` to keep vCenter sessions alive during long-running Storage vMotion tasks.
 
 ---
@@ -116,3 +117,4 @@ Each major phase displays a summary and waits for confirmation (`y` to proceed).
 - `README.md` for a project overview and high-level workflow.
 - `CHANGELOG.md` for release notes.
 - `TODO.md` for operational follow-ups.
+- `docs/MIGRATION_FEATURES_EN.md` for a narrative of the latest automation improvements.
