@@ -200,14 +200,21 @@ class GuestCommandExecutor:
                 auth=auth,
                 guestFilePath=guest_path,
             )
+            # Prefer requests when available, but fall back to urllib on non-200 or exceptions
             if REQUESTS_AVAILABLE:
-                response = requests.get(file_info.url, verify=False, timeout=30)
-                if response.status_code == 200:
-                    return response.text
-            else:
-                ctx_inner = self._create_ssl_context()
+                try:
+                    response = requests.get(file_info.url, verify=False, timeout=30)
+                    if response.status_code == 200:
+                        return response.text
+                except Exception:
+                    # Intentionally fall through to urllib
+                    pass
+            ctx_inner = self._create_ssl_context()
+            try:
                 with urllib.request.urlopen(file_info.url, context=ctx_inner) as resp:
                     return resp.read().decode("utf-8", errors="replace")
+            except Exception:
+                return ""
         except vim.fault.FileNotFound:
             return ""
         except Exception:
