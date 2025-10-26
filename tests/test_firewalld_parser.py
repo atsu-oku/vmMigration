@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 import unittest
 
 from firewalld_manager import apply_zone_ports, apply_zone_sources, apply_service_ports

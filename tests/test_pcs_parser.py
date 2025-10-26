@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 import unittest
 
 from pcs_parser import ClusterStatus, parse_cluster_status

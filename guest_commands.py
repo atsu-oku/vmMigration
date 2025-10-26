@@ -21,7 +21,7 @@ except ImportError:
 
 from pyVmomi import vim  # type: ignore[import]
 
-STDERR_ERROR_LITERALS = ("エラー", "失敗")
+STDERR_ERROR_LITERALS = ("error", "failure")
 STDERR_ERROR_REGEXES = (
     re.compile(r"(^|\s)error\b", re.IGNORECASE),
     re.compile(r"(^|\s)failed\b", re.IGNORECASE),

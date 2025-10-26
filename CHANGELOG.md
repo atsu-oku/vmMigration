@@ -1,5 +1,13 @@
 # Version History
 
+## 2025-10-26 (Guest command resilience & reporting)
+
+- Hardened guest command file downloads to retry with urllib when `requests` fails or returns non-200 responses, ensuring stdout/stderr capture succeeds.
+- Added a `--source-vm` CLI option for `cloneAndVmotion.py` so scripted runs can skip the interactive VM prompt.
+- Collected `[OK]`/`[WARN]`/`[ERROR]` messages into an execution summary that prints once the migration workflow finishes.
+- Reconciled firewalld zone interfaces using source-derived mappings before reload, preventing orphaned assignments.
+- Updated documentation to cover the new summary, CLI flag, and guest command fallback.
+
 ## 2025-10-20 (Legacy guest tooling support)
 
 - Reworked the legacy guest network configurator to detect `ip`, `ifconfig`, and `route`, falling back to net-tools when NetworkManager is absent.
@@ -50,7 +58,7 @@
 
 ## 2025-10-11
 
-- Organised the flow from clone → IP configuration → Storage vMotion.
+- Organised the flow from clone ↁEIP configuration ↁEStorage vMotion.
 - Added connectivity verification and rollback steps using nmcli / ping inside the guest OS.
 
 ## 2025-10-10
