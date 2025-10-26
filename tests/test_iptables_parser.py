@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 import unittest
 
 from iptables_parser import IptablesConfig, parse_iptables_config

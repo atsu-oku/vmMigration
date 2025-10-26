@@ -1,5 +1,5 @@
-﻿# -*- coding: utf-8 -*-
-"""Environment mapping helpers for STG⇔PRD conversions and service lookups."""
+# -*- coding: utf-8 -*-
+"""Environment mapping helpers for STG<->PRD conversions and service lookups."""
 
 from __future__ import annotations
 

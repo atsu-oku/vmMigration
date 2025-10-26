@@ -42,7 +42,7 @@ DEFAULT_CONN_CHECK_PARAMS = ConnectionCheckParams()
 
 
 def extract_mac_from_sdk_interface(entry: Mapping[str, Any]) -> Optional[str]:
-    """Return the MAC address from a guest networking interface entry (vSphere Automation API ≥ 8.0)."""
+    """Return the MAC address from a guest networking interface entry (vSphere Automation API >= 8.0)."""
     if not isinstance(entry, Mapping):
         return None
     candidate_keys = ("mac_address", "macAddress", "mac", "hardware_address", "hardwareAddress")
@@ -80,7 +80,7 @@ def is_link_local_address(address: Optional[str]) -> bool:
 
 
 def extract_ipv4_from_sdk_interface(entry: Mapping[str, Any]) -> Tuple[Optional[str], Optional[int]]:
-    """Return (IPv4 address, prefix length) from a guest networking interface entry (API ≥ 8.0)."""
+    """Return (IPv4 address, prefix length) from a guest networking interface entry (API >= 8.0)."""
     if not isinstance(entry, Mapping):
         return None, None
     ip_sources: List[Mapping[str, Any]] = []
@@ -126,7 +126,7 @@ def extract_ipv4_from_sdk_interface(entry: Mapping[str, Any]) -> Tuple[Optional[
 
 
 def extract_dns_servers_from_state(state_payload: Any) -> List[str]:
-    """Return DNS servers reported by the guest networking state endpoint (API ≥ 8.0)."""
+    """Return DNS servers reported by the guest networking state endpoint (API >= 8.0)."""
     if isinstance(state_payload, Mapping):
         inner = state_payload.get("value", state_payload)
         if isinstance(inner, Mapping):

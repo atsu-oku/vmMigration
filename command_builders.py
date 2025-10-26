@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """Builders for command strings executed inside the guest."""
 
 from __future__ import annotations

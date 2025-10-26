@@ -47,6 +47,7 @@ Alternative setup flows (e.g., creating the virtual environment before cloning, 
 - Normalises DNS comparisons to stop false “missing DNS” warnings and reports only meaningful differences.
 - Avoids duplicate static-route application across NICs, clears stale default routes before reconfiguration, and keeps `nmcli` connections in autoconnect mode for post-reboot resilience.
 - Provides guided rollback steps (VM deletion, datastore clean-up) when a failure occurs mid-flight.
+- Collects `[OK]`/`[WARN]`/`[ERROR]` markers and prints an execution summary once the workflow completes.
 
 ---
 
@@ -81,6 +82,9 @@ During long-running operations the script keeps both vCenter sessions alive by i
 - Increase logging verbosity by exporting `VSPHERE_CLONE_LOG_LEVEL=DEBUG`.
 - After a root authentication failure the workflow automatically switches to the sudo-capable account for the remainder of the run, avoiding repeated root prompts.
 - The final verification step can be switched between SDK and `nmcli` by setting `REQUESTS_AVAILABLE`; when `requests` is installed, the SDK path is preferred.
+- Supply the source VM name ahead of time with `python cloneAndVmotion.py --source-vm <vm-name>` when scripting or rerunning the same workload.
+- Review the execution summary printed at the end; it consolidates `[OK]`/`[WARN]`/`[ERROR]` output for quick sharing.
+- Guest stdout/stderr capture uses VMware Guest Operations. If `requests` cannot download the logs, the tool automatically retries with `urllib` so diagnostics remain available.
 
 ---
 

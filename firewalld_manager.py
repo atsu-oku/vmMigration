@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """Management helpers for applying firewalld configuration."""
 
 from __future__ import annotations
