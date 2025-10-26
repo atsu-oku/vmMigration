@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """Automates the staged-to-production VM migration workflow between vCenters."""
 from __future__ import annotations
+import argparse
+import builtins
 import os
 import ssl
 import sys
@@ -67,6 +69,77 @@ def _is_link_local_address(address: Optional[str]) -> bool:
         return ipaddress.ip_address(address) in LINK_LOCAL_PREFIX
     except ValueError:
         return False
+
+
+SUCCESS_EVENTS: List[str] = []
+FAILURE_EVENTS: List[str] = []
+
+
+def log_success(message: str) -> None:
+    """Record a success message for the execution summary."""
+    normalized = message.strip()
+    if normalized and normalized not in SUCCESS_EVENTS:
+        SUCCESS_EVENTS.append(normalized)
+
+
+def log_failure(message: str) -> None:
+    """Record a failure or warning message for the execution summary."""
+    normalized = message.strip()
+    if normalized and normalized not in FAILURE_EVENTS:
+        FAILURE_EVENTS.append(normalized)
+
+
+_ORIGINAL_PRINT = builtins.print
+
+
+def _tracking_print(*args, **kwargs) -> None:
+    """Proxy print function that tracks notable success/failure messages."""
+    sep = kwargs.get("sep", " ")
+    message = sep.join(str(arg) for arg in args)
+    normalized = message.lstrip()
+    if normalized.startswith("[OK]"):
+        log_success(normalized[len("[OK]") :].strip())
+    elif normalized.startswith("[WARN]"):
+        log_failure(normalized[len("[WARN]") :].strip())
+    elif normalized.startswith("[ERROR]"):
+        log_failure(normalized[len("[ERROR]") :].strip())
+    _ORIGINAL_PRINT(*args, **kwargs)
+
+
+builtins.print = _tracking_print
+
+
+def _parse_cli_arguments(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    """Parse command line arguments for the migration workflow."""
+    parser = argparse.ArgumentParser(
+        description="Automate the staged-to-production VM migration workflow between vCenters."
+    )
+    parser.add_argument(
+        "-s",
+        "--source-vm",
+        dest="source_vm_name",
+        help="Name of the staged/source VM to clone (skips interactive prompt when provided).",
+    )
+    return parser.parse_args(argv)
+
+
+
+def _print_execution_summary() -> None:
+    """Display a summary of successes and failures recorded during execution."""
+    print("\n==== \u5b9f\u884c\u30b5\u30de\u30ea ====")
+    if SUCCESS_EVENTS:
+        print("\u6210\u529f\u3057\u305f\u3053\u3068:")
+        for entry in SUCCESS_EVENTS:
+            print(f"  - {entry}")
+    else:
+        print("\u6210\u529f\u3057\u305f\u3053\u3068: \u306a\u3057")
+    if FAILURE_EVENTS:
+        print("\u5931\u6557\u3057\u305f\u3053\u3068:")
+        for entry in FAILURE_EVENTS:
+            print(f"  - {entry}")
+    else:
+        print("\u5931\u6557\u3057\u305f\u3053\u3068: \u306a\u3057")
+
 
 
 def _load_local_module(module_name: str, filename: str):
@@ -921,7 +994,11 @@ def _sync_hosts_file_to_prd(guest_executor, timestamp: str) -> bool:
     return True
 
 
-def _sync_firewalld_configuration_to_prd(guest_executor, timestamp: str) -> bool:
+def _sync_firewalld_configuration_to_prd(
+    guest_executor,
+    timestamp: str,
+    source_zone_interfaces: Optional[Dict[str, List[str]]] = None,
+) -> bool:
     """Update firewalld configuration to PRD equivalents when the service is active."""
     exit_code, _, _ = guest_executor("command -v firewall-cmd", check_exit_code=False)
     if exit_code != 0:
@@ -949,6 +1026,7 @@ def _sync_firewalld_configuration_to_prd(guest_executor, timestamp: str) -> bool
             return False
     overall_success = True
     zones_updated: List[str] = []
+    zone_interface_overrides = source_zone_interfaces or {}
 
     for zone in sorted(zone_names):
         zone_file = f"/etc/firewalld/zones/{zone}.xml"
@@ -983,11 +1061,95 @@ def _sync_firewalld_configuration_to_prd(guest_executor, timestamp: str) -> bool
             f"firewall-cmd --permanent --zone={shlex.quote(zone)} --list-interfaces",
             check_exit_code=False,
         )
-        interface_list: List[str] = []
+        current_interfaces: List[str] = []
         if interfaces_exit == 0:
-            interface_list = [entry.strip() for entry in (interfaces_stdout or "").split() if entry.strip()]
+            current_interfaces = [
+                entry.strip()
+                for entry in (interfaces_stdout or "").split()
+                if entry.strip()
+            ]
         elif interfaces_err:
             LOGGER.debug("Failed to list firewalld interfaces for zone '%s': %s", zone, interfaces_err.strip())
+        desired_interfaces = None
+        if zone_interface_overrides:
+            desired_interfaces = zone_interface_overrides.get(zone)
+        current_interface_set: Set[str] = {iface for iface in current_interfaces if iface}
+        if desired_interfaces is not None:
+            desired_clean = [
+                iface.strip()
+                for iface in desired_interfaces
+                if iface and iface.strip()
+            ]
+            desired_set: Set[str] = set(desired_clean)
+            if desired_set != current_interface_set:
+                if _ensure_zone_backup():
+                    extras = sorted(current_interface_set - desired_set)
+                    for interface_name in extras:
+                        remove_exit, _, remove_err = guest_executor(
+                            f"firewall-cmd --permanent --zone={shlex.quote(zone)} "
+                            f"--remove-interface={shlex.quote(interface_name)}",
+                            check_exit_code=False,
+                        )
+                        if remove_exit != 0:
+                            LOGGER.debug(
+                                "Failed to detach interface '%s' from zone '%s': %s",
+                                interface_name,
+                                zone,
+                                (remove_err or "").strip() or remove_exit,
+                            )
+                            overall_success = False
+                        else:
+                            current_interface_set.discard(interface_name)
+                            zone_changed = True
+                    missing_interfaces = [
+                        iface for iface in desired_clean if iface not in current_interface_set
+                    ]
+                    for interface_name in missing_interfaces:
+                        add_exit, _, add_err = guest_executor(
+                            f"firewall-cmd --permanent --zone={shlex.quote(zone)} "
+                            f"--add-interface={shlex.quote(interface_name)}",
+                            check_exit_code=False,
+                        )
+                        if add_exit != 0:
+                            LOGGER.debug(
+                                "Failed to attach interface '%s' to zone '%s': %s",
+                                interface_name,
+                                zone,
+                                (add_err or "").strip() or add_exit,
+                            )
+                            overall_success = False
+                        else:
+                            current_interface_set.add(interface_name)
+                            zone_changed = True
+                else:
+                    overall_success = False
+            current_interfaces = list(current_interface_set)
+        else:
+            for interface_name in current_interfaces:
+                if not interface_name:
+                    continue
+                query_iface_exit, _, _ = guest_executor(
+                    f"firewall-cmd --permanent --zone={shlex.quote(zone)} "
+                    f"--query-interface={shlex.quote(interface_name)}",
+                    check_exit_code=False,
+                )
+                if query_iface_exit != 0:
+                    if _ensure_zone_backup():
+                        add_iface_exit, _, add_iface_err = guest_executor(
+                            f"firewall-cmd --permanent --zone={shlex.quote(zone)} "
+                            f"--add-interface={shlex.quote(interface_name)}",
+                            check_exit_code=False,
+                        )
+                        if add_iface_exit == 0:
+                            zone_changed = True
+                        else:
+                            LOGGER.debug(
+                                "Failed to reattach interface '%s' to zone '%s': %s",
+                                interface_name,
+                                zone,
+                                (add_iface_err or "").strip() or add_iface_exit,
+                            )
+                            overall_success = False
 
         # Synchronise sources
         sources_exit, sources_stdout, sources_err = guest_executor(
@@ -1093,7 +1255,6 @@ def _sync_firewalld_configuration_to_prd(guest_executor, timestamp: str) -> bool
                     continue
             zone_changed = True
 
-        # Remove SSH rich rule from zones where it should not exist
         if zone.lower() in {"heartbeat"}:
             restricted_rule = f"rule family=\"ipv4\" source address=\"{SSH_ALLOWED_SOURCE_IP}\" service name=\"ssh\" accept"
             query_cmd = (
@@ -1119,32 +1280,6 @@ def _sync_firewalld_configuration_to_prd(guest_executor, timestamp: str) -> bool
                         zone_changed = True
                         if zone not in zones_updated:
                             zones_updated.append(zone)
-        # Ensure captured interfaces remain assigned to the zone
-        for interface_name in interface_list:
-            if not interface_name:
-                continue
-            query_iface_exit, _, _ = guest_executor(
-                f"firewall-cmd --permanent --zone={shlex.quote(zone)} "
-                f"--query-interface={shlex.quote(interface_name)}",
-                check_exit_code=False,
-            )
-            if query_iface_exit != 0:
-                if _ensure_zone_backup():
-                    add_iface_exit, _, add_iface_err = guest_executor(
-                        f"firewall-cmd --permanent --zone={shlex.quote(zone)} "
-                        f"--add-interface={shlex.quote(interface_name)}",
-                        check_exit_code=False,
-                    )
-                    if add_iface_exit == 0:
-                        zone_changed = True
-                    else:
-                        LOGGER.debug(
-                            "Failed to reattach interface '%s' to zone '%s': %s",
-                            interface_name,
-                            zone,
-                            (add_iface_err or "").strip() or add_iface_exit,
-                        )
-                        overall_success = False
         if zone_changed and zone not in zones_updated:
             zones_updated.append(zone)
 
@@ -1404,14 +1539,19 @@ def _sync_iptables_configuration_to_prd(guest_executor, timestamp: str) -> bool:
     return True
 
 
-def _sync_prd_system_configuration(guest_executor) -> bool:
+def _sync_prd_system_configuration(
+    guest_executor,
+    source_zone_interfaces: Optional[Dict[str, List[str]]] = None,
+) -> bool:
     """Synchronise hosts and firewall configurations inside the guest with PRD expectations."""
     print("   -> Synchronising guest hosts and firewall configuration with PRD mappings...")
     timestamp = datetime.now().strftime("%Y%m%d")
     success = True
+    if not _ensure_http_proxy_configuration(guest_executor, timestamp):
+        success = False
     if not _sync_hosts_file_to_prd(guest_executor, timestamp):
         success = False
-    if not _sync_firewalld_configuration_to_prd(guest_executor, timestamp):
+    if not _sync_firewalld_configuration_to_prd(guest_executor, timestamp, source_zone_interfaces):
         success = False
     if not _sync_ntp_configuration_to_prd(guest_executor, timestamp):
         success = False
@@ -1421,8 +1561,6 @@ def _sync_prd_system_configuration(guest_executor) -> bool:
         success = False
     if not _sync_iptables_configuration_to_prd(guest_executor, timestamp):
         success = False
-    if not _ensure_http_proxy_configuration(guest_executor, timestamp):
-        success = False
     return success
 
 
@@ -1431,13 +1569,21 @@ def _ensure_http_proxy_configuration(guest_executor, timestamp: str) -> bool:
     proxy_url = "http://172.16.162.6:3128"
     profile_path = "/etc/profile"
     backup_path = f"{profile_path}-{timestamp}.bak"
-    profile_exit, profile_content, profile_err = guest_executor(
-        f"cat {shlex.quote(profile_path)}",
+    exists_exit, _, _ = guest_executor(
+        f"test -f {shlex.quote(profile_path)}",
         check_exit_code=False,
     )
-    if profile_exit != 0:
-        print(f"   [WARN] Unable to read {profile_path}: {(profile_err or '').strip() or profile_exit}")
-        return False
+    profile_exists = exists_exit == 0
+    if profile_exists:
+        profile_exit, profile_content, profile_err = guest_executor(
+            f"cat {shlex.quote(profile_path)}",
+            check_exit_code=False,
+        )
+        if profile_exit != 0:
+            print(f"   [WARN] Unable to read {profile_path}: {(profile_err or '').strip() or profile_exit}")
+            return False
+    else:
+        profile_content = ""
     proxy_lines = [
         f"export http_proxy={proxy_url}",
         f"export https_proxy={proxy_url}",
@@ -1523,6 +1669,7 @@ class WorkflowState:
     original_static_routes: List[Dict[str, Any]] = field(default_factory=list)
     prd_static_routes: List[Dict[str, Any]] = field(default_factory=list)
     sdk_network_client: Optional[VsphereGuestNetworkSDKType] = None
+    source_firewalld_zone_interfaces: Dict[str, List[str]] = field(default_factory=dict)
     source_keepalive_handle: Optional[Tuple[threading.Thread, threading.Event]] = None
     dest_keepalive_handle: Optional[Tuple[threading.Thread, threading.Event]] = None
     target_datastore: Optional[Any] = None
@@ -1537,6 +1684,7 @@ class SourceVmDetails:
     default_gateway_source: Optional[str]
     default_gateway_owner_idx: Optional[int]
     static_routes: List[Dict[str, Any]]
+    firewalld_zone_interfaces: Dict[str, List[str]]
 
 
 def collect_source_vm_metadata(
@@ -1707,6 +1855,7 @@ def collect_source_vm_metadata(
         LOGGER.debug("NICs without IPv4 info from guest tools: %s", missing_ipv4_macs)
 
     source_interface_names: Dict[str, str] = {}
+    firewalld_zone_interfaces: Dict[str, List[str]] = {}
     guest_operations_manager = getattr(content, "guestOperationsManager", None)
     if nic_plans and guest_operations_manager:
         try:
@@ -1751,6 +1900,61 @@ def collect_source_vm_metadata(
                     mac_lower = (nic_plan.get("mac_address") or "").strip().lower()
                     if mac_lower and mac_lower in source_interface_names:
                         nic_plan["original_ifname"] = source_interface_names[mac_lower]
+
+            def _collect_firewalld_zone_interfaces() -> Dict[str, List[str]]:
+                mapping: Dict[str, List[str]] = {}
+                check_exit, _, _ = source_guest_command_executor(
+                    "command -v firewall-cmd",
+                    check_exit_code=False,
+                )
+                if check_exit != 0:
+                    return mapping
+                if not _is_service_active(source_guest_command_executor, "firewalld"):
+                    return mapping
+                zone_names: Set[str] = set()
+                zones_exit, zones_stdout, _ = source_guest_command_executor(
+                    "firewall-cmd --get-zones",
+                    check_exit_code=False,
+                )
+                if zones_exit == 0 and zones_stdout:
+                    for token in zones_stdout.split():
+                        token_clean = token.strip()
+                        if token_clean:
+                            zone_names.add(token_clean)
+                if not zone_names:
+                    dir_exit, dir_stdout, _ = source_guest_command_executor(
+                        "ls /etc/firewalld/zones",
+                        check_exit_code=False,
+                    )
+                    if dir_exit == 0 and dir_stdout:
+                        for line in dir_stdout.splitlines():
+                            candidate = line.strip()
+                            if candidate.endswith(".xml"):
+                                zone_names.add(candidate[:-4])
+                if not zone_names:
+                    return mapping
+                for zone_name in sorted(zone_names):
+                    list_exit, list_stdout, list_err = source_guest_command_executor(
+                        f"firewall-cmd --permanent --zone={shlex.quote(zone_name)} --list-interfaces",
+                        check_exit_code=False,
+                    )
+                    if list_exit != 0:
+                        if list_err:
+                            LOGGER.debug(
+                                "Failed to read firewalld interfaces for zone '%s': %s",
+                                zone_name,
+                                list_err.strip(),
+                            )
+                        continue
+                    interfaces = [
+                        entry.strip()
+                        for entry in (list_stdout or "").split()
+                        if entry.strip()
+                    ]
+                    mapping[zone_name] = interfaces
+                return mapping
+
+            firewalld_zone_interfaces = _collect_firewalld_zone_interfaces()
         finally:
             reset_root_login_disabled()
 
@@ -1948,6 +2152,7 @@ def collect_source_vm_metadata(
         default_gateway_source=original_default_gateway_source,
         default_gateway_owner_idx=default_gateway_owner_idx,
         static_routes=original_static_routes,
+        firewalld_zone_interfaces=firewalld_zone_interfaces,
     )
 
 
@@ -2082,6 +2287,10 @@ class CloneAndVmotionWorkflow:
         state.original_default_gateway_source = details.default_gateway_source
         state.default_gateway_owner_idx = details.default_gateway_owner_idx
         state.original_static_routes = [dict(route) for route in details.static_routes]
+        state.source_firewalld_zone_interfaces = {
+            zone: list(interfaces)
+            for zone, interfaces in details.firewalld_zone_interfaces.items()
+        }
 
         datastore_view = self.content_source.viewManager.CreateContainerView(
             self.content_source.rootFolder,
@@ -2453,6 +2662,9 @@ class CloneAndVmotionWorkflow:
 def main() -> None:
     global GUEST_ROOT_PWD, GUEST_ADMIN_PWD
 
+    cli_args = _parse_cli_arguments()
+    provided_source_vm_name = (cli_args.source_vm_name or "").strip()
+
     # ------------------------------------------------
     # 1. Enter passwords
     # ------------------------------------------------
@@ -2461,6 +2673,8 @@ def main() -> None:
         VCSA_PWD_DEST = getpass.getpass(f"Password for {VCSA_USER} on {VCSA_HOST_DEST}: ")
     except (EOFError, KeyboardInterrupt) as error:
         print('ERROR:', error)
+        log_failure(f"Credential prompt interrupted: {error}")
+        _print_execution_summary()
         sys.exit(1)
     reset_root_login_disabled()
 
@@ -2474,10 +2688,16 @@ def main() -> None:
     # ------------------------------------------------
     # 3. Collect target VM name and guest credentials
     # ------------------------------------------------
-    input_target_vm_name = input("Enter the name of the VM to clone: ")
+    input_target_vm_name = provided_source_vm_name
     if not input_target_vm_name:
-        print("No VM name provided. Aborting processing.")
-        sys.exit(0)
+        input_target_vm_name = input("Enter the name of the VM to clone: ").strip()
+        if not input_target_vm_name:
+            print("No VM name provided. Aborting processing.")
+            log_failure("No VM name provided.")
+            _print_execution_summary()
+            sys.exit(0)
+    else:
+        print(f"Using source VM '{input_target_vm_name}' provided via CLI argument.")
     try:
         GUEST_ROOT_PWD = getpass.getpass(f"Password for Guest OS user '{GUEST_ROOT_USER}': ")
         GUEST_ADMIN_PWD = getpass.getpass(
@@ -2485,6 +2705,8 @@ def main() -> None:
         )
     except (EOFError, KeyboardInterrupt) as error:
         print('ERROR:', error)
+        log_failure(f"Guest credential prompt interrupted: {error}")
+        _print_execution_summary()
         sys.exit(1)
 
     # ------------------------------------------------
@@ -2503,6 +2725,7 @@ def main() -> None:
     original_default_gateway: str | None = None
     original_default_gateway_source: str | None = None
     original_static_routes: List[Dict[str, Any]] = []
+    source_firewalld_zone_interfaces: Dict[str, List[str]] = {}
     si_source = None
     content_source = None
     si_dest = None
@@ -2555,6 +2778,10 @@ def main() -> None:
         default_gateway_owner_idx = source_details.default_gateway_owner_idx
         original_static_routes = [dict(route) for route in source_details.static_routes]
         source_dns_servers = list(source_details.dns_servers)
+        source_firewalld_zone_interfaces = {
+            zone: list(interfaces)
+            for zone, interfaces in source_details.firewalld_zone_interfaces.items()
+        }
         datastore_view = content_source.viewManager.CreateContainerView(
             content_source.rootFolder,
             [vim.Datastore],
@@ -3530,7 +3757,10 @@ def main() -> None:
                         applied_static_routes.copy(),
                         expected_dns_servers[:] if expected_dns_servers else []
                     ))
-            if not _sync_prd_system_configuration(guest_command_executor):
+            if not _sync_prd_system_configuration(
+                guest_command_executor,
+                source_firewalld_zone_interfaces,
+            ):
                 workflow_had_warnings = True
             ensure_firewall_allows_ssh(guest_command_executor, SSH_ALLOWED_SOURCE_IP)
             print("   [OK] Completed IP configuration for all NICs.")
@@ -3871,6 +4101,7 @@ def main() -> None:
         else:
             final_message = "Processing finished."
         print(final_message)
+        _print_execution_summary()
 
 if __name__ == "__main__":
     main()
