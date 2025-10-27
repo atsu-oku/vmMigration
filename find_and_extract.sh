@@ -23,6 +23,12 @@ OUTPUT_DIR="/tmp/${USER:-nobody}/${SCRIPT_NAME_BASENAME}"
 mkdir -p "${OUTPUT_DIR}" || { echo "Error: cannot create ${OUTPUT_DIR}" >&2; exit 1; }
 # 作成したディレクトリのパーミッションを700に設定し、所有者のみがアクセスできるようにする
 chmod 700 "${OUTPUT_DIR}" 2>/dev/null || true
+# ファイル読み込み時の安全基準
+MAX_ALLOWED_FILE_SIZE_BYTES=$((1024 * 1024))
+FILE_CMD_AVAILABLE=0
+if command -v file >/dev/null 2>&1; then
+    FILE_CMD_AVAILABLE=1
+fi
 # =====================================================================
 
 # --- 初期ロケール設定と復元準備 ---
@@ -33,21 +39,17 @@ ORIGINAL_LC_ALL="${LC_ALL:-}"
 # --- 一時ファイル変数 ---
 # スクリプト全体で使用する一時ファイルのパスを保持する変数を初期化
 CURRENT_INFRA_HITS_TEMP=""
-NEW_INFRA_HITS_TEMP=""
-NEW_INFRA_STG_HITS_TEMP=""
-NEW_INFRA_PROD_HITS_TEMP=""
-NEW_INFRA_OTHER_HITS_TEMP=""
-BOTH_HITS_TEMP=""
+NEW_STG_HITS_TEMP=""
+NEW_PRD_HITS_TEMP=""
+OTHER_HITS_TEMP=""
 PERMISSION_CHECK_TEST_FILE_TEMP=""
 
 # --- 後片付け関数 ---
 # スクリプト終了時に呼び出され、作成した一時ファイルをすべて削除する
 cleanup() {
-    rm -f "$CURRENT_INFRA_HITS_TEMP" "$NEW_INFRA_HITS_TEMP" \
-          "$NEW_INFRA_STG_HITS_TEMP" "$NEW_INFRA_PROD_HITS_TEMP" "$NEW_INFRA_OTHER_HITS_TEMP" \
-          "$BOTH_HITS_TEMP" "$PERMISSION_CHECK_TEST_FILE_TEMP" 2>/dev/null
-    # サマリー表示用に生成される中間ファイルも削除
-    rm -f "$NEW_INFRA_OTHER_HITS_TEMP.final" "$NEW_INFRA_OTHER_HITS_TEMP.paths" "$NEW_INFRA_OTHER_HITS_TEMP.finalpaths" 2>/dev/null
+    rm -f "$CURRENT_INFRA_HITS_TEMP" "$NEW_STG_HITS_TEMP" \
+          "$NEW_PRD_HITS_TEMP" "$OTHER_HITS_TEMP" \
+          "$PERMISSION_CHECK_TEST_FILE_TEMP" 2>/dev/null
     for temp_path in "${TRANSFORM_TEMP_PATHS[@]}"; do
         if [ -n "$temp_path" ]; then
             rm -f "$temp_path" 2>/dev/null
@@ -64,6 +66,22 @@ cleanup() {
 }
 # trapコマンドは、一時ファイルが確実に作成された後に設定する
 
+force_exit() {
+    printf "\n%s\n" "$MSG_INTERRUPT_FORCED"
+    cleanup
+    exit 130
+}
+
+handle_interrupt() {
+    if [ "${CANCEL_REQUESTED:-0}" -eq 0 ]; then
+        CANCEL_REQUESTED=1
+        printf "\n%s\n" "$MSG_INTERRUPT_RECEIVED"
+        trap force_exit INT
+    else
+        force_exit
+    fi
+}
+
 # --- ロケール設定 ---
 # grepやsortの挙動を安定させるため、ロケールをC(ASCII)に設定
 export LC_ALL=C
@@ -79,6 +97,7 @@ if [[ "$ORIGINAL_LANG" == ja_JP* ]]; then
     MSG_VERBOSE_PREFIX="[詳細] "
     MSG_VERBOSE_SCANNING_FILE="ファイルをスキャン中: "
     MSG_VERBOSE_SKIPPING_BACKUP_FILE="バックアップファイルをスキップ: "
+    MSG_VERBOSE_SKIPPING_BINARY_FILE="バイナリまたはサイズ超過のファイルをスキップ: "
     MSG_SUMMARY_TOTAL_FILES_SCANNED="スキャンした総ファイル数: %d"
     MSG_ERROR_PREFIX="エラー: "
     MSG_ERROR_BASH_VERSION_TOO_LOW="このスクリプトの実行にはBashバージョン %s.0 以上が必要です。現在のバージョンは %s.%s です。\n"
@@ -93,8 +112,10 @@ if [[ "$ORIGINAL_LANG" == ja_JP* ]]; then
     MSG_EXECUTION_DATETIME_LABEL="実行日時:"
     MSG_SEARCH_START="検索を開始します..."
     MSG_SEARCH_PATH_LABEL="検索対象パス: "
-    MSG_NEW_INFRA_LOG_FILE_LABEL="新基盤定義ログファイル: "
     MSG_CURRENT_INFRA_LOG_FILE_LABEL="現行基盤定義ログファイル: "
+    MSG_NEW_STG_LOG_FILE_LABEL="新基盤STG定義ログファイル: "
+    MSG_NEW_PRD_LOG_FILE_LABEL="新基盤PRD定義ログファイル: "
+    MSG_OTHER_LOG_FILE_LABEL="その他定義ログファイル: "
     MSG_LOG_GENERATED_LOCATION="ログの出力先： ${OUTPUT_DIR}"
     MSG_LOG_DELETE_MODE="ログファイル削除モードです。"
     MSG_LOG_DELETE_NOT_FOUND="削除対象のログファイルは見つかりませんでした。"
@@ -104,6 +125,9 @@ if [[ "$ORIGINAL_LANG" == ja_JP* ]]; then
     MSG_LOG_DELETE_FAILED="エラー: %s の削除に失敗しました。\n"
     MSG_LOG_DELETE_COMPLETED="ログファイルの削除処理が完了しました。"
     MSG_LOG_DELETE_CANCELLED="ログファイルの削除はキャンセルされました。"
+    MSG_INTERRUPT_RECEIVED="中断要求を受け付けました。後処理を行います..."
+    MSG_INTERRUPT_FORCED="強制終了します。"
+    MSG_OPERATION_CANCELLED="処理を中断しました。"
     MSG_DELETELLOGS_NOT_ALLOWED="--deletelogs は transform サブコマンドでは使用できません。"
     MSG_ERROR_APPLY_ONLY_TRANSFORM="--apply は transform サブコマンドでのみ利用できます。"
     MSG_ERROR_DRY_RUN_ONLY_TRANSFORM="--dry-run は transform サブコマンドでのみ利用できます。"
@@ -140,17 +164,20 @@ if [[ "$ORIGINAL_LANG" == ja_JP* ]]; then
     MSG_ERROR_ROLLBACK_FILE_OPTION="--file は rollback サブコマンドでのみ使用できます。"
     MSG_ROLLBACK_TARGET_NOT_FOUND="ロールバック対象がログに見つかりません: %s"
     MSG_SEARCH_COMPLETED_PRIMARY="検索が完了しました。"
-    MSG_CHECK_NEW_INFRA_LOG="新基盤の定義に関するログは %s を確認してください。\n"
+    MSG_CHECK_NEW_STG_LOG="新基盤 STG の定義に関するログは %s を確認してください。\n"
+    MSG_CHECK_NEW_PRD_LOG="新基盤 PRD の定義に関するログは %s を確認してください。\n"
+    MSG_CHECK_OTHER_LOG="その他の定義に関するログは %s を確認してください。\n"
     MSG_CHECK_CURRENT_INFRA_LOG="現行基盤の定義に関するログは %s を確認してください。\n"
     MSG_CURRENT_INFRA_HITS_HEADER="--- 現行基盤の定義を含むファイル ---"
-    MSG_NEW_INFRA_HITS_HEADER_STG="--- 新基盤の定義を含むファイル (Staging ホスト名) ---"
-    MSG_NEW_INFRA_HITS_HEADER_PROD="--- 新基盤の定義を含むファイル (Production ホスト名) ---"
-    MSG_NEW_INFRA_HITS_HEADER_BY_COND="--- 新基盤の定義を含むファイル (%s) ---"
-    MSG_BOTH_LOGS_HITS_HEADER="--- 注意: 以下のファイルは現行・新基盤の両方の定義を含んでいます ---"
+    MSG_NEW_STG_HITS_HEADER="--- 新基盤 STG の定義を含むファイル ---"
+    MSG_NEW_PRD_HITS_HEADER="--- 新基盤 PRD の定義を含むファイル ---"
+    MSG_OTHER_HITS_HEADER="--- その他の定義を含むファイル ---"
     MSG_NO_HITS="該当なし"
     MSG_FILE_LABEL="ファイル: "
     MSG_CONDITION_LABEL_CURRENT="条件(現行基盤)"
-    MSG_CONDITION_LABEL_NEW="条件(新基盤)"
+    MSG_CONDITION_LABEL_NEW_STG="条件(新基盤 STG)"
+    MSG_CONDITION_LABEL_NEW_PRD="条件(新基盤 PRD)"
+    MSG_CONDITION_LABEL_OTHER="条件(その他)"
     MSG_IP_CONDITION_CURRENT_DESC="IPアドレス (現行)"
     MSG_IP_AWS_CONDITION_CURRENT_DESC="IPアドレス (AWS)"
     MSG_ENV_CONDITION_CURRENT_DESC="環境文字列 (現行)"
@@ -158,10 +185,23 @@ if [[ "$ORIGINAL_LANG" == ja_JP* ]]; then
     MSG_IPTP_CONDITION_CURRENT_DESC="文字列 \"iptp\""
     MSG_PFS_CONDITION_CURRENT_DESC="文字列 \"pfs01\" または \"pfs02\""
     MSG_CONV_CONDITION_CURRENT_DESC="文字列 \"dconv\""
+    MSG_IP_CONDITION_NEW_STG_DESC="IPアドレス (新STG)"
+    MSG_ENV_CONDITION_NEW_STG_DESC="環境文字列 \"newstaging\""
+    MSG_HOSTNAME_S_CONDITION_NEW_DESC="ホスト名サフィックス \"s\""
+    MSG_TOKEN_STG_CONDITION_NEW_DESC="文字列 \"stg\""
+    MSG_IP_CONDITION_NEW_PRD_DESC="IPアドレス (新PRD)"
+    MSG_ENV_CONDITION_NEW_PRD_DESC="環境文字列 \"newproduction\""
+    MSG_HOSTNAME_P_CONDITION_NEW_DESC="ホスト名サフィックス \"p\""
+    MSG_HOSTNAME_GIT_CTRL_CONDITION_NEW_DESC="ホスト名 \"git\" (末尾 \"c\")"
+    MSG_TOKEN_PRD_CONDITION_NEW_DESC="文字列 \"prd\""
     MSG_CONV_CONDITION_NEW_DESC="文字列 \"conv0\""
-    MSG_IP_CONDITION_NEW_DESC="IPアドレス (新)"
-    MSG_HOSTNAME_STG_CONDITION_NEW_DESC="新ホスト名 (Staging)"
-    MSG_HOSTNAME_PROD_CONDITION_NEW_DESC="新ホスト名 (Production)"
+    MSG_IP_AWS_CONDITION_DESC="IPアドレス (AWS)"
+    MSG_IP_TOYOSU_CONDITION_DESC="IPアドレス (Toyosu)"
+    MSG_IP_SUBNET_WS2_DESC="IPアドレス (WS2)"
+    MSG_IP_REGIONAL_1_DESC="IPアドレス (Regional 44)"
+    MSG_IP_REGIONAL_2_DESC="IPアドレス (Regional 172)"
+    MSG_IP_REGIONAL_3_DESC="IPアドレス (Regional 33)"
+    MSG_IP_INFRA_CONDITION_DESC="IPアドレス (Infra 174)"
     MSG_ENV_CONDITION_NEW_DESC="環境文字列 (新)"
     MSG_IPETFS_CONDITION_NEW_DESC="文字列 \"ipet-fs\""
     MSG_COMMENT_IGNORED_LABEL="(コメント行(#)は無視)"
@@ -180,6 +220,7 @@ else
     MSG_VERBOSE_PREFIX="[VERBOSE] "
     MSG_VERBOSE_SCANNING_FILE="Scanning file: "
     MSG_VERBOSE_SKIPPING_BACKUP_FILE="Skipping backup file: "
+    MSG_VERBOSE_SKIPPING_BINARY_FILE="Skipping binary/oversized file: "
     MSG_SUMMARY_TOTAL_FILES_SCANNED="Total files scanned: %d"
     MSG_ERROR_PREFIX="Error: "
     MSG_ERROR_BASH_VERSION_TOO_LOW="This script requires Bash version %s.0 or higher. Your version is %s.%s.\n"
@@ -194,8 +235,10 @@ else
     MSG_EXECUTION_DATETIME_LABEL="Execution Datetime:"
     MSG_SEARCH_START="Starting search..."
     MSG_SEARCH_PATH_LABEL="Search Path: "
-    MSG_NEW_INFRA_LOG_FILE_LABEL="New Infra Defs Log: "
     MSG_CURRENT_INFRA_LOG_FILE_LABEL="Current Infra Defs Log: "
+    MSG_NEW_STG_LOG_FILE_LABEL="New Infra (STG) Log:"
+    MSG_NEW_PRD_LOG_FILE_LABEL="New Infra (PRD) Log:"
+    MSG_OTHER_LOG_FILE_LABEL="Other Matches Log:"
     MSG_LOG_GENERATED_LOCATION="(generated in ${OUTPUT_DIR})"
     MSG_LOG_DELETE_MODE="Log file deletion mode."
     MSG_LOG_DELETE_NOT_FOUND="No log files found to delete."
@@ -205,6 +248,9 @@ else
     MSG_LOG_DELETE_FAILED="Error: Failed to delete %s.\n"
     MSG_LOG_DELETE_COMPLETED="Log file deletion process completed."
     MSG_LOG_DELETE_CANCELLED="Log file deletion cancelled."
+    MSG_INTERRUPT_RECEIVED="Interrupt received. Cleaning up..."
+    MSG_INTERRUPT_FORCED="Force exiting."
+    MSG_OPERATION_CANCELLED="Operation cancelled."
     MSG_DELETELLOGS_NOT_ALLOWED="--deletelogs cannot be used with the transform subcommand."
     MSG_ERROR_APPLY_ONLY_TRANSFORM="--apply is available only with the transform subcommand."
     MSG_ERROR_DRY_RUN_ONLY_TRANSFORM="--dry-run is available only with the transform subcommand."
@@ -241,17 +287,20 @@ else
     MSG_ERROR_ROLLBACK_FILE_OPTION="--file is only available with the rollback subcommand."
     MSG_ROLLBACK_TARGET_NOT_FOUND="Rollback target not found in the log: %s"
     MSG_SEARCH_COMPLETED_PRIMARY="Search completed."
-    MSG_CHECK_NEW_INFRA_LOG="For new infrastructure definitions, please check: %s\n"
+    MSG_CHECK_NEW_STG_LOG="For new STG definitions, please check: %s\n"
+    MSG_CHECK_NEW_PRD_LOG="For new PRD definitions, please check: %s\n"
+    MSG_CHECK_OTHER_LOG="For other findings, please check: %s\n"
     MSG_CHECK_CURRENT_INFRA_LOG="For current infrastructure definitions, please check: %s\n"
     MSG_CURRENT_INFRA_HITS_HEADER="--- Files with Current Infrastructure Definitions ---"
-    MSG_NEW_INFRA_HITS_HEADER_STG="--- Files with New Infrastructure Definitions (Staging Hostnames) ---"
-    MSG_NEW_INFRA_HITS_HEADER_PROD="--- Files with New Infrastructure Definitions (Production Hostnames) ---"
-    MSG_NEW_INFRA_HITS_HEADER_BY_COND="--- Files with New Infrastructure Definitions (%s) ---"
-    MSG_BOTH_LOGS_HITS_HEADER="--- Warning: The following files contain definitions for both current and new infrastructures ---"
+    MSG_NEW_STG_HITS_HEADER="--- Files with New Infrastructure Definition (STG) ---"
+    MSG_NEW_PRD_HITS_HEADER="--- Files with New Infrastructure Definition (PRD) ---"
+    MSG_OTHER_HITS_HEADER="--- Files with Other Notable Definitions ---"
     MSG_NO_HITS="None"
     MSG_FILE_LABEL="File: "
     MSG_CONDITION_LABEL_CURRENT="Condition(Current Infra)"
-    MSG_CONDITION_LABEL_NEW="Condition(New Infra)"
+    MSG_CONDITION_LABEL_NEW_STG="Condition(New Infra STG)"
+    MSG_CONDITION_LABEL_NEW_PRD="Condition(New Infra PRD)"
+    MSG_CONDITION_LABEL_OTHER="Condition(Other)"
     MSG_IP_CONDITION_CURRENT_DESC="IP Address (Current)"
     MSG_IP_AWS_CONDITION_CURRENT_DESC="IP Address (AWS)"
     MSG_ENV_CONDITION_CURRENT_DESC="Environment string (Current)"
@@ -259,10 +308,23 @@ else
     MSG_IPTP_CONDITION_CURRENT_DESC="String \"iptp\""
     MSG_PFS_CONDITION_CURRENT_DESC="String \"pfs01\" or \"pfs02\""
     MSG_CONV_CONDITION_CURRENT_DESC="String \"dconv\""
+    MSG_IP_CONDITION_NEW_STG_DESC="IP Address (New STG)"
+    MSG_ENV_CONDITION_NEW_STG_DESC="Environment string \"newstaging\""
+    MSG_HOSTNAME_S_CONDITION_NEW_DESC="Hostname suffix \"s\""
+    MSG_TOKEN_STG_CONDITION_NEW_DESC="Token \"stg\""
+    MSG_IP_CONDITION_NEW_PRD_DESC="IP Address (New PRD)"
+    MSG_ENV_CONDITION_NEW_PRD_DESC="Environment string \"newproduction\""
+    MSG_HOSTNAME_P_CONDITION_NEW_DESC="Hostname suffix \"p\""
+    MSG_HOSTNAME_GIT_CTRL_CONDITION_NEW_DESC="Hostname \"git\" with suffix \"c\""
+    MSG_TOKEN_PRD_CONDITION_NEW_DESC="Token \"prd\""
     MSG_CONV_CONDITION_NEW_DESC="String \"conv0\""
-    MSG_IP_CONDITION_NEW_DESC="IP Address (New)"
-    MSG_HOSTNAME_STG_CONDITION_NEW_DESC="New Hostname (Staging)"
-    MSG_HOSTNAME_PROD_CONDITION_NEW_DESC="New Hostname (Production)"
+    MSG_IP_AWS_CONDITION_DESC="IP Address (AWS)"
+    MSG_IP_TOYOSU_CONDITION_DESC="IP Address (Toyosu)"
+    MSG_IP_SUBNET_WS2_DESC="IP Address (WS2)"
+    MSG_IP_REGIONAL_1_DESC="IP Address (Regional 44)"
+    MSG_IP_REGIONAL_2_DESC="IP Address (Regional 172)"
+    MSG_IP_REGIONAL_3_DESC="IP Address (Regional 33)"
+    MSG_IP_INFRA_CONDITION_DESC="IP Address (Infra 174)"
     MSG_ENV_CONDITION_NEW_DESC="Environment string (New)"
     MSG_IPETFS_CONDITION_NEW_DESC="String \"ipet-fs\""
     MSG_COMMENT_IGNORED_LABEL="(comments ignored (#))"
@@ -273,6 +335,20 @@ else
     SEPARATOR_LINE_LONG="================================================================================"
     SEPARATOR_LINE_SHORT="--------------------------------------------------------------------------------"
 fi
+
+if [[ "$ORIGINAL_LANG" == ja_JP* ]]; then
+    MSG_TRANSFORM_ASIS_HEADER="--- As-Is (%s) ---"
+    MSG_TRANSFORM_TOBE_HEADER="--- To-Be (%s) ---"
+    MSG_TRANSFORM_DIFF_LOG_SAVED="As-Is/To-Be のログを %s に出力しました。"
+else
+    MSG_TRANSFORM_ASIS_HEADER="--- As-Is (%s) ---"
+    MSG_TRANSFORM_TOBE_HEADER="--- To-Be (%s) ---"
+    MSG_TRANSFORM_DIFF_LOG_SAVED="As-Is/To-Be output written to %s."
+fi
+
+CANCEL_REQUESTED=0
+trap handle_interrupt INT
+trap cleanup EXIT TERM
 
 # --- オプションと引数処理 ---
 DELETE_LOGS_MODE=0
@@ -397,6 +473,11 @@ else
     fi
 fi
 
+LIMIT_VAR_CONFIG=0
+if [[ "$SEARCH_PATH" == /var || "$SEARCH_PATH" == /var/ || "$SEARCH_PATH" == /var/* ]]; then
+    LIMIT_VAR_CONFIG=1
+fi
+
 
 # --- 書き込み権限チェック関数 ---
 # スクリプトが出力ディレクトリに書き込み可能かを確認する
@@ -417,14 +498,28 @@ if [ "$DELETE_LOGS_MODE" -eq 1 ]; then
     HOSTNAME_VAR=$(hostname)
     TIMESTAMP_PATTERN_GLOB="[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9]"
     # 削除対象のログファイル名のパターンを定義
-    LOG_PATTERN_NEW_GLOB="${HOSTNAME_VAR}_${TIMESTAMP_PATTERN_GLOB}_new_infra.log"
     LOG_PATTERN_CURRENT_GLOB="${HOSTNAME_VAR}_${TIMESTAMP_PATTERN_GLOB}_current_infra.log"
+    LOG_PATTERN_NEW_STG_GLOB="${HOSTNAME_VAR}_${TIMESTAMP_PATTERN_GLOB}_new_infra_stg.log"
+    LOG_PATTERN_NEW_PRD_GLOB="${HOSTNAME_VAR}_${TIMESTAMP_PATTERN_GLOB}_new_infra_prd.log"
+    LOG_PATTERN_OTHER_GLOB="${HOSTNAME_VAR}_${TIMESTAMP_PATTERN_GLOB}_other.log"
+    LOG_PATTERN_LEGACY_NEW_GLOB="${HOSTNAME_VAR}_${TIMESTAMP_PATTERN_GLOB}_new_infra.log"
     declare -a files_to_delete=()
+    declare -A log_candidate_seen=()
+    declare -a log_glob_patterns=(
+        "$LOG_PATTERN_CURRENT_GLOB"
+        "$LOG_PATTERN_NEW_STG_GLOB"
+        "$LOG_PATTERN_NEW_PRD_GLOB"
+        "$LOG_PATTERN_OTHER_GLOB"
+        "$LOG_PATTERN_LEGACY_NEW_GLOB"
+    )
     # findコマンドでパターンに一致するログファイルを検索
-    find "${OUTPUT_DIR}" -maxdepth 1 -type f \
-         \( -name "$LOG_PATTERN_NEW_GLOB" -o -name "$LOG_PATTERN_CURRENT_GLOB" \) \
-         -print0 | while IFS= read -r -d '' file; do
-        files_to_delete+=("$file")
+    for glob_pattern in "${log_glob_patterns[@]}"; do
+        while IFS= read -r -d '' file; do
+            if [ -z "${log_candidate_seen["$file"]}" ]; then
+                files_to_delete+=("$file")
+                log_candidate_seen["$file"]=1
+            fi
+        done < <(find "${OUTPUT_DIR}" -maxdepth 1 -type f -name "$glob_pattern" -print0)
     done
 
     if [ ${#files_to_delete[@]} -eq 0 ]; then
@@ -460,11 +555,15 @@ check_write_permission
 HOSTNAME_VAR=$(hostname)
 CURRENT_TIMESTAMP_FOR_FILENAME=$(date +%Y%m%d_%H%M%S)
 CURRENT_DATETIME_FOR_LOG=$(date "+%Y-%m-%d %H:%M:%S")
-NEW_INFRA_OUTPUT_FILE="${OUTPUT_DIR}/${HOSTNAME_VAR}_${CURRENT_TIMESTAMP_FOR_FILENAME}_new_infra.log"
 CURRENT_INFRA_OUTPUT_FILE="${OUTPUT_DIR}/${HOSTNAME_VAR}_${CURRENT_TIMESTAMP_FOR_FILENAME}_current_infra.log"
+NEW_STG_OUTPUT_FILE="${OUTPUT_DIR}/${HOSTNAME_VAR}_${CURRENT_TIMESTAMP_FOR_FILENAME}_new_infra_stg.log"
+NEW_PRD_OUTPUT_FILE="${OUTPUT_DIR}/${HOSTNAME_VAR}_${CURRENT_TIMESTAMP_FOR_FILENAME}_new_infra_prd.log"
+OTHER_OUTPUT_FILE="${OUTPUT_DIR}/${HOSTNAME_VAR}_${CURRENT_TIMESTAMP_FOR_FILENAME}_other.log"
 # ログファイルを空の状態で作成
-: > "$NEW_INFRA_OUTPUT_FILE"
 : > "$CURRENT_INFRA_OUTPUT_FILE"
+: > "$NEW_STG_OUTPUT_FILE"
+: > "$NEW_PRD_OUTPUT_FILE"
+: > "$OTHER_OUTPUT_FILE"
 
 # --- ヘッダー生成と出力 ---
 # スクリプトの基本情報をヘッダー文字列として一度だけ生成する
@@ -481,20 +580,17 @@ printf -v header_info "\n%s\n%s %s\n%s %s\n%s %s\n%s %s\n-----------------------
 printf "%s" "$header_info"
 
 # 各ログファイルにヘッダーを書き込む (リダイレクトは上書きの'>'で良い)
-printf "%s" "$header_info" > "$NEW_INFRA_OUTPUT_FILE"
 printf "%s" "$header_info" > "$CURRENT_INFRA_OUTPUT_FILE"
+printf "%s" "$header_info" > "$NEW_STG_OUTPUT_FILE"
+printf "%s" "$header_info" > "$NEW_PRD_OUTPUT_FILE"
+printf "%s" "$header_info" > "$OTHER_OUTPUT_FILE"
 
 
 # --- 一時ファイル作成 ---
 CURRENT_INFRA_HITS_TEMP=$(mktemp) || { printf "${MSG_ERROR_PREFIX}${MSG_TEMP_FILE_CREATION_FAILED}" "CURRENT_INFRA_HITS_TEMP" >&2; exit 1; }
-NEW_INFRA_HITS_TEMP=$(mktemp) || { cleanup; printf "${MSG_ERROR_PREFIX}${MSG_TEMP_FILE_CREATION_FAILED}" "NEW_INFRA_HITS_TEMP" >&2; exit 1; }
-NEW_INFRA_STG_HITS_TEMP=$(mktemp) || { cleanup; printf "${MSG_ERROR_PREFIX}${MSG_TEMP_FILE_CREATION_FAILED}" "NEW_INFRA_STG_HITS_TEMP" >&2; exit 1; }
-NEW_INFRA_PROD_HITS_TEMP=$(mktemp) || { cleanup; printf "${MSG_ERROR_PREFIX}${MSG_TEMP_FILE_CREATION_FAILED}" "NEW_INFRA_PROD_HITS_TEMP" >&2; exit 1; }
-NEW_INFRA_OTHER_HITS_TEMP=$(mktemp) || { cleanup; printf "${MSG_ERROR_PREFIX}${MSG_TEMP_FILE_CREATION_FAILED}" "NEW_INFRA_OTHER_HITS_TEMP" >&2; exit 1; }
-BOTH_HITS_TEMP=$(mktemp)      || { cleanup; printf "${MSG_ERROR_PREFIX}${MSG_TEMP_FILE_CREATION_FAILED}" "BOTH_HITS_TEMP" >&2; exit 1; }
-
-# スクリプト終了時(EXIT)、中断(INT)、強制終了(TERM)のシグナルを捕捉し、cleanup関数を実行
-trap cleanup EXIT INT TERM
+NEW_STG_HITS_TEMP=$(mktemp) || { cleanup; printf "${MSG_ERROR_PREFIX}${MSG_TEMP_FILE_CREATION_FAILED}" "NEW_STG_HITS_TEMP" >&2; exit 1; }
+NEW_PRD_HITS_TEMP=$(mktemp) || { cleanup; printf "${MSG_ERROR_PREFIX}${MSG_TEMP_FILE_CREATION_FAILED}" "NEW_PRD_HITS_TEMP" >&2; exit 1; }
+OTHER_HITS_TEMP=$(mktemp) || { cleanup; printf "${MSG_ERROR_PREFIX}${MSG_TEMP_FILE_CREATION_FAILED}" "OTHER_HITS_TEMP" >&2; exit 1; }
 
 # --- 実行開始メッセージ ---
 printf "%s\n" "$MSG_SEARCH_START"
@@ -516,6 +612,40 @@ is_backup_file_name() {
     else
         return 1 # false
     fi
+}
+
+# --- should_skip_file_for_processing: バイナリまたはサイズ超過ファイルを判定 ---
+# 引数: ファイルパス
+# 戻り値: スキップする場合は0、処理可能なら1
+should_skip_file_for_processing() {
+    local filepath="$1"
+    local file_size=0
+    local mime_encoding=""
+    local mime_type=""
+
+    if [ ! -f "$filepath" ]; then
+        return 1
+    fi
+
+    file_size=$(stat -c '%s' "$filepath" 2>/dev/null)
+    if [ $? -eq 0 ] && [ "$file_size" -gt "$MAX_ALLOWED_FILE_SIZE_BYTES" ]; then
+        return 0
+    fi
+
+    if [ "$FILE_CMD_AVAILABLE" -eq 1 ]; then
+        mime_encoding=$(file -b --mime-encoding "$filepath" 2>/dev/null || echo "")
+        if [ "$mime_encoding" = "binary" ]; then
+            return 0
+        fi
+        if [ -z "$mime_encoding" ]; then
+            mime_type=$(file -b --mime "$filepath" 2>/dev/null || echo "")
+            if [[ "$mime_type" == *"charset=binary"* ]]; then
+                return 0
+            fi
+        fi
+    fi
+
+    return 1
 }
 # --- filter_grep_output: grepの出力を整形・フィルタリング ---
 # コメント行(#)を除外し、ヒット行にプレフィックスを付けるなどの処理を行う
@@ -635,6 +765,61 @@ print_filtered_hit_list() {
     done
     if [ "$items_actually_printed" -eq 0 ]; then printf "%s\n" "$MSG_NO_HITS"; fi
 }
+
+print_diff_section() {
+    local diff_file="$1"
+    local mode="$2"
+    local prefix="-"
+    if [ "$mode" = "new" ]; then
+        prefix="+"
+    fi
+    if [ -z "$diff_file" ] || [ ! -s "$diff_file" ]; then
+        printf "  (diff information unavailable)\n"
+        return
+    fi
+    awk -v pref="$prefix" '
+        /^--- / {next}
+        /^\+\+\+/ {next}
+        /^@@/ {current_header=$0; header_pending=1; next}
+        {
+            first_char = substr($0, 1, 1)
+            second_char = substr($0, 2, 1)
+            if (first_char == pref && second_char != pref) {
+                if (!printed_any) {
+                    printed_any = 1
+                    section_count = 1
+                } else {
+                    section_count++
+                }
+                if (header_pending && current_header != "") {
+                    if (section_count > 1) {
+                        print ""
+                    }
+                    print current_header
+                    header_pending = 0
+                }
+                print "  " substr($0, 2)
+            }
+        }
+        END {
+            if (!printed_any) {
+                print "  (no changes)"
+            }
+        }
+    ' "$diff_file"
+}
+
+emit_preview_block() {
+    local file_path="$1"
+    local diff_file="$2"
+    printf -- "$MSG_TRANSFORM_ASIS_HEADER\n" "$file_path"
+    print_diff_section "$diff_file" "old"
+    printf "\n"
+    printf -- "$MSG_TRANSFORM_TOBE_HEADER\n" "$file_path"
+    print_diff_section "$diff_file" "new"
+    printf "\n"
+}
+
 # --- print_detailed_other_hits: 「その他条件」のサマリーを詳細に出力 ---
 print_detailed_other_hits() {
     local temp_hit_file="$1"
@@ -657,6 +842,11 @@ print_detailed_other_hits() {
             done
         fi
     done
+}
+# Override with simplified implementation to avoid deprecated dependencies.
+print_detailed_other_hits() {
+    : "${1}"
+    return 0
 }
 # --- print_both_logs_hit_list: 両方のログにヒットしたファイルリストを出力 ---
 print_both_logs_hit_list() {
@@ -735,16 +925,47 @@ run_transform() {
     local diff_file=""
     local change_log=""
     local host_for_log="$(hostname 2>/dev/null || echo unknown)"
+    local transform_diff_log=""
+    local preview_timestamp=""
 
     if [ "$SEARCH_PATH" = "/var" ] || [ "$SEARCH_PATH" = "/var/" ]; then
         check_newproduction_structure
     fi
 
     while IFS= read -r -d $'\0' filepath; do
+        if [ "$CANCEL_REQUESTED" -ne 0 ]; then
+            break
+        fi
+        if [ "$LIMIT_VAR_CONFIG" -eq 1 ]; then
+            case "$filepath" in
+                /var/www/com/ipet-ins/*/fuel/app/config/*) ;;
+                *) continue ;;
+            esac
+        fi
+        if [[ "$filepath" == *.bak || "$filepath" == *.old || "$filepath" == *.bin || "$filepath" == *.cache || "$filepath" == *.types || "$filepath" == *.pem || "$filepath" == *.PEM ]]; then
+            if [ "$VERBOSE_MODE" -eq 1 ]; then
+                printf "%s%s\n" "${MSG_VERBOSE_PREFIX}" "${MSG_VERBOSE_SKIPPING_BACKUP_FILE}$filepath"
+            fi
+            continue
+        fi
+        case "$filepath" in
+            /etc/grub.d/*|/etc/pki/*|/etc/postfix/*|/etc/services|/etc/systemd/*|/etc/ImageMagick/*|/etc/php-fpm.d/*|/etc/profile.d/*|/etc/ssh/*|*.log|*.LOG)
+                if [ "$VERBOSE_MODE" -eq 1 ]; then
+                    printf "%s%s\n" "${MSG_VERBOSE_PREFIX}" "${MSG_VERBOSE_SKIPPING_BACKUP_FILE}$filepath"
+                fi
+                continue
+                ;;
+        esac
         total_files_scanned_transform=$((total_files_scanned_transform + 1))
         if [ "$SKIP_BACKUP_FILES_MODE" -eq 1 ] && is_backup_file_name "$(basename "$filepath")"; then
             if [ "$VERBOSE_MODE" -eq 1 ]; then
                 printf "%s%s\n" "${MSG_VERBOSE_PREFIX}" "${MSG_VERBOSE_SKIPPING_BACKUP_FILE}$filepath"
+            fi
+            continue
+        fi
+        if should_skip_file_for_processing "$filepath"; then
+            if [ "$VERBOSE_MODE" -eq 1 ]; then
+                printf "%s%s\n" "${MSG_VERBOSE_PREFIX}" "${MSG_VERBOSE_SKIPPING_BINARY_FILE}$filepath"
             fi
             continue
         fi
@@ -807,7 +1028,7 @@ function rebuild_with_ip(str, rem, result, prefix, token, converted) {
     }
     return result rem
 }
-function replace_zero_ns(str, rem, result, prefix, next_char) {
+function replace_zero_ns(str, rem, result, prefix, next_char, matched, digits) {
     rem = str
     result = ""
     while (match(rem, /0[0-9]+s/)) {
@@ -818,7 +1039,12 @@ function replace_zero_ns(str, rem, result, prefix, next_char) {
             rem = substr(rem, RSTART + RLENGTH)
             continue
         }
-        result = result prefix "0np"
+        matched = substr(rem, RSTART, RLENGTH)
+        digits = substr(matched, 2, length(matched) - 2)
+        if (digits == "") {
+            digits = "0"
+        }
+        result = result prefix "0" digits "p"
         rem = substr(rem, RSTART + RLENGTH)
         changed = 1
     }
@@ -861,6 +1087,11 @@ function replace_stg_tokens(str, prefix, suffix, before_char, after_char, result
     return result str
 }
 {
+    original_line = $0
+    if (original_line ~ /^[[:space:]]*(127\.0\.0\.1|::1)\b/) {
+        print original_line
+        next
+    }
     is_httpd_conf = (target_path ~ /\.conf($|\.)/ || target_path ~ /\/etc\/httpd\//)
     line = rebuild_with_ip($0)
     updated = replace_zero_ns(line)
@@ -892,12 +1123,25 @@ AWK
         if [ $status -eq 0 ]; then
             TRANSFORM_TEMP_PATHS["$filepath"]="$temp_transformed"
             TRANSFORM_CHANGED_FILES+=("$filepath")
-            if [ "$VERBOSE_MODE" -eq 1 ] || [ "$TRANSFORM_DRY_RUN" -eq 1 ]; then
-                diff_file=$(mktemp) || diff_file=""
-                if [ -n "$diff_file" ]; then
-                    diff -u "$filepath" "$temp_transformed" > "$diff_file" 2>/dev/null || true
+            diff_file=$(mktemp) || diff_file=""
+            if [ -n "$diff_file" ]; then
+                local diff_status
+                diff -u "$filepath" "$temp_transformed" > "$diff_file" 2>/dev/null
+                diff_status=$?
+                if [ $diff_status -eq 0 ]; then
+                    # No differences; discard diff file.
+                    rm -f "$diff_file" 2>/dev/null
+                    TRANSFORM_DIFF_PATHS["$filepath"]=""
+                elif [ $diff_status -eq 1 ]; then
+                    # Differences captured successfully.
                     TRANSFORM_DIFF_PATHS["$filepath"]="$diff_file"
+                else
+                    # Error generating diff.
+                    rm -f "$diff_file" 2>/dev/null
+                    TRANSFORM_DIFF_PATHS["$filepath"]=""
                 fi
+            else
+                TRANSFORM_DIFF_PATHS["$filepath"]=""
             fi
         elif [ $status -eq 3 ]; then
             rm -f "$temp_transformed" 2>/dev/null
@@ -911,6 +1155,11 @@ AWK
             printf "${MSG_ERROR_PREFIX}${MSG_ERROR_TRANSFORM_EXECUTION}\n" "$transform_output" >&2
         fi
     done < <(find "$SEARCH_PATH" -path '*/selinux/*' -prune -o -type f -not -name '*#*' -print0)
+
+    if [ "$CANCEL_REQUESTED" -ne 0 ]; then
+        printf "%s\n" "$MSG_OPERATION_CANCELLED"
+        return 130
+    fi
 
     printf "\n%s\n" "$MSG_TRANSFORM_SUMMARY_HEADER"
     printf "${MSG_SUMMARY_TOTAL_FILES_SCANNED}\n" "$total_files_scanned_transform"
@@ -939,20 +1188,50 @@ AWK
 
     local -a sorted_changed_files=()
     mapfile -t sorted_changed_files < <(printf '%s\n' "${TRANSFORM_CHANGED_FILES[@]}" | sort -u)
+    preview_timestamp=$(date +%Y%m%d_%H%M%S)
+    transform_diff_log="${OUTPUT_DIR}/${host_for_log}_${preview_timestamp}_transform_preview.log"
+    if ! {
+        printf "# As-Is/To-Be Preview\n"
+        printf "# Generated: %s\n" "$(date "+%Y-%m-%d %H:%M:%S")"
+        printf "# Dry-run: %s\n" "$([ "$TRANSFORM_DRY_RUN" -eq 1 ] && echo yes || echo no)"
+        printf "# Target: %s\n\n" "$SEARCH_PATH"
+    } > "$transform_diff_log"; then
+        transform_diff_log=""
+    else
+        chmod 600 "$transform_diff_log" 2>/dev/null || true
+    fi
+
     for file in "${sorted_changed_files[@]}"; do
-        printf "$MSG_TRANSFORM_FILE_WOULD_CHANGE\n" "$file"
+        if [ "$CANCEL_REQUESTED" -ne 0 ]; then
+            break
+        fi
+        local diff_file
+        printf -- "$MSG_TRANSFORM_FILE_WOULD_CHANGE\n" "$file"
+        diff_file="${TRANSFORM_DIFF_PATHS[$file]:-}"
+        if [ -n "$transform_diff_log" ]; then
+            emit_preview_block "$file" "$diff_file" | tee -a "$transform_diff_log"
+        else
+            emit_preview_block "$file" "$diff_file"
+        fi
         if [ "$VERBOSE_MODE" -eq 1 ]; then
             diff_file="${TRANSFORM_DIFF_PATHS[$file]:-}"
             if [ -n "$diff_file" ] && [ -s "$diff_file" ]; then
-                printf "$MSG_TRANSFORM_DIFF_HEADER\n" "$file"
+                printf -- "$MSG_TRANSFORM_DIFF_HEADER\n" "$file"
                 cat "$diff_file"
             fi
         fi
     done
 
+    if [ -n "$transform_diff_log" ]; then
+        printf -- "$MSG_TRANSFORM_DIFF_LOG_SAVED\n" "$transform_diff_log"
+    fi
+
     if [ "$TRANSFORM_DRY_RUN" -eq 1 ]; then
         printf "%s\n" "$MSG_TRANSFORM_DRY_RUN_COMPLETED"
         for file in "${sorted_changed_files[@]}"; do
+            if [ "$CANCEL_REQUESTED" -ne 0 ]; then
+                break
+            fi
             diff_file="${TRANSFORM_DIFF_PATHS[$file]:-}"
             temp_transformed="${TRANSFORM_TEMP_PATHS[$file]:-}"
             if [ -n "$diff_file" ]; then rm -f "$diff_file" 2>/dev/null; fi
@@ -976,7 +1255,10 @@ AWK
     fi
 
     local timestamp
-    timestamp=$(date +%Y%m%d_%H%M%S)
+    timestamp="$preview_timestamp"
+    if [ -z "$timestamp" ]; then
+        timestamp=$(date +%Y%m%d_%H%M%S)
+    fi
     local apply_failures=0
     if [ "$TRANSFORM_DRY_RUN" -eq 0 ]; then
         change_log="${OUTPUT_DIR}/${host_for_log}_${timestamp}_transform.log"
@@ -984,6 +1266,9 @@ AWK
     fi
 
     for file in "${sorted_changed_files[@]}"; do
+        if [ "$CANCEL_REQUESTED" -ne 0 ]; then
+            break
+        fi
         local temp_file="${TRANSFORM_TEMP_PATHS[$file]}"
         local diff_saved="${TRANSFORM_DIFF_PATHS[$file]:-}"
         local backup_path="${file}.bak_${timestamp}"
@@ -1071,6 +1356,9 @@ run_rollback() {
     fi
 
     while IFS=$'\t' read -r original_path backup_path original_mode original_owner original_group; do
+        if [ "$CANCEL_REQUESTED" -ne 0 ]; then
+            break
+        fi
         if [[ "$original_path" =~ ^# ]] || { [ -z "$original_path" ] && [ -z "$backup_path" ]; }; then
             continue
         fi
@@ -1128,6 +1416,11 @@ run_rollback() {
         printf "%s\n" "$MSG_ROLLBACK_NO_ENTRIES"
     fi
 
+    if [ "$CANCEL_REQUESTED" -ne 0 ]; then
+        printf "%s\n" "$MSG_OPERATION_CANCELLED"
+        return 130
+    fi
+
     printf "$MSG_ROLLBACK_SUMMARY\n" "$restored_count" "$failed_count"
 
     if [ $failed_count -ne 0 ]; then
@@ -1137,13 +1430,11 @@ run_rollback() {
 }
 
 if [ "$SUBCOMMAND" = "transform" ] && [ "$DELETE_LOGS_MODE" -eq 0 ]; then
-    trap cleanup EXIT INT TERM
     run_transform
     exit $?
 fi
 
 if [ "$SUBCOMMAND" = "rollback" ]; then
-    trap cleanup EXIT INT TERM
     run_rollback
     exit $?
 fi
@@ -1158,6 +1449,8 @@ pattern_ip_172_other_third_octets_main='(1|10|13|15|16|22|25|51|100|101|103)'
 pattern_ip_172_specific_main="172\.([0-9]{1,3})\.${pattern_ip_172_other_third_octets_main}\.([0-9]{1,3})"
 pattern_ip_aws_1='172\.29\.([0-9]{1,3})\.([0-9]{1,3})'
 pattern_ip_aws_2='169\.254\.[0-3]\.([0-9]{1,3})'
+pattern_ip_new_prd='172\.16\.16[0-9]\.[0-9]{1,3}'
+pattern_ip_new_stg='172\.16\.(170|171|172|173|174|175|176|177|178|179)\.[0-9]{1,3}'
 pattern_ip_toyosu='172\.17\.([0-9]{1,3})\.([0-9]{1,3})'
 pattern_ip_hb_1='10\.0\.[01]\.([0-9]{1,3})'
 pattern_ip_hb_2='200\.(12[0-7]|1[01][0-9]|[0-9]?[0-9])\.([0-9]{1,3})\.([0-9]{1,3})'
@@ -1173,8 +1466,7 @@ hostname_patterns_main=( 'ipetdchq2nd001' 'ipetdc00[12]' 'iptad(?:con001|aud01|m
 new_hostname_pattern_main="\b($(IFS='|'; echo "${hostname_patterns_main[*]}"))\b"
 # 連想配列に、条件名と正規表現パターンを格納
 CURRENT_INFRA_CONDITIONS=(
-    ["IP_current"]="\\b(${pattern_ip_100_100_main}|${pattern_ip_172_16_slash17_main}|${pattern_ip_172_specific_main}|${pattern_ip_toyosu}|${pattern_ip_hb_1}|${pattern_ip_hb_2}|${pattern_ip_subnet_ws2}|${pattern_ip_regional_1}|${pattern_ip_regional_2}|${pattern_ip_regional_3}|${pattern_ip_infra})\\b"
-    ["IP_AWS_current"]="\\b(${pattern_ip_aws_1}|${pattern_ip_aws_2})\\b"
+    ["IP_current"]="\\b(${pattern_ip_100_100_main}|${pattern_ip_172_16_slash17_main}|${pattern_ip_172_specific_main}|${pattern_ip_hb_1}|${pattern_ip_hb_2})\\b"
     ["ENV_current"]='\b(staging|production)[/.;]'
     ["HOSTNAME_current"]="$new_hostname_pattern_main"
     ["IPTP_current"]='\biptp\b'
@@ -1185,7 +1477,6 @@ CURRENT_INFRA_CONDITIONS=(
 declare -A CURRENT_INFRA_CONDITIONS_DESC
 CURRENT_INFRA_CONDITIONS_DESC=(
     ["IP_current"]="$MSG_IP_CONDITION_CURRENT_DESC"
-    ["IP_AWS_current"]="$MSG_IP_AWS_CONDITION_CURRENT_DESC"
     ["ENV_current"]="$MSG_ENV_CONDITION_CURRENT_DESC"
     ["HOSTNAME_current"]="$MSG_HOSTNAME_CONDITION_CURRENT_DESC"
     ["IPTP_current"]="$MSG_IPTP_CONDITION_CURRENT_DESC"
@@ -1194,27 +1485,91 @@ CURRENT_INFRA_CONDITIONS_DESC=(
 )
 
 # --- 新基盤の定義 ---
-declare -A NEW_INFRA_CONDITIONS
-# 新基盤のIPアドレス範囲 (172.16.128.0/17)
-pattern_ip_172_16_slash17_upper_fixed="172\.16\.(12[89]|1[3-9][0-9]|2[0-4][0-9]|25[0-5])\.([0-9]{1,3})"
 # 新基盤のホスト名パターンを配列で定義
-hostname_patterns=( '(?:line|event|mul|psweb|petname|recept|iposco|crm)-(?:lb|ap|db)[0-9]+[sp]' 'XXX-(?:ap|db|lb)[0-9]+[sp]' 'ipet-lb[0-9]+[sp]' 'ipetclub-(?:lb|ap|db)[0-9]+[sp]' 'dlagency-(?:lb|ap|db)[0-9]+[sp]' 'agency-(?:lb|ap|db)[0-9]+[sp]' 'epc(?:ds)?[0-9]+[sp]' 'docomo-(?:lb|ap|db)[0-9]+[sp]' 'ipet-(?:fs|bk)[0-9]+[sp]' 'sdp[0-9]+[sp]' 'myp-(?:ap|db)[0-9]+[sp]' 'smtp[0-9]+[sp]' 'mailman-ap[0-9]+[sp]' 'log[0-9]+[sp]' 'wel-(?:ap|db)[0-9]+[sp]' 'inext-(?:ap|db)[0-9]+[sp]' '(?:grafana|metabase)[0-9]+p' 'proxy[0-9]+[sp]' 'asteria-ap[0-9]+[sp]' 'infoone-(?:doc|ap)[0-9]+[sp]' 'biz-(?:ap|db)[0-9]+[sp]' 'dmp-(?:ap|ci|lb|mb)[0-9]+[sp]' 'xdp-(?:ap|conv|db)[0-9]+[sp]' 'ltt-(?:ap|db)[0-9]+[sp]' 'dwa-db[0-9]+[sp]' 'jenkins[0-9]+[sp]' '(?:bigip|repos|zabbix|scansv|pmp)[0-9]+[sp]' 'report-[0-9]+[sp]' 'jumpw[0-9]+[sp]' 'jumpl[0-9]+[sp]' 'fubi-db[0-9]+[sp]' 'bat[0-9]+[sp]' 'dwhapi-(?:ap|db)[0-9]+[sp]' '(?:eset|hulft|iFilter)[0-9]+[sp]' 'jobarg[0-9]+' '[a-z0-9]+-(?:lb|ap|db|fs|bk|conv|ci|mb)[0-9]+[sp]' )
-new_hostname_pattern_fixed="\b($(IFS='|'; echo "${hostname_patterns[*]}"))\b"
-NEW_INFRA_CONDITIONS=(
-    ["IP_new"]="\\b${pattern_ip_172_16_slash17_upper_fixed}\\b"
-    ["ENV_new"]='\b(newstaging|newproduction)[/.;]'
-    ["HOSTNAME_new"]="$new_hostname_pattern_fixed"
-    ["IPETFS_new"]='.*ipet-fs.*'
-    ["CONV0_new"]='conv0'
+hostname_patterns_new_base=( '(?:line|event|mul|psweb|petname|recept|iposco|crm)-(?:lb|ap|db)[0-9]+[sp]' 'XXX-(?:ap|db|lb)[0-9]+[sp]' 'ipet-lb[0-9]+[sp]' 'ipetclub-(?:lb|ap|db)[0-9]+[sp]' 'dlagency-(?:lb|ap|db)[0-9]+[sp]' 'agency-(?:lb|ap|db)[0-9]+[sp]' 'epc(?:ds)?[0-9]+[sp]' 'docomo-(?:lb|ap|db)[0-9]+[sp]' 'ipet-(?:fs|bk)[0-9]+[sp]' 'sdp[0-9]+[sp]' 'myp-(?:ap|db)[0-9]+[sp]' 'smtp[0-9]+[sp]' 'mailman-ap[0-9]+[sp]' 'log[0-9]+[sp]' 'wel-(?:ap|db)[0-9]+[sp]' 'inext-(?:ap|db)[0-9]+[sp]' '(?:grafana|metabase)[0-9]+p' 'tableau0[0-9]+p' 'proxy[0-9]+[sp]' 'asteria-ap[0-9]+[sp]' 'infoone-(?:doc|ap)[0-9]+[sp]' 'biz-(?:ap|db)[0-9]+[sp]' 'dmp-(?:ap|ci|lb|mb)[0-9]+[sp]' 'xdp-(?:ap|conv|db)[0-9]+[sp]' 'ltt-(?:ap|db)[0-9]+[sp]' 'dwa-db[0-9]+[sp]' 'jenkins[0-9]+[sp]' '(?:bigip|repos|zabbix|scansv|pmp)[0-9]+[sp]' 'report-(?:ap|db)[0-9]+[sp]' 'jumpw[0-9]+[sp]' 'jumpl[0-9]+[sp]' 'fubi-db[0-9]+[sp]' 'bat[0-9]+[sp]' 'dwhapi-(?:ap|db)[0-9]+[sp]' '(?:eset|hulft|iFilter)[0-9]+[sp]' 'deploy[0-9]+[sp]' 'ifo-je-ap[0-9]+[sp](?:vm)?' 'jobarg[0-9]+' '[a-z0-9]+-(?:lb|ap|db|fs|bk|conv|ci|mb)[0-9]+[sp]' )
+declare -a hostname_patterns_stg=()
+declare -a hostname_patterns_prd=()
+for pattern in "${hostname_patterns_new_base[@]}"; do
+    stg_pattern="$pattern"
+    prd_pattern="$pattern"
+    if [[ "$pattern" == *"[sp]"* ]]; then
+        stg_pattern=$(printf '%s\n' "$pattern" | sed 's/\[sp\]/s/g')
+        prd_pattern=$(printf '%s\n' "$pattern" | sed 's/\[sp\]/p/g')
+    elif [[ "$pattern" == *"[SP]"* ]]; then
+        stg_pattern=$(printf '%s\n' "$pattern" | sed 's/\[SP\]/S/g')
+        prd_pattern=$(printf '%s\n' "$pattern" | sed 's/\[SP\]/P/g')
+    elif [[ "$pattern" =~ p$ ]]; then
+        stg_pattern="${pattern%p}s"
+    elif [[ "$pattern" =~ P$ ]]; then
+        stg_pattern="${pattern%P}S"
+    else
+        stg_pattern="${pattern}s"
+        prd_pattern="${pattern}p"
+    fi
+    hostname_patterns_stg+=("$stg_pattern")
+    hostname_patterns_prd+=("$prd_pattern")
+done
+
+hostname_patterns_prd+=('git0[0-9]+c')
+
+new_hostname_pattern_stg="\b($(IFS='|'; echo "${hostname_patterns_stg[*]}"))\b"
+new_hostname_pattern_prd="\b($(IFS='|'; echo "${hostname_patterns_prd[*]}"))\b"
+
+declare -A NEW_STG_CONDITIONS
+NEW_STG_CONDITIONS=(
+    ["IP_new_stg"]="\\b${pattern_ip_new_stg}\\b"
+    ["ENV_new_stg"]="\\bnewstaging\\b"
+    ["HOSTNAME_suffix_s"]="$new_hostname_pattern_stg"
+    ["TOKEN_stg"]="\\bstg\\b"
 )
-declare -A NEW_INFRA_CONDITIONS_DESC
-NEW_INFRA_CONDITIONS_DESC=(
-    ["IP_new"]="$MSG_IP_CONDITION_NEW_DESC"
-    ["ENV_new"]="$MSG_ENV_CONDITION_NEW_DESC"
-    ["HOSTNAME_stg_new"]="$MSG_HOSTNAME_STG_CONDITION_NEW_DESC"
-    ["HOSTNAME_prod_new"]="$MSG_HOSTNAME_PROD_CONDITION_NEW_DESC"
-    ["IPETFS_new"]="$MSG_IPETFS_CONDITION_NEW_DESC"
+declare -A NEW_STG_CONDITIONS_DESC
+NEW_STG_CONDITIONS_DESC=(
+    ["IP_new_stg"]="$MSG_IP_CONDITION_NEW_STG_DESC"
+    ["ENV_new_stg"]="$MSG_ENV_CONDITION_NEW_STG_DESC"
+    ["HOSTNAME_suffix_s"]="$MSG_HOSTNAME_S_CONDITION_NEW_DESC"
+    ["TOKEN_stg"]="$MSG_TOKEN_STG_CONDITION_NEW_DESC"
+)
+
+declare -A NEW_PRD_CONDITIONS
+NEW_PRD_CONDITIONS=(
+    ["IP_new_prd"]="\\b${pattern_ip_new_prd}\\b"
+    ["ENV_new_prd"]="\\bnewproduction\\b"
+    ["HOSTNAME_suffix_p"]="$new_hostname_pattern_prd"
+    ["HOSTNAME_git_ctrl"]="\\bgit0[0-9]+c\\b"
+    ["TOKEN_prd"]="\\bprd\\b"
+)
+declare -A NEW_PRD_CONDITIONS_DESC
+NEW_PRD_CONDITIONS_DESC=(
+    ["IP_new_prd"]="$MSG_IP_CONDITION_NEW_PRD_DESC"
+    ["ENV_new_prd"]="$MSG_ENV_CONDITION_NEW_PRD_DESC"
+    ["HOSTNAME_suffix_p"]="$MSG_HOSTNAME_P_CONDITION_NEW_DESC"
+    ["HOSTNAME_git_ctrl"]="$MSG_HOSTNAME_GIT_CTRL_CONDITION_NEW_DESC"
+    ["TOKEN_prd"]="$MSG_TOKEN_PRD_CONDITION_NEW_DESC"
+)
+
+declare -A OTHER_CONDITIONS
+OTHER_CONDITIONS=(
+    ["IP_aws"]="\\b(${pattern_ip_aws_1}|${pattern_ip_aws_2})\\b"
+    ["IP_toyosu"]="\\b${pattern_ip_toyosu}\\b"
+    ["IP_subnet_ws2"]="\\b${pattern_ip_subnet_ws2}\\b"
+    ["IP_regional_1"]="\\b${pattern_ip_regional_1}\\b"
+    ["IP_regional_2"]="\\b${pattern_ip_regional_2}\\b"
+    ["IP_regional_3"]="\\b${pattern_ip_regional_3}\\b"
+    ["IP_infra"]="\\b${pattern_ip_infra}\\b"
+    ["CONV0_new"]='conv0'
+    ["IPETFS_new"]='ipet-fs'
+)
+declare -A OTHER_CONDITIONS_DESC
+OTHER_CONDITIONS_DESC=(
+    ["IP_aws"]="$MSG_IP_AWS_CONDITION_DESC"
+    ["IP_toyosu"]="$MSG_IP_TOYOSU_CONDITION_DESC"
+    ["IP_subnet_ws2"]="$MSG_IP_SUBNET_WS2_DESC"
+    ["IP_regional_1"]="$MSG_IP_REGIONAL_1_DESC"
+    ["IP_regional_2"]="$MSG_IP_REGIONAL_2_DESC"
+    ["IP_regional_3"]="$MSG_IP_REGIONAL_3_DESC"
+    ["IP_infra"]="$MSG_IP_INFRA_CONDITION_DESC"
     ["CONV0_new"]="$MSG_CONV_CONDITION_NEW_DESC"
+    ["IPETFS_new"]="$MSG_IPETFS_CONDITION_NEW_DESC"
 )
 # =====================================================================
 
@@ -1222,17 +1577,40 @@ NEW_INFRA_CONDITIONS_DESC=(
 # --- メイン処理 ---
 TOTAL_FILES_SCANNED=0
 declare -A current_infra_hits_written
-declare -A new_infra_hits_written
-declare -A new_infra_stg_hits_written
-declare -A new_infra_prod_hits_written
-declare -A new_infra_other_hits_written
+declare -A new_stg_hits_written
+declare -A new_prd_hits_written
+declare -A other_hits_written
 
 SECONDS=0
 # findコマンドでスキャン対象ファイルをリストアップし、whileループで1ファイルずつ処理
 # findの-print0とreadの-d $'\0' を使うことで、ファイル名にスペースや特殊文字が含まれていても安全に扱える
 while IFS= read -r -d $'\0' filepath; do
+    if [ "$CANCEL_REQUESTED" -ne 0 ]; then
+        break
+    fi
+    if [ "$LIMIT_VAR_CONFIG" -eq 1 ]; then
+        case "$filepath" in
+            /var/www/com/ipet-ins/*/fuel/app/config/*) ;;
+            *) continue ;;
+        esac
+    fi
+    case "$filepath" in
+        /etc/grub.d/*|/etc/pki/*|/etc/postfix/*|/etc/services|/etc/systemd/*|/etc/ImageMagick/*|/etc/php-fpm.d/*|/etc/profile.d/*|/etc/ssh/*|*.log|*.LOG)
+            if [ "$VERBOSE_MODE" -eq 1 ]; then
+                printf "%s%s\n" "${MSG_VERBOSE_PREFIX}" "${MSG_VERBOSE_SKIPPING_BACKUP_FILE}$filepath"
+            fi
+            continue
+            ;;
+    esac
     TOTAL_FILES_SCANNED=$((TOTAL_FILES_SCANNED + 1))
     abs_filepath=$(readlink -f "$filepath" 2>/dev/null || echo "$filepath")
+
+    if should_skip_file_for_processing "$filepath"; then
+        if [ "$VERBOSE_MODE" -eq 1 ]; then
+            printf "%s%s\n" "${MSG_VERBOSE_PREFIX}" "${MSG_VERBOSE_SKIPPING_BINARY_FILE}$filepath"
+        fi
+        continue
+    fi
 
     # パフォーマンス向上のため、ファイル内容を一度だけメモリ上の配列に読み込む
     IFS= readarray -t file_lines < "$filepath" || continue
@@ -1252,8 +1630,6 @@ while IFS= read -r -d $'\0' filepath; do
 
     current_infra_log_header_printed=0
     current_infra_match_found=0
-    new_infra_log_header_printed=0
-    new_infra_match_found=0
 
     # === 現行基盤定義の検索ループ ===
     for condition_name in "${!CURRENT_INFRA_CONDITIONS[@]}"; do
@@ -1286,123 +1662,125 @@ while IFS= read -r -d $'\0' filepath; do
         printf "\n" >> "$CURRENT_INFRA_OUTPUT_FILE"
     fi
 
-    # === 新基盤定義の検索ループ ===
-    for condition_name in "${!NEW_INFRA_CONDITIONS[@]}"; do
-        pattern="${NEW_INFRA_CONDITIONS[$condition_name]}"
-        description=""
+    new_stg_log_header_printed=0
+    new_stg_match_found=0
+    for condition_name in "${!NEW_STG_CONDITIONS[@]}"; do
+        pattern="${NEW_STG_CONDITIONS[$condition_name]}"
+        description="${NEW_STG_CONDITIONS_DESC[$condition_name]}"
         grep_options="-I -E -i -n -C 5 --color=never"
-        if [[ "$condition_name" == "IP_new" ]]; then grep_options="-I -E -n -C 5 --color=never"; fi
+        if [[ "$condition_name" == "IP_new_stg" ]]; then grep_options="-I -E -n -C 5 --color=never"; fi
         raw_matches=$(grep $grep_options -- "$pattern" <<<"$file_content" 2>/dev/null)
-        if [ -n "$raw_matches" ]; then
-            hit_category=""
-            if [[ "$condition_name" == "HOSTNAME_new" ]]; then
-                stg_hit_found=false
-                prod_hit_found=false
-                
-                # grep -o でマッチしたホスト名だけを正確に抽出し、誤判定を防ぐ
-                extracted_hosts=$(grep -o -i -E "$new_hostname_pattern_fixed" <<< "$file_content")
-                
-                for host in $extracted_hosts; do
-                    if [[ "$host" =~ s$ || "$host" =~ jobarg[0-9]+$ ]]; then
-                        stg_hit_found=true
-                    fi
-                    if [[ "$host" =~ p$ ]]; then
-                        prod_hit_found=true
-                    fi
-                done
-
-                if [[ "$stg_hit_found" == true ]]; then
-                    hit_category="stg"
-                    description=${NEW_INFRA_CONDITIONS_DESC["HOSTNAME_stg_new"]}
-                fi
-                if [[ "$prod_hit_found" == true ]]; then
-                    hit_category="${hit_category}prod"
-                    if [ -n "$description" ]; then
-                        description+=", ${NEW_INFRA_CONDITIONS_DESC["HOSTNAME_prod_new"]}"
-                    else
-                        description=${NEW_INFRA_CONDITIONS_DESC["HOSTNAME_prod_new"]}
-                    fi
-                fi
-            else
-                hit_category="other"
-                description=${NEW_INFRA_CONDITIONS_DESC[$condition_name]}
+        filtered_matches=$(filter_grep_output "$raw_matches" "" "$MSG_HIT_LINE_PREFIX")
+        if [ -n "$filtered_matches" ]; then
+            if [ "$new_stg_log_header_printed" -eq 0 ]; then
+                printf "%s\n" "$SEPARATOR_LINE_LONG" >> "$NEW_STG_OUTPUT_FILE"
+                printf "${MSG_FILE_LABEL}\"%s\"\n" "$filepath" >> "$NEW_STG_OUTPUT_FILE"
+                new_stg_log_header_printed=1
             fi
-            
-            filtered_matches=$(filter_grep_output "$raw_matches" "" "$MSG_HIT_LINE_PREFIX")
-            if [ -n "$filtered_matches" ]; then
-                if [ "$new_infra_log_header_printed" -eq 0 ]; then
-                    printf "%s\n" "$SEPARATOR_LINE_LONG" >> "$NEW_INFRA_OUTPUT_FILE"
-                    printf "${MSG_FILE_LABEL}\"%s\"\n" "$filepath" >> "$NEW_INFRA_OUTPUT_FILE"
-                    new_infra_log_header_printed=1
-                fi
-                printf "%s\n" "$SEPARATOR_LINE_SHORT" >> "$NEW_INFRA_OUTPUT_FILE"
-                printf "${MSG_CONDITION_LABEL_NEW}: %s %s\n" "$description" "$MSG_COMMENT_IGNORED_LABEL" >> "$NEW_INFRA_OUTPUT_FILE"
-                printf "${MSG_MATCHES_LABEL} (%s):\n" "$MSG_CONTEXT_LINES_LABEL" >> "$NEW_INFRA_OUTPUT_FILE"
-                printf '%s\n' "$filtered_matches" >> "$NEW_INFRA_OUTPUT_FILE"
-                new_infra_match_found=1
-
-                if [[ "$hit_category" == *"stg"* ]] && [ -z "${new_infra_stg_hits_written[$abs_filepath]}" ]; then
-                    echo "$abs_filepath" >> "$NEW_INFRA_STG_HITS_TEMP"; new_infra_stg_hits_written[$abs_filepath]=1
-                fi
-                if [[ "$hit_category" == *"prod"* ]] && [ -z "${new_infra_prod_hits_written[$abs_filepath]}" ]; then
-                    echo "$abs_filepath" >> "$NEW_INFRA_PROD_HITS_TEMP"; new_infra_prod_hits_written[$abs_filepath]=1
-                fi
-                if [[ "$hit_category" == "other" ]] && [ -z "${new_infra_other_hits_written["$condition_name:$abs_filepath"]}" ]; then
-                     echo "$condition_name:$abs_filepath" >> "$NEW_INFRA_OTHER_HITS_TEMP"; new_infra_other_hits_written["$condition_name:$abs_filepath"]=1
-                fi
-            fi
+            printf "%s\n" "$SEPARATOR_LINE_SHORT" >> "$NEW_STG_OUTPUT_FILE"
+            printf "${MSG_CONDITION_LABEL_NEW_STG}: %s %s\n" "$description" "$MSG_COMMENT_IGNORED_LABEL" >> "$NEW_STG_OUTPUT_FILE"
+            printf "${MSG_MATCHES_LABEL} (%s):\n" "$MSG_CONTEXT_LINES_LABEL" >> "$NEW_STG_OUTPUT_FILE"
+            printf '%s\n' "$filtered_matches" >> "$NEW_STG_OUTPUT_FILE"
+            new_stg_match_found=1
         fi
     done
-
-    if [ "$new_infra_match_found" -ne 0 ]; then
-        if [ -z "${new_infra_hits_written["$abs_filepath"]}" ]; then
-            echo "$abs_filepath" >> "$NEW_INFRA_HITS_TEMP"
-            new_infra_hits_written["$abs_filepath"]=1
+    if [ "$new_stg_match_found" -ne 0 ]; then
+        if [ -z "${new_stg_hits_written["$abs_filepath"]}" ]; then
+            echo "$abs_filepath" >> "$NEW_STG_HITS_TEMP"
+            new_stg_hits_written["$abs_filepath"]=1
         fi
-        printf "\n" >> "$NEW_INFRA_OUTPUT_FILE"
+        printf "\n" >> "$NEW_STG_OUTPUT_FILE"
+    fi
+
+    new_prd_log_header_printed=0
+    new_prd_match_found=0
+    for condition_name in "${!NEW_PRD_CONDITIONS[@]}"; do
+        pattern="${NEW_PRD_CONDITIONS[$condition_name]}"
+        description="${NEW_PRD_CONDITIONS_DESC[$condition_name]}"
+        grep_options="-I -E -i -n -C 5 --color=never"
+        if [[ "$condition_name" == "IP_new_prd" ]]; then grep_options="-I -E -n -C 5 --color=never"; fi
+        raw_matches=$(grep $grep_options -- "$pattern" <<<"$file_content" 2>/dev/null)
+        filtered_matches=$(filter_grep_output "$raw_matches" "" "$MSG_HIT_LINE_PREFIX")
+        if [ -n "$filtered_matches" ]; then
+            if [ "$new_prd_log_header_printed" -eq 0 ]; then
+                printf "%s\n" "$SEPARATOR_LINE_LONG" >> "$NEW_PRD_OUTPUT_FILE"
+                printf "${MSG_FILE_LABEL}\"%s\"\n" "$filepath" >> "$NEW_PRD_OUTPUT_FILE"
+                new_prd_log_header_printed=1
+            fi
+            printf "%s\n" "$SEPARATOR_LINE_SHORT" >> "$NEW_PRD_OUTPUT_FILE"
+            printf "${MSG_CONDITION_LABEL_NEW_PRD}: %s %s\n" "$description" "$MSG_COMMENT_IGNORED_LABEL" >> "$NEW_PRD_OUTPUT_FILE"
+            printf "${MSG_MATCHES_LABEL} (%s):\n" "$MSG_CONTEXT_LINES_LABEL" >> "$NEW_PRD_OUTPUT_FILE"
+            printf '%s\n' "$filtered_matches" >> "$NEW_PRD_OUTPUT_FILE"
+            new_prd_match_found=1
+        fi
+    done
+    if [ "$new_prd_match_found" -ne 0 ]; then
+        if [ -z "${new_prd_hits_written["$abs_filepath"]}" ]; then
+            echo "$abs_filepath" >> "$NEW_PRD_HITS_TEMP"
+            new_prd_hits_written["$abs_filepath"]=1
+        fi
+        printf "\n" >> "$NEW_PRD_OUTPUT_FILE"
+    fi
+
+    other_log_header_printed=0
+    other_match_found=0
+    for condition_name in "${!OTHER_CONDITIONS[@]}"; do
+        pattern="${OTHER_CONDITIONS[$condition_name]}"
+        description="${OTHER_CONDITIONS_DESC[$condition_name]}"
+        grep_options="-I -E -n -C 5 --color=never"
+        raw_matches=$(grep $grep_options -- "$pattern" <<<"$file_content" 2>/dev/null)
+        filtered_matches=$(filter_grep_output "$raw_matches" "" "$MSG_HIT_LINE_PREFIX")
+        if [ -n "$filtered_matches" ]; then
+            if [ "$other_log_header_printed" -eq 0 ]; then
+                printf "%s\n" "$SEPARATOR_LINE_LONG" >> "$OTHER_OUTPUT_FILE"
+                printf "${MSG_FILE_LABEL}\"%s\"\n" "$filepath" >> "$OTHER_OUTPUT_FILE"
+                other_log_header_printed=1
+            fi
+            printf "%s\n" "$SEPARATOR_LINE_SHORT" >> "$OTHER_OUTPUT_FILE"
+            printf "${MSG_CONDITION_LABEL_OTHER}: %s %s\n" "$description" "$MSG_COMMENT_IGNORED_LABEL" >> "$OTHER_OUTPUT_FILE"
+            printf "${MSG_MATCHES_LABEL} (%s):\n" "$MSG_CONTEXT_LINES_LABEL" >> "$OTHER_OUTPUT_FILE"
+            printf '%s\n' "$filtered_matches" >> "$OTHER_OUTPUT_FILE"
+            other_match_found=1
+        fi
+    done
+    if [ "$other_match_found" -ne 0 ]; then
+        if [ -z "${other_hits_written["$abs_filepath"]}" ]; then
+            echo "$abs_filepath" >> "$OTHER_HITS_TEMP"
+            other_hits_written["$abs_filepath"]=1
+        fi
+        printf "\n" >> "$OTHER_OUTPUT_FILE"
     fi
 
 done < <(find "$SEARCH_PATH" -path '*/selinux/*' -prune -o -type f -not -name '*#*' -print0)
 
+# 中断要求があった場合は処理を終了
+if [ "$CANCEL_REQUESTED" -ne 0 ]; then
+    printf "%s\n" "$MSG_OPERATION_CANCELLED"
+    exit 130
+fi
+
 # --- 実行結果のサマリー表示 ---
 printf -- "\n%s\n" "$SEPARATOR_LINE_SHORT"
 printf "%s\n" "$MSG_SEARCH_COMPLETED_PRIMARY"
-printf -- "${MSG_CHECK_NEW_INFRA_LOG}" "$NEW_INFRA_OUTPUT_FILE"
+printf -- "${MSG_CHECK_NEW_STG_LOG}" "$NEW_STG_OUTPUT_FILE"
+printf -- "${MSG_CHECK_NEW_PRD_LOG}" "$NEW_PRD_OUTPUT_FILE"
+printf -- "${MSG_CHECK_OTHER_LOG}" "$OTHER_OUTPUT_FILE"
 printf -- "${MSG_CHECK_CURRENT_INFRA_LOG}" "$CURRENT_INFRA_OUTPUT_FILE"
 printf -- "${MSG_SUMMARY_TOTAL_FILES_SCANNED}\n" "$TOTAL_FILES_SCANNED"
-
-# commコマンドで、両方の基盤定義にヒットしたファイルを抽出
-if [ -s "$CURRENT_INFRA_HITS_TEMP" ] && [ -s "$NEW_INFRA_HITS_TEMP" ]; then
-    comm -12 <(sort -u "$CURRENT_INFRA_HITS_TEMP") <(sort -u "$NEW_INFRA_HITS_TEMP") > "$BOTH_HITS_TEMP"
-fi
 
 chmod -R 777 "${OUTPUT_DIR}"
 
 printf "\n%s\n" "$MSG_CURRENT_INFRA_HITS_HEADER"
 print_filtered_hit_list "$CURRENT_INFRA_HITS_TEMP"
 
-# --- 分類されたサマリー表示 ---
-printf "\n%s\n" "$MSG_NEW_INFRA_HITS_HEADER_STG"
-print_filtered_hit_list "$NEW_INFRA_STG_HITS_TEMP"
+printf "\n%s\n" "$MSG_NEW_STG_HITS_HEADER"
+print_filtered_hit_list "$NEW_STG_HITS_TEMP"
 
-printf "\n%s\n" "$MSG_NEW_INFRA_HITS_HEADER_PROD"
-print_filtered_hit_list "$NEW_INFRA_PROD_HITS_TEMP"
+printf "\n%s\n" "$MSG_NEW_PRD_HITS_HEADER"
+print_filtered_hit_list "$NEW_PRD_HITS_TEMP"
 
-# 「その他条件」のヒットから、ホスト名でのヒットを重複して表示しないように除外
-if [ -s "$NEW_INFRA_OTHER_HITS_TEMP" ]; then
-    cut -d: -f2- "$NEW_INFRA_OTHER_HITS_TEMP" | sort -u > "$NEW_INFRA_OTHER_HITS_TEMP.paths"
-    comm -23 "$NEW_INFRA_OTHER_HITS_TEMP.paths" <(sort -u "$NEW_INFRA_STG_HITS_TEMP" "$NEW_INFRA_PROD_HITS_TEMP") > "$NEW_INFRA_OTHER_HITS_TEMP.finalpaths"
-    if [ -s "$NEW_INFRA_OTHER_HITS_TEMP.finalpaths" ]; then
-        grep -F -f "$NEW_INFRA_OTHER_HITS_TEMP.finalpaths" "$NEW_INFRA_OTHER_HITS_TEMP" > "$NEW_INFRA_OTHER_HITS_TEMP.final"
-    else
-        : > "$NEW_INFRA_OTHER_HITS_TEMP.final"
-    fi
-fi
-
-print_detailed_other_hits "$NEW_INFRA_OTHER_HITS_TEMP.final"
-
-printf "\n%s\n" "$MSG_BOTH_LOGS_HITS_HEADER"
-print_both_logs_hit_list "$BOTH_HITS_TEMP"
+printf "\n%s\n" "$MSG_OTHER_HITS_HEADER"
+print_filtered_hit_list "$OTHER_HITS_TEMP"
 
 printf "\n処理にかかった時間: %d 秒\n" "$SECONDS"
 
