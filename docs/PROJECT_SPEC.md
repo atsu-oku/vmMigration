@@ -80,7 +80,7 @@ All file modifications are performed via the `_write_guest_file` helper, which:
 - Every file mutation creates a timestamped `-YYYYMMDD.bak` copy in place (hosts, profile, firewalld zone XMLs, NTP configs, yum repos, td-agent repo, iptables).
 - Firewalld rewrites ensure only a single backup per zone per run to avoid clutter.
 - TLS repair attempts are logged step-by-step; unresolved issues downgrade to `[WARN]` while leaving the original files untouched.
-- Execution summary highlights backup paths so operators can roll back manually if required.
+- Execution summary highlights backup paths so operators can roll back manually if required.  For the shell-side helper (`find_and_extract.sh`), see `docs/FIND_AND_EXTRACT_TOOL.md` for automated transform/rollback guidance.
 
 ---
 
