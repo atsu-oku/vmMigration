@@ -98,6 +98,7 @@ if [[ "$ORIGINAL_LANG" == ja_JP* ]]; then
     MSG_VERBOSE_SCANNING_FILE="ファイルをスキャン中: "
     MSG_VERBOSE_SKIPPING_BACKUP_FILE="バックアップファイルをスキップ: "
     MSG_VERBOSE_SKIPPING_BINARY_FILE="バイナリまたはサイズ超過のファイルをスキップ: "
+    MSG_VERBOSE_SKIPPING_PROTECTED_FILE="除外対象の設定ファイルをスキップ: "
     MSG_SUMMARY_TOTAL_FILES_SCANNED="スキャンした総ファイル数: %d"
     MSG_ERROR_PREFIX="エラー: "
     MSG_ERROR_BASH_VERSION_TOO_LOW="このスクリプトの実行にはBashバージョン %s.0 以上が必要です。現在のバージョンは %s.%s です。\n"
@@ -221,6 +222,7 @@ else
     MSG_VERBOSE_SCANNING_FILE="Scanning file: "
     MSG_VERBOSE_SKIPPING_BACKUP_FILE="Skipping backup file: "
     MSG_VERBOSE_SKIPPING_BINARY_FILE="Skipping binary/oversized file: "
+    MSG_VERBOSE_SKIPPING_PROTECTED_FILE="Skipping protected configuration file: "
     MSG_SUMMARY_TOTAL_FILES_SCANNED="Total files scanned: %d"
     MSG_ERROR_PREFIX="Error: "
     MSG_ERROR_BASH_VERSION_TOO_LOW="This script requires Bash version %s.0 or higher. Your version is %s.%s.\n"
@@ -956,6 +958,12 @@ run_transform() {
                 continue
                 ;;
         esac
+        if [ "$filepath" = "/etc/nginx/nginx.conf" ] || [ "$filepath" = "/etc/httpd/httpd.conf" ]; then
+            if [ "$VERBOSE_MODE" -eq 1 ]; then
+                printf "%s%s\n" "${MSG_VERBOSE_PREFIX}" "${MSG_VERBOSE_SKIPPING_PROTECTED_FILE}$filepath"
+            fi
+            continue
+        fi
         total_files_scanned_transform=$((total_files_scanned_transform + 1))
         if [ "$SKIP_BACKUP_FILES_MODE" -eq 1 ] && is_backup_file_name "$(basename "$filepath")"; then
             if [ "$VERBOSE_MODE" -eq 1 ]; then
@@ -1602,6 +1610,12 @@ while IFS= read -r -d $'\0' filepath; do
             continue
             ;;
     esac
+    if [ "$filepath" = "/etc/nginx/nginx.conf" ] || [ "$filepath" = "/etc/httpd/httpd.conf" ]; then
+        if [ "$VERBOSE_MODE" -eq 1 ]; then
+            printf "%s%s\n" "${MSG_VERBOSE_PREFIX}" "${MSG_VERBOSE_SKIPPING_PROTECTED_FILE}$filepath"
+        fi
+        continue
+    fi
     TOTAL_FILES_SCANNED=$((TOTAL_FILES_SCANNED + 1))
     abs_filepath=$(readlink -f "$filepath" 2>/dev/null || echo "$filepath")
 
