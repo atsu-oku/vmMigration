@@ -8,48 +8,11 @@
 # -----------------------------------------------------------------------------
 #  改変履歴
 # -----------------------------------------------------------------------------
-#  v2.7.0.1 - (提供された初期バージョン)
-#  v2.8.0.0 - 検索条件を連想配列にリファクタリング。
-#  v2.8.1.0 - 複合検索条件を個別の条件に分解。
-#  v2.8.2.0 - 不正なIPアドレス形式の検出機能を追加。
-#  v2.8.3.0 - 新基盤ホスト名リストを網羅する正規表現を定義。
-#  v2.8.4.0 - 新基盤ホスト名リストの固定数値を正規表現に汎化。
-#  v2.8.5.0 - 新基盤ホスト名定義の末尾s/pを両方許容するよう変更。
-#  v2.8.6.0 - 標準出力サマリーをStaging/Productionに分けて表示するよう修正。
-#  v2.8.7.0 - 未知のプレフィックスを持つ新基盤ホスト名を検出する汎用的な正規表現を追加。
-#  v2.8.8.0 - 現行基盤の旧ホスト名リストを正規表現パターン化。
-#  v2.8.9.0 - ループ内での `local` 変数宣言エラーを修正。「その他条件」を詳細化。
-#  v2.9.0.0 - ログの趣旨に合わせて「メインログ」を「現行基盤定義」等に名称変更 (後に誤りと判明)。
-#  v2.9.1.0 - SELinux関連パスと"#"を含むファイル名を除外。
-#  v2.9.2.0 - is_backup_file_name関数の未定義エラーを修正。
-#  v2.9.3.0 - 「新基盤」と「現行基盤」の定義が逆だった問題を修正。
-#  v2.9.4.0 - 詳細な改変履歴をコード内に記載。
-#  v2.9.5.0 - ホスト名のStaging/Production判定ロジックを修正し、誤判定を防止。
-#  v2.9.6.0 - 現行基盤ホスト名の正規表現を修正し、'dmp'プレフィックスの検出漏れを解消。
-#  v2.9.7.0 - 新基盤ホスト名の正規表現を修正し、数字の桁数を可変長に変更。
-#  v2.9.8.0 - 新基盤ホスト名のStaging/Production判定ロジックを堅牢な方式に修正。
-#  v2.9.9.0 - 標準出力サマリーの詳細表示部分に改行を追加。
-#  v3.0.0.0 - 標準出力サマリーの詳細表示部分の改行不具合を修正。
-#  v3.1.0.0 - LPIC Level2技術者向けに詳細な日本語コメントを付加。
-#  v3.1.1.0 - 指示に基づき、詳細な改変履歴をヘッダーに記載。
-#  v3.1.2.0 - LPIC Level1技術者向けに、より詳細なコメントを追記。
-#  v3.1.3.0 - 環境文字列の検索条件を現行・新基盤に正しく振り分け。
-#  v3.1.4.0 - 実行開始時に区切り線が複数表示される不具合を修正。
-#  v3.1.5.0 - 現行基盤のIPアドレス検索条件を追加。
-#  v3.1.6.0 - 現行基盤ホスト名の正規表現を修正し、'dmp'プレフィックスの検出漏れを解消。
-#  v3.1.7.0 - 新基盤ホスト名の正規表現を修正し、'dlagency'と'agency'プレフィックスの検出漏れを解消。
-#  v3.1.8.0 - スクリプト実行時に表示されるヘッダーのフォーマット不具合を修正。
-#  v3.1.9.0 - 現行基盤ホスト名の正規表現を修正し、'dmp', 'ltt', 'biz'プレフィックスの検出漏れを解消。
-#  v3.2.0.0 - 現行基盤のIPアドレスおよびホスト名の正規表現を修正し、検出漏れを解消。
-#  v3.2.1.0 - 現行基盤のIPアドレス検索条件からAWS関連のものを分離。
-#  v3.2.2.0 - 現行基盤ホスト名の正規表現を修正し、'dmp', 'ltt', 'biz'プレフィックスを持つサーバーの検出漏れを解消。
-#  v3.2.3.0 - 現行基盤ホスト名の正規表現をさらに修正し、'dmp', 'ltt', 'biz'プレフィックスを持つサーバーの検出漏れを解消。
-#  v3.2.4.0 - 2025/08/01: 現行基盤ホスト名の正規表現を再度修正し、'dmp', 'ltt', 'biz'
-#             プレフィックスを持つサーバーの検出漏れを解消。
+#  バージョン履歴はリポジトリの CHANGELOG_find_and_extract.md を参照してください。
 ###############################################################################
 
 # --- スクリプトバージョン ---
-SCRIPT_VERSION="3.2.4.0"
+SCRIPT_VERSION="3.4.0.0"
 
 # === 出力ディレクトリを /tmp に固定 ==================================
 # スクリプト名から拡張子(.sh)を除いた部分を取得
@@ -85,6 +48,16 @@ cleanup() {
           "$BOTH_HITS_TEMP" "$PERMISSION_CHECK_TEST_FILE_TEMP" 2>/dev/null
     # サマリー表示用に生成される中間ファイルも削除
     rm -f "$NEW_INFRA_OTHER_HITS_TEMP.final" "$NEW_INFRA_OTHER_HITS_TEMP.paths" "$NEW_INFRA_OTHER_HITS_TEMP.finalpaths" 2>/dev/null
+    for temp_path in "${TRANSFORM_TEMP_PATHS[@]}"; do
+        if [ -n "$temp_path" ]; then
+            rm -f "$temp_path" 2>/dev/null
+        fi
+    done
+    for diff_path in "${TRANSFORM_DIFF_PATHS[@]}"; do
+        if [ -n "$diff_path" ]; then
+            rm -f "$diff_path" 2>/dev/null
+        fi
+    done
     # 退避しておいたロケール設定を復元
     export LANG="$ORIGINAL_LANG"
     export LC_ALL="$ORIGINAL_LC_ALL"
@@ -99,10 +72,7 @@ export LC_ALL=C
 # 環境変数LANGが "ja_JP" で始まる場合、メッセージを日本語に設定
 if [[ "$ORIGINAL_LANG" == ja_JP* ]]; then
     # 日本語メッセージ
-    MSG_USAGE_LINE1_EXTENDED="使用方法: $0 [オプション] <検索対象パス>  または  $0 --deletelogs"
-    MSG_USAGE_OPTIONS_HEADER="オプション:"
-    MSG_USAGE_OPTION_VERBOSE="  -v, --verbose      詳細な情報を表示します。"
-    MSG_USAGE_OPTION_SKIP_BACKUP_FILES="  --skip-backup-files バックアップと思われるファイルのスキャンを抑止します。"
+    printf -v MSG_USAGE_LINE1_EXTENDED "使用方法:\n  %s [scan|transform|rollback] [オプション] <対象パス>\n  %s --deletelogs\n\nサブコマンド:\n  scan        現行/新基盤定義をスキャン (従来動作)\n  transform   新基盤(STG)の値をPRDに変換 (デフォルトはドライラン)\n  rollback    変換ログを基にロールバックを実行\n\n主なオプション:\n  -v, --verbose          詳細なログを表示\n  --skip-backup-files   バックアップと思われるファイルを除外\n  --dry-run             変換を出力のみで実施 (transformのデフォルト)\n  --apply               変換を実際に適用 (確認プロンプトあり)\n  --file <パス>         rollbackで指定したファイルのみ復元" "$0" "$0"
     MSG_ERROR_INVALID_OPTION="無効なオプションまたはオプションの組み合わせです。"
     MSG_ERROR_INVALID_INPUT="入力が不正です。yes または no を入力してください。"
     MSG_ERROR_INVALID_IP_FORMAT="ファイル「%s」の %s 行目に不正な形式のIPアドレス \"%s\" が見つかりました。\n"
@@ -134,6 +104,41 @@ if [[ "$ORIGINAL_LANG" == ja_JP* ]]; then
     MSG_LOG_DELETE_FAILED="エラー: %s の削除に失敗しました。\n"
     MSG_LOG_DELETE_COMPLETED="ログファイルの削除処理が完了しました。"
     MSG_LOG_DELETE_CANCELLED="ログファイルの削除はキャンセルされました。"
+    MSG_DELETELLOGS_NOT_ALLOWED="--deletelogs は transform サブコマンドでは使用できません。"
+    MSG_ERROR_APPLY_ONLY_TRANSFORM="--apply は transform サブコマンドでのみ利用できます。"
+    MSG_ERROR_DRY_RUN_ONLY_TRANSFORM="--dry-run は transform サブコマンドでのみ利用できます。"
+    MSG_TRANSFORM_MODE_HEADER="--- 変換モード ---"
+    MSG_TRANSFORM_DRY_RUN_NOTICE="ドライランで実行します。ファイルには変更を加えません。"
+    MSG_TRANSFORM_APPLY_NOTICE="変更点を検出し、確認後に適用します。"
+    MSG_TRANSFORM_SUMMARY_HEADER="--- 変換サマリー ---"
+    MSG_TRANSFORM_FILE_WOULD_CHANGE="変更予定: %s"
+    MSG_TRANSFORM_FILE_CHANGED="変更しました: %s (バックアップ: %s)"
+    MSG_TRANSFORM_FILE_FAILED="エラー: %s の変更に失敗しました。"
+    MSG_TRANSFORM_APPLY_CONFIRM="変更対象 %d 件に対して更新を適用しますか？ (yes/no): "
+    MSG_TRANSFORM_APPLY_CANCELLED="変更はキャンセルされました。"
+    MSG_TRANSFORM_NO_CHANGES="変更対象のファイルは見つかりませんでした。"
+    MSG_TRANSFORM_DRY_RUN_COMPLETED="ドライランが完了しました。"
+    MSG_TRANSFORM_APPLY_COMPLETED="変換を完了しました。"
+    MSG_TRANSFORM_APPLY_SKIPPED="適用処理をスキップしました。"
+    MSG_TRANSFORM_FAILED_HEADER="--- 失敗したファイル ---"
+    MSG_TRANSFORM_DIFF_HEADER="--- 差分: %s ---"
+    MSG_ERROR_TRANSFORM_EXECUTION="変換処理でエラーが発生しました: %s"
+    MSG_TRANSFORM_TOTAL_CHANGED="変更対象: %d 件"
+    MSG_TRANSFORM_TOTAL_FAILED="失敗: %d 件"
+    MSG_TRANSFORM_NEWPROD_BASE_MISSING="期待する基底ディレクトリ %s が見つかりません。"
+    MSG_TRANSFORM_NEWPROD_DIR_NOT_FOUND="/var/www/com/ipet-ins/ 配下に newproduction 設定ディレクトリが見つかりません。"
+    MSG_TRANSFORM_NEWPROD_FILES_MISSING="%s に必要な設定ファイルが不足しています: %s"
+    MSG_TRANSFORM_LOG_SAVED="ロールバックログを %s に保存しました。"
+    MSG_ROLLBACK_MODE_HEADER="--- ロールバックモード ---"
+    MSG_ROLLBACK_LOG_NOT_FOUND="指定されたロールバックログが見つかりません: %s"
+    MSG_ROLLBACK_INVALID_LINE="ロールバックログの形式が不正です: %s"
+    MSG_ROLLBACK_BACKUP_MISSING="バックアップが存在しません: %s"
+    MSG_ROLLBACK_FILE_RESTORED="復元しました: %s"
+    MSG_ROLLBACK_FILE_FAILED="復元に失敗しました: %s"
+    MSG_ROLLBACK_NO_ENTRIES="ロールバックログに復元対象がありません。"
+    MSG_ROLLBACK_SUMMARY="復元: %d 件 / 失敗: %d 件"
+    MSG_ERROR_ROLLBACK_FILE_OPTION="--file は rollback サブコマンドでのみ使用できます。"
+    MSG_ROLLBACK_TARGET_NOT_FOUND="ロールバック対象がログに見つかりません: %s"
     MSG_SEARCH_COMPLETED_PRIMARY="検索が完了しました。"
     MSG_CHECK_NEW_INFRA_LOG="新基盤の定義に関するログは %s を確認してください。\n"
     MSG_CHECK_CURRENT_INFRA_LOG="現行基盤の定義に関するログは %s を確認してください。\n"
@@ -168,10 +173,7 @@ if [[ "$ORIGINAL_LANG" == ja_JP* ]]; then
     SEPARATOR_LINE_SHORT="--------------------------------------------------------------------------------"
 else
     # English Messages
-    MSG_USAGE_LINE1_EXTENDED="Usage: $0 [options] <search_path>  or  $0 --deletelogs"
-    MSG_USAGE_OPTIONS_HEADER="Options:"
-    MSG_USAGE_OPTION_VERBOSE="  -v, --verbose      Display verbose information."
-    MSG_USAGE_OPTION_SKIP_BACKUP_FILES="  --skip-backup-files Skip scanning of files that appear to be backups."
+    printf -v MSG_USAGE_LINE1_EXTENDED "Usage:\n  %s [scan|transform|rollback] [options] <target>\n  %s --deletelogs\n\nSubcommands:\n  scan        Scan for matching definitions (default)\n  transform   Rewrite STG values to PRD (dry-run by default)\n  rollback    Restore files using a transform log\n\nKey options:\n  -v, --verbose        Display verbose logging\n  --skip-backup-files Skip files that look like backups\n  --dry-run           Run without applying changes (transform default)\n  --apply             Apply replacements after confirmation\n  --file <path>       Limit rollback to specific files" "$0" "$0"
     MSG_ERROR_INVALID_OPTION="Invalid option or combination of options."
     MSG_ERROR_INVALID_INPUT="Invalid input. Please enter yes or no."
     MSG_ERROR_INVALID_IP_FORMAT="Error: Invalid IP address format \"%s\" found in file \"%s\" on line %s.\n"
@@ -203,6 +205,41 @@ else
     MSG_LOG_DELETE_FAILED="Error: Failed to delete %s.\n"
     MSG_LOG_DELETE_COMPLETED="Log file deletion process completed."
     MSG_LOG_DELETE_CANCELLED="Log file deletion cancelled."
+    MSG_DELETELLOGS_NOT_ALLOWED="--deletelogs cannot be used with the transform subcommand."
+    MSG_ERROR_APPLY_ONLY_TRANSFORM="--apply is available only with the transform subcommand."
+    MSG_ERROR_DRY_RUN_ONLY_TRANSFORM="--dry-run is available only with the transform subcommand."
+    MSG_TRANSFORM_MODE_HEADER="--- Transform Mode ---"
+    MSG_TRANSFORM_DRY_RUN_NOTICE="Running in dry-run mode. No files will be modified."
+    MSG_TRANSFORM_APPLY_NOTICE="Detected changes will be reviewed and applied after confirmation."
+    MSG_TRANSFORM_SUMMARY_HEADER="--- Transform Summary ---"
+    MSG_TRANSFORM_FILE_WOULD_CHANGE="Would change: %s"
+    MSG_TRANSFORM_FILE_CHANGED="Updated: %s (backup: %s)"
+    MSG_TRANSFORM_FILE_FAILED="Error: failed to update %s."
+    MSG_TRANSFORM_APPLY_CONFIRM="Apply updates to %d file(s)? (yes/no): "
+    MSG_TRANSFORM_APPLY_CANCELLED="Changes have been cancelled."
+    MSG_TRANSFORM_NO_CHANGES="No files require changes."
+    MSG_TRANSFORM_DRY_RUN_COMPLETED="Dry-run completed."
+    MSG_TRANSFORM_APPLY_COMPLETED="Transform operation completed."
+    MSG_TRANSFORM_APPLY_SKIPPED="Apply phase skipped."
+    MSG_TRANSFORM_FAILED_HEADER="--- Failed Files ---"
+    MSG_TRANSFORM_DIFF_HEADER="--- Diff: %s ---"
+    MSG_ERROR_TRANSFORM_EXECUTION="Transform execution failed: %s"
+    MSG_TRANSFORM_TOTAL_CHANGED="Pending updates: %d"
+    MSG_TRANSFORM_TOTAL_FAILED="Failures: %d"
+    MSG_TRANSFORM_NEWPROD_BASE_MISSING="Expected base directory %s was not found."
+    MSG_TRANSFORM_NEWPROD_DIR_NOT_FOUND="No newproduction configuration directories were found under /var/www/com/ipet-ins/."
+    MSG_TRANSFORM_NEWPROD_FILES_MISSING="Configuration directory %s is missing files: %s"
+    MSG_TRANSFORM_LOG_SAVED="Rollback log saved to %s."
+    MSG_ROLLBACK_MODE_HEADER="--- Rollback Mode ---"
+    MSG_ROLLBACK_LOG_NOT_FOUND="Rollback log not found: %s"
+    MSG_ROLLBACK_INVALID_LINE="Invalid rollback log entry: %s"
+    MSG_ROLLBACK_BACKUP_MISSING="Backup file is missing: %s"
+    MSG_ROLLBACK_FILE_RESTORED="Restored: %s"
+    MSG_ROLLBACK_FILE_FAILED="Failed to restore: %s"
+    MSG_ROLLBACK_NO_ENTRIES="No entries to restore in the rollback log."
+    MSG_ROLLBACK_SUMMARY="Restored: %d  /  Failed: %d"
+    MSG_ERROR_ROLLBACK_FILE_OPTION="--file is only available with the rollback subcommand."
+    MSG_ROLLBACK_TARGET_NOT_FOUND="Rollback target not found in the log: %s"
     MSG_SEARCH_COMPLETED_PRIMARY="Search completed."
     MSG_CHECK_NEW_INFRA_LOG="For new infrastructure definitions, please check: %s\n"
     MSG_CHECK_CURRENT_INFRA_LOG="For current infrastructure definitions, please check: %s\n"
@@ -243,6 +280,14 @@ SEARCH_PATH=""
 VERBOSE_MODE=0
 SKIP_BACKUP_FILES_MODE=0
 MIN_BASH_MAJOR_VERSION=4
+SUBCOMMAND="scan"
+TRANSFORM_DRY_RUN=1
+declare -A TRANSFORM_TEMP_PATHS=()
+declare -A TRANSFORM_DIFF_PATHS=()
+declare -A TRANSFORM_FAILURE_MESSAGES=()
+declare -a TRANSFORM_CHANGED_FILES=()
+declare -a TRANSFORM_FAILED_FILES=()
+declare -a ROLLBACK_TARGETS=()
 
 # Bashのバージョンが4未満の場合、エラーを出力して終了
 if [[ -z "${BASH_VERSINFO[0]}" ]] || [[ "${BASH_VERSINFO[0]}" -lt "$MIN_BASH_MAJOR_VERSION" ]]; then
@@ -252,6 +297,23 @@ if [[ -z "${BASH_VERSINFO[0]}" ]] || [[ "${BASH_VERSINFO[0]}" -lt "$MIN_BASH_MAJ
     exit 1
 fi
 
+if [[ $# -gt 0 ]]; then
+    case "$1" in
+        scan)
+            SUBCOMMAND="scan"
+            shift
+            ;;
+        transform)
+            SUBCOMMAND="transform"
+            shift
+            ;;
+        rollback)
+            SUBCOMMAND="rollback"
+            shift
+            ;;
+    esac
+fi
+
 # 引数を解析し、オプションと検索パスを分離
 declare -a remaining_args=()
 while [[ $# -gt 0 ]]; do
@@ -259,10 +321,40 @@ while [[ $# -gt 0 ]]; do
         -v|--verbose) VERBOSE_MODE=1; shift ;;
         --skip-backup-files) SKIP_BACKUP_FILES_MODE=1; shift ;;
         --deletelogs)
+            if [ "$SUBCOMMAND" = "transform" ]; then
+                printf "${MSG_ERROR_PREFIX}${MSG_DELETELLOGS_NOT_ALLOWED}\n" >&2
+                printf "${MSG_USAGE_LINE1_EXTENDED}\n" >&2; exit 1
+            fi
             if [ "$#" -gt 1 ] || [ ${#remaining_args[@]} -ne 0 ]; then
                 printf "${MSG_ERROR_PREFIX}${MSG_TOO_MANY_ARGS_OR_INVALID_COMBINATION}\n" >&2
                 printf "${MSG_USAGE_LINE1_EXTENDED}\n" >&2; exit 1; fi
             DELETE_LOGS_MODE=1; shift ;;
+        --apply)
+            if [ "$SUBCOMMAND" != "transform" ]; then
+                printf "${MSG_ERROR_PREFIX}${MSG_ERROR_APPLY_ONLY_TRANSFORM}\n" >&2
+                printf "${MSG_USAGE_LINE1_EXTENDED}\n" >&2; exit 1
+            fi
+            TRANSFORM_DRY_RUN=0
+            shift ;;
+        --dry-run)
+            if [ "$SUBCOMMAND" != "transform" ]; then
+                printf "${MSG_ERROR_PREFIX}${MSG_ERROR_DRY_RUN_ONLY_TRANSFORM}\n" >&2
+                printf "${MSG_USAGE_LINE1_EXTENDED}\n" >&2; exit 1
+            fi
+            TRANSFORM_DRY_RUN=1
+            shift ;;
+        --file)
+            if [ "$SUBCOMMAND" != "rollback" ]; then
+                printf "${MSG_ERROR_PREFIX}${MSG_ERROR_ROLLBACK_FILE_OPTION}\n" >&2
+                printf "${MSG_USAGE_LINE1_EXTENDED}\n" >&2; exit 1
+            fi
+            if [ $# -lt 2 ]; then
+                printf "${MSG_ERROR_PREFIX}${MSG_TOO_MANY_ARGS_OR_INVALID_COMBINATION}\n" >&2
+                printf "${MSG_USAGE_LINE1_EXTENDED}\n" >&2; exit 1
+            fi
+            ROLLBACK_TARGETS+=("$2")
+            shift 2
+            ;;
         -*) printf "${MSG_ERROR_PREFIX}${MSG_ERROR_INVALID_OPTION}: %s\n" "$1" >&2
             printf "${MSG_USAGE_LINE1_EXTENDED}\n" >&2; exit 1 ;;
         *) remaining_args+=("$1"); shift ;;
@@ -270,13 +362,27 @@ while [[ $# -gt 0 ]]; do
 done
 
 # 動作モードに応じて引数のバリデーションを行う
-if [ "$DELETE_LOGS_MODE" -eq 1 ]; then
+if [ "$SUBCOMMAND" = "rollback" ]; then
+    if [ "$DELETE_LOGS_MODE" -eq 1 ]; then
+        printf "${MSG_ERROR_PREFIX}${MSG_DELETELLOGS_NOT_ALLOWED}\n" >&2
+        printf "${MSG_USAGE_LINE1_EXTENDED}\n" >&2; exit 1
+    fi
+    if [ ${#remaining_args[@]} -ne 1 ]; then
+        printf "${MSG_ERROR_PREFIX}${MSG_TOO_MANY_ARGS_OR_INVALID_COMBINATION}\n" >&2
+        printf "${MSG_USAGE_LINE1_EXTENDED}\n" >&2; exit 1
+    fi
+    SEARCH_PATH="${remaining_args[0]}"
+    if [ ! -f "$SEARCH_PATH" ]; then
+        printf "${MSG_ERROR_PREFIX}${MSG_ROLLBACK_LOG_NOT_FOUND}\n" "$SEARCH_PATH" >&2
+        exit 1
+    fi
+elif [ "$DELETE_LOGS_MODE" -eq 1 ]; then
     # 削除モードの場合、他の引数は許可しない
     if [ ${#remaining_args[@]} -ne 0 ]; then
         printf "${MSG_ERROR_PREFIX}${MSG_TOO_MANY_ARGS_OR_INVALID_COMBINATION}\n" >&2
         printf "${MSG_USAGE_LINE1_EXTENDED}\n" >&2; exit 1; fi
 else
-    # 検索モードの場合、検索パスが1つだけ指定されていることを確認
+    # 検索/変換モードの場合、検索パスが1つだけ指定されていることを確認
     if [ ${#remaining_args[@]} -eq 0 ]; then
         printf "${MSG_ERROR_PREFIX}${MSG_SEARCH_PATH_NOT_SPECIFIED}\n" >&2
         printf "${MSG_USAGE_LINE1_EXTENDED}\n" >&2; exit 1;
@@ -347,6 +453,8 @@ if [ "$DELETE_LOGS_MODE" -eq 1 ]; then
     exit 0
 fi
 
+if [ "$SUBCOMMAND" = "scan" ] || [ "$DELETE_LOGS_MODE" -ne 0 ]; then
+
 # --- 通常実行時の初期化 ---
 check_write_permission
 HOSTNAME_VAR=$(hostname)
@@ -392,6 +500,9 @@ trap cleanup EXIT INT TERM
 printf "%s\n" "$MSG_SEARCH_START"
 printf "${MSG_SEARCH_PATH_LABEL}%s\n" "$SEARCH_PATH"
 printf "${MSG_LOG_GENERATED_LOCATION}\n"
+
+fi
+
 
 # --- ヘルパー関数の事前定義 ---
 # --- is_backup_file_name: ファイル名がバックアップファイルか判定 ---
@@ -557,6 +668,485 @@ print_both_logs_hit_list() {
     done < "$temp_hit_file"
     if [ "$items_actually_printed" -eq 0 ]; then printf "%s\n" "$MSG_NO_HITS"; fi
 }
+
+check_newproduction_structure() {
+    local base_dir="/var/www/com/ipet-ins"
+    local system_dir=""
+    local config_dir=""
+    local found_dir=0
+    local expected_files=(app.php config.php db.php email.php session.php)
+
+    if [ ! -d "$base_dir" ]; then
+        TRANSFORM_FAILED_FILES+=("$base_dir")
+        TRANSFORM_FAILURE_MESSAGES["$base_dir"]=$(printf "%s" "$(printf "$MSG_TRANSFORM_NEWPROD_BASE_MISSING" "$base_dir")")
+        return 1
+    fi
+
+    for system_dir in "$base_dir"/*; do
+        [ -d "$system_dir" ] || continue
+        config_dir="$system_dir/fuel/app/config/newproduction"
+        if [ -d "$config_dir" ]; then
+            found_dir=1
+            local missing_files=()
+            local expected=""
+            for expected in "${expected_files[@]}"; do
+                if [ ! -f "$config_dir/$expected" ]; then
+                    missing_files+=("$expected")
+                fi
+            done
+            if [ ${#missing_files[@]} -gt 0 ]; then
+                local joined=""
+                local saved_ifs=$IFS
+                IFS=', '; joined="${missing_files[*]}"
+                IFS=$saved_ifs
+                TRANSFORM_FAILED_FILES+=("$config_dir")
+                TRANSFORM_FAILURE_MESSAGES["$config_dir"]=$(printf "$MSG_TRANSFORM_NEWPROD_FILES_MISSING" "$config_dir" "$joined")
+            fi
+        fi
+    done
+
+    if [ "$found_dir" -eq 0 ]; then
+        TRANSFORM_FAILED_FILES+=("$base_dir")
+        TRANSFORM_FAILURE_MESSAGES["$base_dir"]="$MSG_TRANSFORM_NEWPROD_DIR_NOT_FOUND"
+        return 1
+    fi
+
+    return 0
+}
+
+run_transform() {
+    printf "%s\n" "$MSG_TRANSFORM_MODE_HEADER"
+    if [ "$TRANSFORM_DRY_RUN" -eq 1 ]; then
+        printf "%s\n" "$MSG_TRANSFORM_DRY_RUN_NOTICE"
+    else
+        printf "%s\n" "$MSG_TRANSFORM_APPLY_NOTICE"
+    fi
+
+    for key in "${!TRANSFORM_TEMP_PATHS[@]}"; do unset 'TRANSFORM_TEMP_PATHS[$key]'; done
+    for key in "${!TRANSFORM_DIFF_PATHS[@]}"; do unset 'TRANSFORM_DIFF_PATHS[$key]'; done
+    for key in "${!TRANSFORM_FAILURE_MESSAGES[@]}"; do unset 'TRANSFORM_FAILURE_MESSAGES[$key]'; done
+    TRANSFORM_CHANGED_FILES=()
+    TRANSFORM_FAILED_FILES=()
+
+    local total_files_scanned_transform=0
+    local transform_output=""
+    local status=0
+    local temp_transformed=""
+    local diff_file=""
+    local change_log=""
+    local host_for_log="$(hostname 2>/dev/null || echo unknown)"
+
+    if [ "$SEARCH_PATH" = "/var" ] || [ "$SEARCH_PATH" = "/var/" ]; then
+        check_newproduction_structure
+    fi
+
+    while IFS= read -r -d $'\0' filepath; do
+        total_files_scanned_transform=$((total_files_scanned_transform + 1))
+        if [ "$SKIP_BACKUP_FILES_MODE" -eq 1 ] && is_backup_file_name "$(basename "$filepath")"; then
+            if [ "$VERBOSE_MODE" -eq 1 ]; then
+                printf "%s%s\n" "${MSG_VERBOSE_PREFIX}" "${MSG_VERBOSE_SKIPPING_BACKUP_FILE}$filepath"
+            fi
+            continue
+        fi
+        if [ "$VERBOSE_MODE" -eq 1 ]; then
+            printf "%s%s\n" "${MSG_VERBOSE_PREFIX}" "${MSG_VERBOSE_SCANNING_FILE}$filepath"
+        fi
+
+        temp_transformed=$(mktemp) || {
+            printf "${MSG_ERROR_PREFIX}${MSG_TEMP_FILE_CREATION_FAILED}" "transform" >&2
+            return 1
+        }
+
+        transform_output=$(awk -v target_path="$filepath" -f - "$filepath" > "$temp_transformed" 2>&1 <<'AWK'
+BEGIN {
+    ip_regex = "[0-9]{1,3}(\\.[0-9]{1,3}){3}(/[0-9]{1,2})?"
+    changed = 0
+}
+
+function convert_ip(token, arr, base, suffix, i) {
+    suffix = ""
+    if (token ~ /\//) {
+        split(token, arr, "/")
+        base = arr[1]
+        suffix = "/" arr[2]
+    } else {
+        base = token
+    }
+    split(base, arr, ".")
+    if (length(arr) != 4) {
+        return token
+    }
+    for (i = 1; i <= 4; i++) {
+        if (arr[i] !~ /^[0-9]+$/) {
+            return token
+        }
+        arr[i] += 0
+        if (arr[i] < 0 || arr[i] > 255) {
+            return token
+        }
+    }
+    if (arr[3] >= 170 && arr[3] <= 179) {
+        arr[3] -= 10
+        changed = 1
+        return arr[1] "." arr[2] "." arr[3] "." arr[4] suffix
+    }
+    return token
+}
+function rebuild_with_ip(str, rem, result, prefix, token, converted) {
+    rem = str
+    result = ""
+    while (match(rem, ip_regex)) {
+        prefix = substr(rem, 1, RSTART - 1)
+        token = substr(rem, RSTART, RLENGTH)
+        converted = convert_ip(token)
+        result = result prefix converted
+        rem = substr(rem, RSTART + RLENGTH)
+        if (converted != token) {
+            changed = 1
+        }
+    }
+    return result rem
+}
+function replace_zero_ns(str, rem, result, prefix, next_char) {
+    rem = str
+    result = ""
+    while (match(rem, /0[0-9]+s/)) {
+        prefix = substr(rem, 1, RSTART - 1)
+        next_char = substr(rem, RSTART + RLENGTH, 1)
+        if (next_char != "" && next_char ~ /[[:alnum:]_]/) {
+            result = result substr(rem, 1, RSTART + RLENGTH - 1)
+            rem = substr(rem, RSTART + RLENGTH)
+            continue
+        }
+        result = result prefix "0np"
+        rem = substr(rem, RSTART + RLENGTH)
+        changed = 1
+    }
+    return result rem
+}
+function replace_trailing_s(str, rem, result, prefix, digit, next_char) {
+    rem = str
+    result = ""
+    while (match(rem, /[0-9]s/)) {
+        prefix = substr(rem, 1, RSTART - 1)
+        digit = substr(rem, RSTART, 1)
+        next_char = substr(rem, RSTART + RLENGTH, 1)
+        if (next_char != "" && next_char ~ /[[:alnum:]_]/) {
+            result = result substr(rem, 1, RSTART + RLENGTH - 1)
+            rem = substr(rem, RSTART + RLENGTH)
+            continue
+        }
+        result = result prefix digit "p"
+        rem = substr(rem, RSTART + RLENGTH)
+        changed = 1
+    }
+    return result rem
+}
+function replace_stg_tokens(str, prefix, suffix, before_char, after_char, result) {
+    result = ""
+    while (match(str, /stg/)) {
+        prefix = substr(str, 1, RSTART - 1)
+        suffix = substr(str, RSTART + RLENGTH)
+        before_char = (RSTART > 1) ? substr(str, RSTART - 1, 1) : ""
+        after_char = (length(str) >= RSTART + RLENGTH) ? substr(str, RSTART + RLENGTH, 1) : ""
+        if ((before_char == "" || before_char !~ /[[:alnum:]]/) && (after_char == "" || after_char !~ /[[:alnum:]]/)) {
+            result = result prefix "prd"
+            str = suffix
+            changed = 1
+        } else {
+            result = result prefix substr(str, RSTART, RLENGTH)
+            str = suffix
+        }
+    }
+    return result str
+}
+{
+    is_httpd_conf = (target_path ~ /\.conf($|\.)/ || target_path ~ /\/etc\/httpd\//)
+    line = rebuild_with_ip($0)
+    updated = replace_zero_ns(line)
+    if (updated != line) {
+        line = updated
+    }
+    line = updated
+    updated = replace_trailing_s(line)
+    if (updated != line) {
+        line = updated
+    }
+    if (line ~ /^[[:space:]]*([0-9]{1,3}\.){3}[0-9]{1,3}/ || line ~ /Hostname[[:space:]]*=/ || line ~ /PRETTY_HOSTNAME[[:space:]]*=/) {
+        line = replace_stg_tokens(line)
+    }
+    if (is_httpd_conf && gsub(/newstaging/, "newproduction", line) > 0) {
+        changed = 1
+    }
+    print line
+}
+END {
+    if (changed) {
+        exit 0
+    }
+    exit 3
+}
+AWK
+        )
+        status=$?
+        if [ $status -eq 0 ]; then
+            TRANSFORM_TEMP_PATHS["$filepath"]="$temp_transformed"
+            TRANSFORM_CHANGED_FILES+=("$filepath")
+            if [ "$VERBOSE_MODE" -eq 1 ] || [ "$TRANSFORM_DRY_RUN" -eq 1 ]; then
+                diff_file=$(mktemp) || diff_file=""
+                if [ -n "$diff_file" ]; then
+                    diff -u "$filepath" "$temp_transformed" > "$diff_file" 2>/dev/null || true
+                    TRANSFORM_DIFF_PATHS["$filepath"]="$diff_file"
+                fi
+            fi
+        elif [ $status -eq 3 ]; then
+            rm -f "$temp_transformed" 2>/dev/null
+        else
+            rm -f "$temp_transformed" 2>/dev/null
+            TRANSFORM_FAILED_FILES+=("$filepath")
+            if [ -z "$transform_output" ]; then
+                transform_output="(no additional details)"
+            fi
+            TRANSFORM_FAILURE_MESSAGES["$filepath"]="$transform_output"
+            printf "${MSG_ERROR_PREFIX}${MSG_ERROR_TRANSFORM_EXECUTION}\n" "$transform_output" >&2
+        fi
+    done < <(find "$SEARCH_PATH" -path '*/selinux/*' -prune -o -type f -not -name '*#*' -print0)
+
+    printf "\n%s\n" "$MSG_TRANSFORM_SUMMARY_HEADER"
+    printf "${MSG_SUMMARY_TOTAL_FILES_SCANNED}\n" "$total_files_scanned_transform"
+    printf "${MSG_TRANSFORM_TOTAL_CHANGED}\n" "${#TRANSFORM_CHANGED_FILES[@]}"
+    printf "${MSG_TRANSFORM_TOTAL_FAILED}\n" "${#TRANSFORM_FAILED_FILES[@]}"
+
+    if [ "${#TRANSFORM_FAILED_FILES[@]}" -gt 0 ]; then
+        printf "\n%s\n" "$MSG_TRANSFORM_FAILED_HEADER"
+        for file in "${TRANSFORM_FAILED_FILES[@]}"; do
+            printf "  %s\n" "$file"
+            if [ -n "${TRANSFORM_FAILURE_MESSAGES[$file]}" ]; then
+                printf "    %s\n" "${TRANSFORM_FAILURE_MESSAGES[$file]}"
+            fi
+        done
+    fi
+
+    if [ "${#TRANSFORM_CHANGED_FILES[@]}" -eq 0 ]; then
+        printf "%s\n" "$MSG_TRANSFORM_NO_CHANGES"
+        if [ "$TRANSFORM_DRY_RUN" -eq 1 ]; then
+            printf "%s\n" "$MSG_TRANSFORM_DRY_RUN_COMPLETED"
+        else
+            printf "%s\n" "$MSG_TRANSFORM_APPLY_SKIPPED"
+        fi
+        return 0
+    fi
+
+    local -a sorted_changed_files=()
+    mapfile -t sorted_changed_files < <(printf '%s\n' "${TRANSFORM_CHANGED_FILES[@]}" | sort -u)
+    for file in "${sorted_changed_files[@]}"; do
+        printf "$MSG_TRANSFORM_FILE_WOULD_CHANGE\n" "$file"
+        if [ "$VERBOSE_MODE" -eq 1 ]; then
+            diff_file="${TRANSFORM_DIFF_PATHS[$file]:-}"
+            if [ -n "$diff_file" ] && [ -s "$diff_file" ]; then
+                printf "$MSG_TRANSFORM_DIFF_HEADER\n" "$file"
+                cat "$diff_file"
+            fi
+        fi
+    done
+
+    if [ "$TRANSFORM_DRY_RUN" -eq 1 ]; then
+        printf "%s\n" "$MSG_TRANSFORM_DRY_RUN_COMPLETED"
+        for file in "${sorted_changed_files[@]}"; do
+            diff_file="${TRANSFORM_DIFF_PATHS[$file]:-}"
+            temp_transformed="${TRANSFORM_TEMP_PATHS[$file]:-}"
+            if [ -n "$diff_file" ]; then rm -f "$diff_file" 2>/dev/null; fi
+            if [ -n "$temp_transformed" ]; then rm -f "$temp_transformed" 2>/dev/null; fi
+            unset 'TRANSFORM_DIFF_PATHS[$file]'
+            unset 'TRANSFORM_TEMP_PATHS[$file]'
+        done
+        TRANSFORM_CHANGED_FILES=()
+        return 0
+    fi
+
+    printf "$MSG_TRANSFORM_APPLY_CONFIRM" "${#sorted_changed_files[@]}"
+    local apply_confirmation
+    read -r apply_confirmation
+    local lower_response
+    lower_response=$(echo "$apply_confirmation" | tr '[:upper:]' '[:lower:]')
+    if [[ ! "$lower_response" =~ ^(yes|y)$ ]]; then
+        printf "%s\n" "$MSG_TRANSFORM_APPLY_CANCELLED"
+        printf "%s\n" "$MSG_TRANSFORM_APPLY_SKIPPED"
+        return 0
+    fi
+
+    local timestamp
+    timestamp=$(date +%Y%m%d_%H%M%S)
+    local apply_failures=0
+    if [ "$TRANSFORM_DRY_RUN" -eq 0 ]; then
+        change_log="${OUTPUT_DIR}/${host_for_log}_${timestamp}_transform.log"
+        printf "# original_path\tbackup_path\toriginal_mode\toriginal_owner\toriginal_group\n" > "$change_log"
+    fi
+
+    for file in "${sorted_changed_files[@]}"; do
+        local temp_file="${TRANSFORM_TEMP_PATHS[$file]}"
+        local diff_saved="${TRANSFORM_DIFF_PATHS[$file]:-}"
+        local backup_path="${file}.bak_${timestamp}"
+        local orig_mode orig_owner orig_group
+
+        orig_mode=$(stat -c '%a' "$file" 2>/dev/null)
+        orig_owner=$(stat -c '%u' "$file" 2>/dev/null)
+        orig_group=$(stat -c '%g' "$file" 2>/dev/null)
+
+        if ! cp -p "$file" "$backup_path" 2>/dev/null; then
+            if ! cp "$file" "$backup_path" 2>/dev/null; then
+                printf "${MSG_ERROR_PREFIX}${MSG_TRANSFORM_FILE_FAILED}\n" "$file" >&2
+                apply_failures=$((apply_failures + 1))
+                if [ -n "$temp_file" ]; then rm -f "$temp_file" 2>/dev/null; fi
+                if [ -n "$diff_saved" ]; then rm -f "$diff_saved" 2>/dev/null; fi
+                unset 'TRANSFORM_TEMP_PATHS[$file]'
+                unset 'TRANSFORM_DIFF_PATHS[$file]'
+                continue
+            fi
+        fi
+
+        if ! cat "$temp_file" > "$file"; then
+            printf "${MSG_ERROR_PREFIX}${MSG_TRANSFORM_FILE_FAILED}\n" "$file" >&2
+            cp "$backup_path" "$file" 2>/dev/null
+            apply_failures=$((apply_failures + 1))
+            if [ -n "$temp_file" ]; then rm -f "$temp_file" 2>/dev/null; fi
+            if [ -n "$diff_saved" ]; then rm -f "$diff_saved" 2>/dev/null; fi
+            unset 'TRANSFORM_TEMP_PATHS[$file]'
+            unset 'TRANSFORM_DIFF_PATHS[$file]'
+            continue
+        fi
+
+        if [ -n "$orig_mode" ]; then chmod "$orig_mode" "$file" 2>/dev/null || true; fi
+        if [ -n "$orig_owner" ] && [ -n "$orig_group" ]; then
+            chown "$orig_owner:$orig_group" "$file" 2>/dev/null || true
+        fi
+
+        printf "$MSG_TRANSFORM_FILE_CHANGED\n" "$file" "$backup_path"
+        if [ -n "$temp_file" ]; then rm -f "$temp_file" 2>/dev/null; fi
+        if [ -n "$diff_saved" ]; then rm -f "$diff_saved" 2>/dev/null; fi
+        unset 'TRANSFORM_TEMP_PATHS[$file]'
+        unset 'TRANSFORM_DIFF_PATHS[$file]'
+        if [ -n "$change_log" ]; then
+            printf "%s\t%s\t%s\t%s\t%s\n" \
+                "$file" "$backup_path" "${orig_mode:-}" "${orig_owner:-}" "${orig_group:-}" >> "$change_log"
+        fi
+    done
+
+    TRANSFORM_CHANGED_FILES=()
+    if [ $apply_failures -eq 0 ]; then
+        printf "%s\n" "$MSG_TRANSFORM_APPLY_COMPLETED"
+        if [ -n "$change_log" ] && [ -f "$change_log" ]; then
+            printf "$MSG_TRANSFORM_LOG_SAVED\n" "$change_log"
+        fi
+        return 0
+    fi
+
+    printf "${MSG_TRANSFORM_TOTAL_FAILED}\n" "$apply_failures"
+    if [ -n "$change_log" ] && [ -f "$change_log" ]; then
+        printf "$MSG_TRANSFORM_LOG_SAVED\n" "$change_log"
+    fi
+    return 1
+}
+
+run_rollback() {
+    local log_file="$SEARCH_PATH"
+    local restored_count=0
+    local failed_count=0
+    local -A target_seen=()
+    local use_targets=0
+    local target
+
+    printf "%s\n" "$MSG_ROLLBACK_MODE_HEADER"
+
+    if [ ! -f "$log_file" ]; then
+        printf "${MSG_ERROR_PREFIX}${MSG_ROLLBACK_LOG_NOT_FOUND}\n" "$log_file" >&2
+        exit 1
+    fi
+
+    if [ ${#ROLLBACK_TARGETS[@]} -gt 0 ]; then
+        use_targets=1
+        for target in "${ROLLBACK_TARGETS[@]}"; do
+            target_seen["$target"]=0
+        done
+    fi
+
+    while IFS=$'\t' read -r original_path backup_path original_mode original_owner original_group; do
+        if [[ "$original_path" =~ ^# ]] || { [ -z "$original_path" ] && [ -z "$backup_path" ]; }; then
+            continue
+        fi
+
+        if [ -z "$original_path" ] || [ -z "$backup_path" ]; then
+            printf "${MSG_ERROR_PREFIX}${MSG_ROLLBACK_INVALID_LINE}\n" "$original_path" >&2
+            failed_count=$((failed_count + 1))
+            continue
+        fi
+
+        if [ $use_targets -eq 1 ]; then
+            if [[ ${target_seen[$original_path]+_} ]]; then
+                :
+            else
+                continue
+            fi
+        fi
+
+        if [ ! -f "$backup_path" ]; then
+            printf "${MSG_ERROR_PREFIX}${MSG_ROLLBACK_BACKUP_MISSING}\n" "$backup_path" >&2
+            failed_count=$((failed_count + 1))
+            continue
+        fi
+
+        if ! cp -p "$backup_path" "$original_path" 2>/dev/null; then
+            if ! cp "$backup_path" "$original_path" 2>/dev/null; then
+                printf "${MSG_ERROR_PREFIX}${MSG_ROLLBACK_FILE_FAILED}\n" "$original_path" >&2
+                failed_count=$((failed_count + 1))
+                continue
+            fi
+        fi
+
+        if [ -n "$original_mode" ]; then chmod "$original_mode" "$original_path" 2>/dev/null || true; fi
+        if [ -n "$original_owner" ] && [ -n "$original_group" ]; then
+            chown "$original_owner:$original_group" "$original_path" 2>/dev/null || true
+        fi
+
+        printf "$MSG_ROLLBACK_FILE_RESTORED\n" "$original_path"
+        restored_count=$((restored_count + 1))
+        if [ $use_targets -eq 1 ]; then
+            target_seen["$original_path"]=1
+        fi
+    done < "$log_file"
+
+    if [ $use_targets -eq 1 ]; then
+        for target in "${ROLLBACK_TARGETS[@]}"; do
+            if [ "${target_seen[$target]}" -ne 1 ]; then
+                printf "${MSG_ERROR_PREFIX}${MSG_ROLLBACK_TARGET_NOT_FOUND}\n" "$target" >&2
+                failed_count=$((failed_count + 1))
+            fi
+        done
+    fi
+
+    if [ $restored_count -eq 0 ] && [ $failed_count -eq 0 ]; then
+        printf "%s\n" "$MSG_ROLLBACK_NO_ENTRIES"
+    fi
+
+    printf "$MSG_ROLLBACK_SUMMARY\n" "$restored_count" "$failed_count"
+
+    if [ $failed_count -ne 0 ]; then
+        return 1
+    fi
+    return 0
+}
+
+if [ "$SUBCOMMAND" = "transform" ] && [ "$DELETE_LOGS_MODE" -eq 0 ]; then
+    trap cleanup EXIT INT TERM
+    run_transform
+    exit $?
+fi
+
+if [ "$SUBCOMMAND" = "rollback" ]; then
+    trap cleanup EXIT INT TERM
+    run_rollback
+    exit $?
+fi
 
 # === 検索条件の定義 =================================
 # --- 現行基盤の定義 ---
