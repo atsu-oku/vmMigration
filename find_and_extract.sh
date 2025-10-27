@@ -72,7 +72,7 @@ export LC_ALL=C
 # 環境変数LANGが "ja_JP" で始まる場合、メッセージを日本語に設定
 if [[ "$ORIGINAL_LANG" == ja_JP* ]]; then
     # 日本語メッセージ
-    printf -v MSG_USAGE_LINE1_EXTENDED "使用方法:\n  %s [scan|transform|rollback] [オプション] <対象パス>\n  %s --deletelogs\n\nサブコマンド:\n  scan        現行/新基盤定義をスキャン (従来動作)\n  transform   新基盤(STG)の値をPRDに変換 (デフォルトはドライラン)\n  rollback    変換ログを基にロールバックを実行\n\n主なオプション:\n  -v, --verbose          詳細なログを表示\n  --skip-backup-files   バックアップと思われるファイルを除外\n  --dry-run             変換を出力のみで実施 (transformのデフォルト)\n  --apply               変換を実際に適用 (確認プロンプトあり)" "$0" "$0"
+    printf -v MSG_USAGE_LINE1_EXTENDED "使用方法:\n  %s [scan|transform|rollback] [オプション] <対象パス>\n  %s --deletelogs\n\nサブコマンド:\n  scan        現行/新基盤定義をスキャン (従来動作)\n  transform   新基盤(STG)の値をPRDに変換 (デフォルトはドライラン)\n  rollback    変換ログを基にロールバックを実行\n\n主なオプション:\n  -v, --verbose          詳細なログを表示\n  --skip-backup-files   バックアップと思われるファイルを除外\n  --dry-run             変換を出力のみで実施 (transformのデフォルト)\n  --apply               変換を実際に適用 (確認プロンプトあり)\n  --file <パス>         rollbackで指定したファイルのみ復元" "$0" "$0"
     MSG_ERROR_INVALID_OPTION="無効なオプションまたはオプションの組み合わせです。"
     MSG_ERROR_INVALID_INPUT="入力が不正です。yes または no を入力してください。"
     MSG_ERROR_INVALID_IP_FORMAT="ファイル「%s」の %s 行目に不正な形式のIPアドレス \"%s\" が見つかりました。\n"
@@ -137,6 +137,8 @@ if [[ "$ORIGINAL_LANG" == ja_JP* ]]; then
     MSG_ROLLBACK_FILE_FAILED="復元に失敗しました: %s"
     MSG_ROLLBACK_NO_ENTRIES="ロールバックログに復元対象がありません。"
     MSG_ROLLBACK_SUMMARY="復元: %d 件 / 失敗: %d 件"
+    MSG_ERROR_ROLLBACK_FILE_OPTION="--file は rollback サブコマンドでのみ使用できます。"
+    MSG_ROLLBACK_TARGET_NOT_FOUND="ロールバック対象がログに見つかりません: %s"
     MSG_SEARCH_COMPLETED_PRIMARY="検索が完了しました。"
     MSG_CHECK_NEW_INFRA_LOG="新基盤の定義に関するログは %s を確認してください。\n"
     MSG_CHECK_CURRENT_INFRA_LOG="現行基盤の定義に関するログは %s を確認してください。\n"
@@ -171,7 +173,7 @@ if [[ "$ORIGINAL_LANG" == ja_JP* ]]; then
     SEPARATOR_LINE_SHORT="--------------------------------------------------------------------------------"
 else
     # English Messages
-    printf -v MSG_USAGE_LINE1_EXTENDED "Usage:\n  %s [scan|transform|rollback] [options] <target>\n  %s --deletelogs\n\nSubcommands:\n  scan        Scan for matching definitions (default)\n  transform   Rewrite STG values to PRD (dry-run by default)\n  rollback    Restore files using a transform log\n\nKey options:\n  -v, --verbose        Display verbose logging\n  --skip-backup-files Skip files that look like backups\n  --dry-run           Run without applying changes (transform default)\n  --apply             Apply replacements after confirmation" "$0" "$0"
+    printf -v MSG_USAGE_LINE1_EXTENDED "Usage:\n  %s [scan|transform|rollback] [options] <target>\n  %s --deletelogs\n\nSubcommands:\n  scan        Scan for matching definitions (default)\n  transform   Rewrite STG values to PRD (dry-run by default)\n  rollback    Restore files using a transform log\n\nKey options:\n  -v, --verbose        Display verbose logging\n  --skip-backup-files Skip files that look like backups\n  --dry-run           Run without applying changes (transform default)\n  --apply             Apply replacements after confirmation\n  --file <path>       Limit rollback to specific files" "$0" "$0"
     MSG_ERROR_INVALID_OPTION="Invalid option or combination of options."
     MSG_ERROR_INVALID_INPUT="Invalid input. Please enter yes or no."
     MSG_ERROR_INVALID_IP_FORMAT="Error: Invalid IP address format \"%s\" found in file \"%s\" on line %s.\n"
@@ -236,6 +238,8 @@ else
     MSG_ROLLBACK_FILE_FAILED="Failed to restore: %s"
     MSG_ROLLBACK_NO_ENTRIES="No entries to restore in the rollback log."
     MSG_ROLLBACK_SUMMARY="Restored: %d  /  Failed: %d"
+    MSG_ERROR_ROLLBACK_FILE_OPTION="--file is only available with the rollback subcommand."
+    MSG_ROLLBACK_TARGET_NOT_FOUND="Rollback target not found in the log: %s"
     MSG_SEARCH_COMPLETED_PRIMARY="Search completed."
     MSG_CHECK_NEW_INFRA_LOG="For new infrastructure definitions, please check: %s\n"
     MSG_CHECK_CURRENT_INFRA_LOG="For current infrastructure definitions, please check: %s\n"
@@ -283,6 +287,7 @@ declare -A TRANSFORM_DIFF_PATHS=()
 declare -A TRANSFORM_FAILURE_MESSAGES=()
 declare -a TRANSFORM_CHANGED_FILES=()
 declare -a TRANSFORM_FAILED_FILES=()
+declare -a ROLLBACK_TARGETS=()
 
 # Bashのバージョンが4未満の場合、エラーを出力して終了
 if [[ -z "${BASH_VERSINFO[0]}" ]] || [[ "${BASH_VERSINFO[0]}" -lt "$MIN_BASH_MAJOR_VERSION" ]]; then
@@ -338,6 +343,18 @@ while [[ $# -gt 0 ]]; do
             fi
             TRANSFORM_DRY_RUN=1
             shift ;;
+        --file)
+            if [ "$SUBCOMMAND" != "rollback" ]; then
+                printf "${MSG_ERROR_PREFIX}${MSG_ERROR_ROLLBACK_FILE_OPTION}\n" >&2
+                printf "${MSG_USAGE_LINE1_EXTENDED}\n" >&2; exit 1
+            fi
+            if [ $# -lt 2 ]; then
+                printf "${MSG_ERROR_PREFIX}${MSG_TOO_MANY_ARGS_OR_INVALID_COMBINATION}\n" >&2
+                printf "${MSG_USAGE_LINE1_EXTENDED}\n" >&2; exit 1
+            fi
+            ROLLBACK_TARGETS+=("$2")
+            shift 2
+            ;;
         -*) printf "${MSG_ERROR_PREFIX}${MSG_ERROR_INVALID_OPTION}: %s\n" "$1" >&2
             printf "${MSG_USAGE_LINE1_EXTENDED}\n" >&2; exit 1 ;;
         *) remaining_args+=("$1"); shift ;;
@@ -1035,12 +1052,22 @@ run_rollback() {
     local log_file="$SEARCH_PATH"
     local restored_count=0
     local failed_count=0
+    local -A target_seen=()
+    local use_targets=0
+    local target
 
     printf "%s\n" "$MSG_ROLLBACK_MODE_HEADER"
 
     if [ ! -f "$log_file" ]; then
         printf "${MSG_ERROR_PREFIX}${MSG_ROLLBACK_LOG_NOT_FOUND}\n" "$log_file" >&2
         exit 1
+    fi
+
+    if [ ${#ROLLBACK_TARGETS[@]} -gt 0 ]; then
+        use_targets=1
+        for target in "${ROLLBACK_TARGETS[@]}"; do
+            target_seen["$target"]=0
+        done
     fi
 
     while IFS=$'\t' read -r original_path backup_path original_mode original_owner original_group; do
@@ -1052,6 +1079,14 @@ run_rollback() {
             printf "${MSG_ERROR_PREFIX}${MSG_ROLLBACK_INVALID_LINE}\n" "$original_path" >&2
             failed_count=$((failed_count + 1))
             continue
+        fi
+
+        if [ $use_targets -eq 1 ]; then
+            if [[ ${target_seen[$original_path]+_} ]]; then
+                :
+            else
+                continue
+            fi
         fi
 
         if [ ! -f "$backup_path" ]; then
@@ -1075,7 +1110,19 @@ run_rollback() {
 
         printf "$MSG_ROLLBACK_FILE_RESTORED\n" "$original_path"
         restored_count=$((restored_count + 1))
+        if [ $use_targets -eq 1 ]; then
+            target_seen["$original_path"]=1
+        fi
     done < "$log_file"
+
+    if [ $use_targets -eq 1 ]; then
+        for target in "${ROLLBACK_TARGETS[@]}"; do
+            if [ "${target_seen[$target]}" -ne 1 ]; then
+                printf "${MSG_ERROR_PREFIX}${MSG_ROLLBACK_TARGET_NOT_FOUND}\n" "$target" >&2
+                failed_count=$((failed_count + 1))
+            fi
+        done
+    fi
 
     if [ $restored_count -eq 0 ] && [ $failed_count -eq 0 ]; then
         printf "%s\n" "$MSG_ROLLBACK_NO_ENTRIES"
