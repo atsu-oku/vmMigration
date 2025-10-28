@@ -43,6 +43,8 @@ NEW_STG_HITS_TEMP=""
 NEW_PRD_HITS_TEMP=""
 OTHER_HITS_TEMP=""
 PERMISSION_CHECK_TEST_FILE_TEMP=""
+TD_REPO_LAST_MESSAGE=""
+TD_REPO_LAST_FAILURE=0
 
 # --- 後片付け関数 ---
 # スクリプト終了時に呼び出され、作成した一時ファイルをすべて削除する
@@ -154,6 +156,9 @@ if [[ "$ORIGINAL_LANG" == ja_JP* ]]; then
     MSG_TRANSFORM_NEWPROD_DIR_NOT_FOUND="/var/www/com/ipet-ins/ 配下に newproduction 設定ディレクトリが見つかりません。"
     MSG_TRANSFORM_NEWPROD_FILES_MISSING="%s に必要な設定ファイルが不足しています: %s"
     MSG_TRANSFORM_LOG_SAVED="ロールバックログを %s に保存しました。"
+    MSG_TRANSFORM_TD_REPO_FALLBACK_APPLIED="td-agent リポジトリ(v4)に接続できなかったため、v3 (%s) を使用します。"
+    MSG_TRANSFORM_TD_REPO_FALLBACK_FAILED="td-agent リポジトリ(v4/v3)に接続できませんでした (試行URL: %s, %s)。"
+    MSG_TRANSFORM_TD_REPO_CURL_NOT_FOUND="curl が見つからないため td-agent リポジトリの疎通確認をスキップしました。"
     MSG_ROLLBACK_MODE_HEADER="--- ロールバックモード ---"
     MSG_ROLLBACK_LOG_NOT_FOUND="指定されたロールバックログが見つかりません: %s"
     MSG_ROLLBACK_INVALID_LINE="ロールバックログの形式が不正です: %s"
@@ -278,6 +283,9 @@ else
     MSG_TRANSFORM_NEWPROD_DIR_NOT_FOUND="No newproduction configuration directories were found under /var/www/com/ipet-ins/."
     MSG_TRANSFORM_NEWPROD_FILES_MISSING="Configuration directory %s is missing files: %s"
     MSG_TRANSFORM_LOG_SAVED="Rollback log saved to %s."
+    MSG_TRANSFORM_TD_REPO_FALLBACK_APPLIED="td-agent repository v4 unreachable; using v3 instead: %s"
+    MSG_TRANSFORM_TD_REPO_FALLBACK_FAILED="Unable to reach td-agent repository v4 or v3 (attempted %s and %s)."
+    MSG_TRANSFORM_TD_REPO_CURL_NOT_FOUND="curl not found; skipping td-agent repository connectivity check."
     MSG_ROLLBACK_MODE_HEADER="--- Rollback Mode ---"
     MSG_ROLLBACK_LOG_NOT_FOUND="Rollback log not found: %s"
     MSG_ROLLBACK_INVALID_LINE="Invalid rollback log entry: %s"
@@ -649,6 +657,69 @@ should_skip_file_for_processing() {
 
     return 1
 }
+
+write_td_repo_content() {
+    local output_path="$1"
+    local series="$2"
+    cat > "$output_path" <<EOF
+[treasuredata]
+name=TreasureData
+baseurl=https://packages.treasuredata.com/${series}/redhat/\$releasever/\$basearch
+gpgcheck=1
+gpgkey=https://packages.treasuredata.com/GPG-KEY-td-agent
+EOF
+}
+
+check_and_adjust_td_repo_temp() {
+    local temp_file="$1"
+    local curl_bin=""
+    local releasever=""
+    local basearch=""
+    local url_v4=""
+    local url_v3=""
+    local probe_path="repodata/repomd.xml"
+
+    TD_REPO_LAST_MESSAGE=""
+    TD_REPO_LAST_FAILURE=0
+
+    curl_bin=$(command -v curl || true)
+    if [ -z "$curl_bin" ]; then
+        TD_REPO_LAST_MESSAGE="$MSG_TRANSFORM_TD_REPO_CURL_NOT_FOUND"
+        return 0
+    fi
+
+    releasever=$(rpm -E %releasever 2>/dev/null | tr -d '\r')
+    if [ -z "$releasever" ] || [ "$releasever" = "%releasever" ]; then
+        releasever=$(rpm -E %rhel 2>/dev/null | tr -d '\r')
+    fi
+    if [ -z "$releasever" ] || [ "$releasever" = "%rhel" ]; then
+        releasever="unknown"
+    fi
+
+    basearch=$(rpm -E %basearch 2>/dev/null | tr -d '\r')
+    if [ -z "$basearch" ] || [ "$basearch" = "%basearch" ]; then
+        basearch=$(uname -m 2>/dev/null || echo "x86_64")
+    fi
+
+    url_v4="https://packages.treasuredata.com/4/redhat/${releasever}/${basearch}"
+    url_v3="https://packages.treasuredata.com/3/redhat/${releasever}/${basearch}"
+
+    if "$curl_bin" --silent --location --fail --head --max-time 10 "${url_v4}/${probe_path}" >/dev/null 2>&1; then
+        # v4 reachable
+        return 0
+    fi
+
+    if "$curl_bin" --silent --location --fail --head --max-time 10 "${url_v3}/${probe_path}" >/dev/null 2>&1; then
+        write_td_repo_content "$temp_file" "3"
+        TD_REPO_LAST_MESSAGE=$(printf "$MSG_TRANSFORM_TD_REPO_FALLBACK_APPLIED" "${url_v3}")
+        return 1
+    fi
+
+    write_td_repo_content "$temp_file" "3"
+    TD_REPO_LAST_MESSAGE=$(printf "$MSG_TRANSFORM_TD_REPO_FALLBACK_FAILED" "${url_v4}" "${url_v3}")
+    TD_REPO_LAST_FAILURE=1
+    return 2
+}
 # --- filter_grep_output: grepの出力を整形・フィルタリング ---
 # コメント行(#)を除外し、ヒット行にプレフィックスを付けるなどの処理を行う
 # 引数1: grepの生出力, 引数2: 特殊フィルタタイプ, 引数3: ヒット行のプレフィックス
@@ -964,6 +1035,38 @@ run_transform() {
             fi
             continue
         fi
+        if [ "$filepath" = "/etc/yum.repos.d/td.repo" ]; then
+            temp_transformed=$(mktemp) || {
+                printf "${MSG_ERROR_PREFIX}${MSG_TEMP_FILE_CREATION_FAILED}" "transform" >&2
+                return 1
+            }
+            write_td_repo_content "$temp_transformed" "4"
+            total_files_scanned_transform=$((total_files_scanned_transform + 1))
+            if cmp -s "$filepath" "$temp_transformed" 2>/dev/null; then
+                rm -f "$temp_transformed" 2>/dev/null
+                continue
+            fi
+            TRANSFORM_TEMP_PATHS["$filepath"]="$temp_transformed"
+            TRANSFORM_CHANGED_FILES+=("$filepath")
+            diff_file=$(mktemp) || diff_file=""
+            if [ -n "$diff_file" ]; then
+                local diff_status
+                diff -u "$filepath" "$temp_transformed" > "$diff_file" 2>/dev/null
+                diff_status=$?
+                if [ $diff_status -eq 0 ]; then
+                    rm -f "$diff_file" 2>/dev/null
+                    TRANSFORM_DIFF_PATHS["$filepath"]=""
+                elif [ $diff_status -eq 1 ]; then
+                    TRANSFORM_DIFF_PATHS["$filepath"]="$diff_file"
+                else
+                    rm -f "$diff_file" 2>/dev/null
+                    TRANSFORM_DIFF_PATHS["$filepath"]=""
+                fi
+            else
+                TRANSFORM_DIFF_PATHS["$filepath"]=""
+            fi
+            continue
+        fi
         total_files_scanned_transform=$((total_files_scanned_transform + 1))
         if [ "$SKIP_BACKUP_FILES_MODE" -eq 1 ] && is_backup_file_name "$(basename "$filepath")"; then
             if [ "$VERBOSE_MODE" -eq 1 ]; then
@@ -1013,6 +1116,11 @@ function convert_ip(token, arr, base, suffix, i) {
         if (arr[i] < 0 || arr[i] > 255) {
             return token
         }
+    }
+    if (target_path == "/etc/profile" && arr[1] == 172 && arr[2] == 16 && arr[3] == 173) {
+        arr[3] = 162
+        changed = 1
+        return arr[1] "." arr[2] "." arr[3] "." arr[4] suffix
     }
     if (arr[3] >= 170 && arr[3] <= 179) {
         arr[3] -= 10
@@ -1279,6 +1387,50 @@ AWK
         fi
         local temp_file="${TRANSFORM_TEMP_PATHS[$file]}"
         local diff_saved="${TRANSFORM_DIFF_PATHS[$file]:-}"
+        if [ "$file" = "/etc/yum.repos.d/td.repo" ] && [ -n "$temp_file" ]; then
+            local td_repo_status
+            check_and_adjust_td_repo_temp "$temp_file"
+            td_repo_status=$?
+            if [ -n "$TD_REPO_LAST_MESSAGE" ]; then
+                if [ "$TD_REPO_LAST_FAILURE" -eq 1 ]; then
+                    printf "${MSG_ERROR_PREFIX}%s\n" "$TD_REPO_LAST_MESSAGE" >&2
+                else
+                    printf "%s\n" "$TD_REPO_LAST_MESSAGE"
+                fi
+            fi
+            if [ "$td_repo_status" -ne 0 ] && [ -f "$temp_file" ]; then
+                if [ -n "$diff_saved" ]; then
+                    if diff -u "$file" "$temp_file" > "$diff_saved" 2>/dev/null; then
+                        rm -f "$diff_saved" 2>/dev/null
+                        diff_saved=""
+                        TRANSFORM_DIFF_PATHS["$file"]=""
+                    else
+                        TRANSFORM_DIFF_PATHS["$file"]="$diff_saved"
+                    fi
+                fi
+            fi
+            if [ "$TD_REPO_LAST_FAILURE" -eq 1 ]; then
+                local already_recorded=0
+                local existing=""
+                for existing in "${TRANSFORM_FAILED_FILES[@]}"; do
+                    if [ "$existing" = "$file" ]; then
+                        already_recorded=1
+                        break
+                    fi
+                done
+                if [ $already_recorded -eq 0 ]; then
+                    TRANSFORM_FAILED_FILES+=("$file")
+                fi
+                TRANSFORM_FAILURE_MESSAGES["$file"]="$TD_REPO_LAST_MESSAGE"
+            fi
+            if [ -f "$temp_file" ] && cmp -s "$file" "$temp_file" 2>/dev/null; then
+                if [ -n "$temp_file" ]; then rm -f "$temp_file" 2>/dev/null; fi
+                if [ -n "$diff_saved" ]; then rm -f "$diff_saved" 2>/dev/null; fi
+                unset 'TRANSFORM_TEMP_PATHS[$file]'
+                unset 'TRANSFORM_DIFF_PATHS[$file]'
+                continue
+            fi
+        fi
         local backup_path="${file}.bak_${timestamp}"
         local orig_mode orig_owner orig_group
 
