@@ -1,5 +1,5 @@
 {
-  "\u0024schema": "https://json-schema.org/draft/2020-12/schema",
+  "$shema": "https://json-schema.org/draft/2020-12/schema",
   "title": "FirewalldZone",
   "type": "object",
   "properties": {

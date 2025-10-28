@@ -18,6 +18,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime
 import importlib.util
+import posixpath
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Set, Tuple, Type, TypeVar, TYPE_CHECKING
 
@@ -349,6 +350,22 @@ def _parse_cli_arguments(argv: Optional[List[str]] = None) -> argparse.Namespace
         dest="source_vm_name",
         help="Name of the staged/source VM to clone (skips interactive prompt when provided).",
     )
+    parser.add_argument(
+        "--enable-standard-config-edits",
+        action="store_true",
+        help=(
+            "Allow the workflow to modify the default set of protected system files "
+            "(/etc/profile, /etc/hosts, and standard NTP configurations)."
+        ),
+    )
+    parser.add_argument(
+        "--protect-guest-file",
+        dest="protected_guest_files",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="Additional absolute guest file path to skip (can be supplied multiple times).",
+    )
     return parser.parse_args(argv)
 
 
@@ -571,6 +588,97 @@ LOGGER = logging.getLogger("cloneAndVmotion")
 LOGGER.setLevel(LOG_LEVEL)
 
 workflow_had_warnings = False
+
+
+DEFAULT_PROTECTED_GUEST_PATHS: Tuple[str, ...] = (
+    "/etc/profile",
+    "/etc/hosts",
+    "/etc/chrony.conf",
+    "/etc/chrony/chrony.conf",
+    "/etc/ntp.conf",
+    "/etc/ntp/ntp.conf",
+    "/etc/ntpd.conf",
+    "/etc/yum.repos.d",
+    "/etc/yum.repos.d/td.repo",
+)
+_PROTECTED_GUEST_PATH_LOOKUP: Set[str] = set()
+
+
+def _normalize_guest_path(path: str) -> str:
+    """Return a normalized POSIX path suitable for protected path comparisons."""
+    normalized = (path or "").strip()
+    if not normalized:
+        return ""
+    return posixpath.normpath(normalized)
+
+
+def register_protected_guest_paths(paths: Iterable[str]) -> None:
+    """Collect additional guest paths that must not be mutated."""
+    for candidate in paths:
+        normalized = _normalize_guest_path(candidate)
+        if normalized:
+            _PROTECTED_GUEST_PATH_LOOKUP.add(normalized)
+
+
+def unregister_protected_guest_paths(paths: Iterable[str]) -> None:
+    """Remove guest paths from the protected list when explicit overrides are requested."""
+    for candidate in paths:
+        normalized = _normalize_guest_path(candidate)
+        if normalized:
+            _PROTECTED_GUEST_PATH_LOOKUP.discard(normalized)
+
+
+register_protected_guest_paths(DEFAULT_PROTECTED_GUEST_PATHS)
+
+
+def _guest_path_protected(path: str) -> bool:
+    """Return True when the target guest path must not be modified."""
+    return _normalize_guest_path(path) in _PROTECTED_GUEST_PATH_LOOKUP
+
+
+SSH_OVERRIDE_SOURCE_IP = SSH_ALLOWED_SOURCE_IP
+SSH_OVERRIDE_RICH_RULE = (
+    f'rule family="ipv4" source address="{SSH_OVERRIDE_SOURCE_IP}" service name="ssh" accept'
+)
+
+
+def _interface_has_odd_third_octet(
+    guest_executor,
+    interface_name: str,
+    cache: Dict[str, bool],
+) -> bool:
+    """Return True when the interface owns an IPv4 whose third octet is odd."""
+    if interface_name in cache:
+        return cache[interface_name]
+    command = f"ip -4 addr show dev {shlex.quote(interface_name)}"
+    exit_code, stdout, stderr = guest_executor(command, check_exit_code=False)
+    result = False
+    if exit_code == 0:
+        for line in (stdout or "").splitlines():
+            line = line.strip()
+            if not line.startswith("inet "):
+                continue
+            candidate = line.split()[1].split("/")[0]
+            parts = candidate.split(".")
+            if len(parts) != 4:
+                continue
+            try:
+                third_octet = int(parts[2])
+            except ValueError:
+                continue
+            if third_octet % 2 == 1:
+                result = True
+                break
+    else:
+        if stderr:
+            LOGGER.debug(
+                "Unable to inspect IPv4 addresses for interface '%s': %s",
+                interface_name,
+                stderr.strip(),
+            )
+    cache[interface_name] = result
+    return result
+
 
 NTP_CONFIG_PATHS: Tuple[str, ...] = (
     "/etc/chrony.conf",
@@ -1015,6 +1123,11 @@ def _ensure_guest_write_privileges(guest_executor) -> bool:
 
 def _write_guest_file(guest_executor, remote_path: str, content: str) -> Tuple[int, str, str]:
     """Write content to a file inside the guest using sequential bash commands."""
+    if _guest_path_protected(remote_path):
+        protected_path = _normalize_guest_path(remote_path)
+        print(f"   -> Skipping update for protected path {protected_path}.")
+        log_success(f"Skipped guest file update for protected path {protected_path}.")
+        return 0, "", ""
     normalized = content.replace("\r\n", "\n")
     if not normalized.endswith("\n"):
         normalized += "\n"
@@ -1268,6 +1381,9 @@ def _run_curl_with_tls_repairs(
 
 def _sync_hosts_file_to_prd(guest_executor, timestamp: str) -> bool:
     """Update /etc/hosts to PRD equivalents."""
+    if _guest_path_protected("/etc/hosts"):
+        print("   -> Skipping /etc/hosts synchronisation because the path is protected.")
+        return True
     exit_code, hosts_content, hosts_err = guest_executor("cat /etc/hosts", check_exit_code=False)
     if exit_code != 0:
         print(f"   [WARN] Unable to read /etc/hosts: {(hosts_err or '').strip() or exit_code}")
@@ -1315,7 +1431,7 @@ def _sync_firewalld_configuration_to_prd(
     timestamp: str,
     source_zones: Optional[List[FirewalldZonePlan]] = None,
 ) -> bool:
-    """Update firewalld configuration to PRD equivalents when the service is active."""
+    """Update firewalld configuration to ensure SSH access from the operations host."""
     exit_code, _, _ = guest_executor("command -v firewall-cmd", check_exit_code=False)
     if exit_code != 0:
         print("   -> firewall-cmd not available; skipping firewalld configuration sync.")
@@ -1323,10 +1439,12 @@ def _sync_firewalld_configuration_to_prd(
     if not _is_service_active(guest_executor, "firewalld"):
         print("   -> firewalld inactive; skipping firewalld configuration sync.")
         return True
-    # firewalld zone XML reconciliation is currently disabled.
-    print("   -> firewalld zone XML rewrite is disabled; skipping firewalld configuration sync.")
-    return True
-    zone_names: Set[str] = set()
+
+    zone_names: Set[str] = {
+        plan.name.strip()
+        for plan in (source_zones or [])
+        if getattr(plan, "name", None)
+    }
     exit_code, zones_output, _ = guest_executor("firewall-cmd --get-zones", check_exit_code=False)
     if exit_code == 0 and zones_output:
         for token in zones_output.split():
@@ -1337,406 +1455,154 @@ def _sync_firewalld_configuration_to_prd(
         exit_code, dir_listing, dir_err = guest_executor("ls /etc/firewalld/zones", check_exit_code=False)
         if exit_code == 0 and dir_listing:
             for line in dir_listing.splitlines():
-                name = line.strip()
-                if name.endswith(".xml"):
-                    zone_names.add(name[:-4])
+                candidate = line.strip()
+                if candidate.endswith(".xml"):
+                    zone_names.add(candidate[:-4])
         else:
-            print(f"   [WARN] Unable to enumerate firewalld zones: {(dir_err or dir_listing or '').strip() or exit_code}")
+            detail = (dir_err or dir_listing or "").strip() or exit_code
+            print(f"   [WARN] Unable to determine firewalld zones: {detail}")
             return False
+    if not zone_names:
+        print("   -> No firewalld zones detected; skipping SSH override.")
+        return True
 
-    plan_lookup: Dict[str, FirewalldZonePlan] = {plan.name: plan for plan in (source_zones or [])}
-    overall_success = True
+    plan_lookup: Dict[str, FirewalldZonePlan] = {
+        plan.name: plan
+        for plan in (source_zones or [])
+        if getattr(plan, "name", None)
+    }
+
+    interface_cache: Dict[str, bool] = {}
     zones_updated: List[str] = []
+    overall_success = True
+    rule_value = SSH_OVERRIDE_RICH_RULE
 
     for zone in sorted(zone_names):
+        plan = plan_lookup.get(zone)
+        interfaces_exit, interfaces_stdout, interfaces_err = guest_executor(
+            f"firewall-cmd --permanent --zone={shlex.quote(zone)} --list-interfaces",
+            check_exit_code=False,
+        )
+        if interfaces_exit == 0:
+            zone_interfaces = [
+                entry.strip()
+                for entry in (interfaces_stdout or "").split()
+                if entry.strip()
+            ]
+        else:
+            zone_interfaces = [
+                entry.strip()
+                for entry in (plan.interfaces if plan else [])
+                if entry and entry.strip()
+            ]
+            if interfaces_err:
+                LOGGER.debug(
+                    "Failed to list firewalld interfaces for zone '%s': %s",
+                    zone,
+                    interfaces_err.strip(),
+                )
+        zone_interfaces = [iface for iface in zone_interfaces if iface]
+        if not zone_interfaces:
+            continue
+
+        requires_override = False
+        for interface in zone_interfaces:
+            if _interface_has_odd_third_octet(guest_executor, interface, interface_cache):
+                requires_override = True
+                break
+        if not requires_override:
+            continue
+
+        rich_exit, rich_stdout, rich_err = guest_executor(
+            f"firewall-cmd --permanent --zone={shlex.quote(zone)} --list-rich-rules",
+            check_exit_code=False,
+        )
+        if rich_exit != 0:
+            detail = (rich_err or "").strip() or rich_exit
+            print(f"   [WARN] Unable to list rich rules for zone '{zone}': {detail}")
+            overall_success = False
+            continue
+        current_rules = [
+            rule.strip()
+            for rule in (rich_stdout or "").splitlines()
+            if rule.strip()
+        ]
+        if rule_value in current_rules:
+            print(f"   -> Zone '{zone}' already allows SSH from {SSH_OVERRIDE_SOURCE_IP}.")
+            continue
+
         zone_file = f"/etc/firewalld/zones/{zone}.xml"
         backup_path = f"{zone_file}-{timestamp}.bak"
         backup_created = False
 
-        def _ensure_zone_backup(
-            backup_path: str = backup_path,
-            zone_file_path: str = zone_file,
-        ) -> bool:
+        def _ensure_zone_backup() -> bool:
             nonlocal backup_created, overall_success
             if backup_created:
                 return True
+            exists_exit, _, _ = guest_executor(
+                f"test -f {shlex.quote(zone_file)}",
+                check_exit_code=False,
+            )
+            if exists_exit != 0:
+                backup_created = True
+                return True
             backup_cmd = (
                 f"[ -f {shlex.quote(backup_path)} ] || "
-                f"cp {shlex.quote(zone_file_path)} {shlex.quote(backup_path)}"
+                f"cp {shlex.quote(zone_file)} {shlex.quote(backup_path)}"
             )
             backup_exit, _, backup_err = guest_executor(backup_cmd, check_exit_code=False)
             if backup_exit != 0:
+                detail = (backup_err or "").strip() or backup_exit
                 print(
-                    f"   [WARN] Unable to back up firewalld zone file '{zone_file}': "
-                    f"{(backup_err or '').strip() or backup_exit}"
+                    f"   [WARN] Unable to back up firewalld zone file '{zone_file}': {detail}"
                 )
                 overall_success = False
                 return False
             backup_created = True
             return True
 
-        plan = plan_lookup.get(zone)
-        desired_interfaces: Optional[List[str]] = None
-        desired_sources = None
-        desired_ports = None
-        desired_rich_rules = None
-        if plan:
-            desired_interfaces = [
-                entry.strip()
-                for entry in plan.interfaces
-                if entry and entry.strip()
-            ]
-            transformed_sources = []
-            for source_value in plan.sources:
-                transformed_source, _ = transform_text_to_prd(source_value)
-                candidate = transformed_source.strip()
-                if candidate:
-                    transformed_sources.append(candidate)
-            desired_sources = transformed_sources
-            desired_ports = [entry.strip() for entry in plan.ports if entry and entry.strip()]
-            transformed_rules = []
-            for rule_value in plan.rich_rules:
-                transformed_rule, _ = transform_text_to_prd(rule_value)
-                candidate = transformed_rule.strip()
-                if candidate:
-                    transformed_rules.append(candidate)
-            desired_rich_rules = transformed_rules
+        if not _ensure_zone_backup():
+            continue
 
-        zone_changed = False
-
-        interfaces_exit, interfaces_stdout, interfaces_err = guest_executor(
-            f"firewall-cmd --permanent --zone={shlex.quote(zone)} --list-interfaces",
+        add_exit, _, add_err = guest_executor(
+            f"firewall-cmd --permanent --zone={shlex.quote(zone)} "
+            f"--add-rich-rule={shlex.quote(rule_value)}",
             check_exit_code=False,
         )
-        if interfaces_exit == 0:
-            current_interfaces = [entry.strip() for entry in (interfaces_stdout or "").split() if entry.strip()]
-        else:
-            current_interfaces = []
-            if interfaces_err:
-                LOGGER.debug("Failed to list firewalld interfaces for zone '%s': %s", zone, interfaces_err.strip())
-        current_interface_set: Set[str] = set(current_interfaces)
-        if desired_interfaces is not None:
-            desired_set: Set[str] = {entry for entry in desired_interfaces if entry}
-            if desired_set != current_interface_set:
-                if _ensure_zone_backup():
-                    for interface_name in sorted(current_interface_set - desired_set):
-                        remove_exit, _, remove_err = guest_executor(
-                            f"firewall-cmd --permanent --zone={shlex.quote(zone)} "
-                            f"--remove-interface={shlex.quote(interface_name)}",
-                            check_exit_code=False,
-                        )
-                        if remove_exit != 0:
-                            LOGGER.debug(
-                                "Failed to detach interface '%s' from zone '%s': %s",
-                                interface_name,
-                                zone,
-                                (remove_err or "").strip() or remove_exit,
-                            )
-                            overall_success = False
-                        else:
-                            zone_changed = True
-                    for interface_name in sorted(desired_set - current_interface_set):
-                        add_exit, _, add_err = guest_executor(
-                            f"firewall-cmd --permanent --zone={shlex.quote(zone)} "
-                            f"--add-interface={shlex.quote(interface_name)}",
-                            check_exit_code=False,
-                        )
-                        if add_exit != 0:
-                            LOGGER.debug(
-                                "Failed to attach interface '%s' to zone '%s': %s",
-                                interface_name,
-                                zone,
-                                (add_err or "").strip() or add_exit,
-                            )
-                            overall_success = False
-                        else:
-                            zone_changed = True
-                else:
-                    overall_success = False
-        else:
-            for interface_name in current_interfaces:
-                query_iface_exit, _, _ = guest_executor(
-                    f"firewall-cmd --permanent --zone={shlex.quote(zone)} "
-                    f"--query-interface={shlex.quote(interface_name)}",
-                    check_exit_code=False,
-                )
-                if query_iface_exit != 0 and _ensure_zone_backup():
-                    add_iface_exit, _, add_iface_err = guest_executor(
-                        f"firewall-cmd --permanent --zone={shlex.quote(zone)} "
-                        f"--add-interface={shlex.quote(interface_name)}",
-                        check_exit_code=False,
-                    )
-                    if add_iface_exit == 0:
-                        zone_changed = True
-                    else:
-                        LOGGER.debug(
-                            "Failed to reattach interface '%s' to zone '%s': %s",
-                            interface_name,
-                            zone,
-                            (add_iface_err or "").strip() or add_iface_exit,
-                        )
-                        overall_success = False
-
-        sources_exit, sources_stdout, sources_err = guest_executor(
-            f"firewall-cmd --permanent --zone={shlex.quote(zone)} --list-sources",
-            check_exit_code=False,
-        )
-        if sources_exit == 0:
-            current_sources = [entry.strip() for entry in (sources_stdout or "").split() if entry.strip()]
-        else:
-            current_sources = []
-            if sources_err:
-                LOGGER.debug("Failed to list firewalld sources for zone '%s': %s", zone, sources_err.strip())
-
-        current_source_set: Set[str] = set(current_sources)
-        if desired_sources is not None:
-            desired_source_set: Set[str] = {entry for entry in desired_sources if entry}
-            if desired_source_set != current_source_set and _ensure_zone_backup():
-                for source_entry in sorted(current_source_set - desired_source_set):
-                    remove_exit, _, remove_err = guest_executor(
-                        f"firewall-cmd --permanent --zone={shlex.quote(zone)} "
-                        f"--remove-source={shlex.quote(source_entry)}",
-                        check_exit_code=False,
-                    )
-                    if remove_exit != 0:
-                        LOGGER.debug(
-                            "Failed to remove firewalld source '%s' from zone '%s': %s",
-                            source_entry,
-                            zone,
-                            (remove_err or "").strip() or remove_exit,
-                        )
-                        overall_success = False
-                    else:
-                        zone_changed = True
-                for source_entry in sorted(desired_source_set - current_source_set):
-                    add_exit, _, add_err = guest_executor(
-                        f"firewall-cmd --permanent --zone={shlex.quote(zone)} "
-                        f"--add-source={shlex.quote(source_entry)}",
-                        check_exit_code=False,
-                    )
-                    if add_exit != 0:
-                        LOGGER.debug(
-                            "Failed to add firewalld source '%s' to zone '%s': %s",
-                            source_entry,
-                            zone,
-                            (add_err or "").strip() or add_exit,
-                        )
-                        overall_success = False
-                    else:
-                        zone_changed = True
-        else:
-            for source_entry in current_sources:
-                transformed_source, transformed_changed = transform_text_to_prd(source_entry)
-                transformed_source = transformed_source.strip()
-                if not transformed_changed or not transformed_source or transformed_source == source_entry:
-                    continue
-                if not _ensure_zone_backup():
-                    break
-                remove_exit, _, remove_err = guest_executor(
-                    f"firewall-cmd --permanent --zone={shlex.quote(zone)} "
-                    f"--remove-source={shlex.quote(source_entry)}",
-                    check_exit_code=False,
-                )
-                if remove_exit != 0:
-                    LOGGER.debug(
-                        "Failed to remove firewalld source '%s' from zone '%s': %s",
-                        source_entry,
-                        zone,
-                        (remove_err or "").strip() or remove_exit,
-                    )
-                    overall_success = False
-                    continue
-                add_exit, _, add_err = guest_executor(
-                    f"firewall-cmd --permanent --zone={shlex.quote(zone)} "
-                    f"--add-source={shlex.quote(transformed_source)}"
-                )
-                if add_exit != 0:
-                    LOGGER.debug(
-                        "Failed to add firewalld source '%s' to zone '%s': %s",
-                        transformed_source,
-                        zone,
-                        (add_err or "").strip() or add_exit,
-                    )
-                    overall_success = False
-                    continue
-                zone_changed = True
-
-        ports_exit, ports_stdout, ports_err = guest_executor(
-            f"firewall-cmd --permanent --zone={shlex.quote(zone)} --list-ports",
-            check_exit_code=False,
-        )
-        if ports_exit == 0:
-            current_ports = [entry.strip() for entry in (ports_stdout or "").split() if entry.strip()]
-        else:
-            current_ports = []
-            if ports_err:
-                LOGGER.debug("Failed to list firewalld ports for zone '%s': %s", zone, ports_err.strip())
-
-        current_port_set: Set[str] = set(current_ports)
-        if desired_ports is not None:
-            desired_port_set: Set[str] = {entry for entry in desired_ports if entry}
-            if desired_port_set != current_port_set and _ensure_zone_backup():
-                for port_entry in sorted(current_port_set - desired_port_set):
-                    remove_exit, _, remove_err = guest_executor(
-                        f"firewall-cmd --permanent --zone={shlex.quote(zone)} "
-                        f"--remove-port={shlex.quote(port_entry)}",
-                        check_exit_code=False,
-                    )
-                    if remove_exit != 0:
-                        LOGGER.debug(
-                            "Failed to remove firewalld port '%s' from zone '%s': %s",
-                            port_entry,
-                            zone,
-                            (remove_err or "").strip() or remove_exit,
-                        )
-                        overall_success = False
-                    else:
-                        zone_changed = True
-                for port_entry in sorted(desired_port_set - current_port_set):
-                    add_exit, _, add_err = guest_executor(
-                        f"firewall-cmd --permanent --zone={shlex.quote(zone)} "
-                        f"--add-port={shlex.quote(port_entry)}",
-                        check_exit_code=False,
-                    )
-                    if add_exit != 0:
-                        LOGGER.debug(
-                            "Failed to add firewalld port '%s' to zone '%s': %s",
-                            port_entry,
-                            zone,
-                            (add_err or "").strip() or add_exit,
-                        )
-                        overall_success = False
-                    else:
-                        zone_changed = True
-
-        rich_exit, rich_stdout, rich_err = guest_executor(
-            f"firewall-cmd --permanent --zone={shlex.quote(zone)} --list-rich-rules",
-            check_exit_code=False,
-        )
-        if rich_exit == 0:
-            current_rich_rules = [rule.strip() for rule in (rich_stdout or "").splitlines() if rule.strip()]
-        else:
-            current_rich_rules = []
-            if rich_err:
-                LOGGER.debug("Failed to list firewalld rich rules for zone '%s': %s", zone, rich_err.strip())
-
-        current_rule_set: Set[str] = set(current_rich_rules)
-        if desired_rich_rules is not None:
-            desired_rule_set: Set[str] = {entry for entry in desired_rich_rules if entry}
-            if desired_rule_set != current_rule_set and _ensure_zone_backup():
-                for rule in sorted(current_rule_set - desired_rule_set):
-                    remove_exit, _, remove_err = guest_executor(
-                        f"firewall-cmd --permanent --zone={shlex.quote(zone)} "
-                        f"--remove-rich-rule={shlex.quote(rule)}",
-                        check_exit_code=False,
-                    )
-                    if remove_exit != 0:
-                        LOGGER.debug(
-                            "Failed to remove firewalld rich rule from zone '%s': %s",
-                            zone,
-                            (remove_err or "").strip() or remove_exit,
-                        )
-                        overall_success = False
-                    else:
-                        zone_changed = True
-                for rule in sorted(desired_rule_set - current_rule_set):
-                    add_exit, _, add_err = guest_executor(
-                        f"firewall-cmd --permanent --zone={shlex.quote(zone)} "
-                        f"--add-rich-rule={shlex.quote(rule)}",
-                        check_exit_code=False,
-                    )
-                    if add_exit != 0:
-                        LOGGER.debug(
-                            "Failed to add firewalld rich rule to zone '%s': %s",
-                            zone,
-                            (add_err or "").strip() or add_exit,
-                        )
-                        overall_success = False
-                    else:
-                        zone_changed = True
-        else:
-            for rule in current_rich_rules:
-                transformed_rule, changed = transform_text_to_prd(rule)
-                transformed_rule = transformed_rule.strip()
-                if not changed or not transformed_rule or transformed_rule == rule:
-                    continue
-                if not _ensure_zone_backup():
-                    break
-                remove_exit, _, remove_err = guest_executor(
-                    f"firewall-cmd --permanent --zone={shlex.quote(zone)} "
-                    f"--remove-rich-rule={shlex.quote(rule)}",
-                    check_exit_code=False,
-                )
-                if remove_exit != 0:
-                    LOGGER.debug(
-                        "Failed to remove firewalld rich rule from zone '%s': %s",
-                        zone,
-                        (remove_err or "").strip() or remove_exit,
-                    )
-                    overall_success = False
-                    continue
-                add_exit, _, add_err = guest_executor(
-                    f"firewall-cmd --permanent --zone={shlex.quote(zone)} "
-                    f"--add-rich-rule={shlex.quote(transformed_rule)}",
-                    check_exit_code=False,
-                )
-                if add_exit != 0:
-                    LOGGER.debug(
-                        "Failed to add firewalld rich rule to zone '%s': %s",
-                        zone,
-                        (add_err or "").strip() or add_exit,
-                    )
-                    overall_success = False
-                    continue
-                zone_changed = True
-
-        if zone.lower() == "heartbeat":
-            restricted_rule = f"rule family=\"ipv4\" source address=\"{SSH_ALLOWED_SOURCE_IP}\" service name=\"ssh\" accept"
-            query_exit, _, _ = guest_executor(
-                f"firewall-cmd --permanent --zone={shlex.quote(zone)} "
-                f"--query-rich-rule={shlex.quote(restricted_rule)}",
-                check_exit_code=False,
+        if add_exit != 0:
+            detail = (add_err or "").strip() or add_exit
+            print(
+                f"   [WARN] Failed to add SSH rich rule to zone '{zone}': {detail}"
             )
-            if query_exit == 0 and _ensure_zone_backup():
-                remove_exit, _, remove_err = guest_executor(
-                    f"firewall-cmd --permanent --zone={shlex.quote(zone)} "
-                    f"--remove-rich-rule={shlex.quote(restricted_rule)}",
-                    check_exit_code=False,
-                )
-                if remove_exit != 0:
-                    LOGGER.debug(
-                        "Failed to remove SSH rich rule from restricted zone '%s': %s",
-                        zone,
-                        (remove_err or "").strip() or remove_exit,
-                    )
-                    overall_success = False
-                else:
-                    zone_changed = True
+            overall_success = False
+            continue
 
-        if zone_changed and zone not in zones_updated:
-            zones_updated.append(zone)
+        zones_updated.append(zone)
+        print(f"   -> Added SSH rich rule for {SSH_OVERRIDE_SOURCE_IP} to zone '{zone}'.")
 
     if zones_updated:
         reload_exit, _, reload_err = guest_executor("firewall-cmd --reload", check_exit_code=False)
         if reload_exit != 0:
-            print(
-                f"   [WARN] Firewalld reload failed after configuration updates: "
-                f"{(reload_err or '').strip() or reload_exit}"
-            )
+            detail = (reload_err or "").strip() or reload_exit
+            print(f"   [WARN] Firewalld reload failed after SSH override updates: {detail}")
             overall_success = False
         else:
-            print(f"   -> Firewalld zones updated: {', '.join(sorted(zones_updated))}")
+            print(
+                f"   -> Firewalld reloaded after updating zones: {', '.join(sorted(zones_updated))}"
+            )
     else:
-        print("   -> Firewalld zones already aligned with PRD entries.")
+        print(f"   -> No zone required SSH overrides for {SSH_OVERRIDE_SOURCE_IP}.")
     return overall_success
-
-
 
 def _sync_ntp_configuration_to_prd(guest_executor, timestamp: str) -> bool:
     """Update chrony/ntp configuration so NTP servers align with PRD DNS mappings."""
     success = True
     found_config = False
     for config_path in NTP_CONFIG_PATHS:
+        if _guest_path_protected(config_path):
+            print(f"   -> Skipping NTP configuration sync for protected path {config_path}.")
+            found_config = True
+            continue
         exists_exit, _, _ = guest_executor(
             f"test -f {shlex.quote(config_path)}",
             check_exit_code=False,
@@ -1833,6 +1699,9 @@ def _sync_ntp_configuration_to_prd(guest_executor, timestamp: str) -> bool:
 
 def _sync_centos_repo_configuration(guest_executor, timestamp: str) -> bool:
     """Rewrite CentOS repo files to use vault.centos.org."""
+    if _guest_path_protected(CENTOS_REPO_DIR):
+        print("   -> Skipping CentOS repo sync; handled by external automation.")
+        return True
     repo_dir_check, _, _ = guest_executor(f"test -d {shlex.quote(CENTOS_REPO_DIR)}", check_exit_code=False)
     if repo_dir_check != 0:
         print("   -> /etc/yum.repos.d not present; skipping CentOS repo sync.")
@@ -1886,6 +1755,9 @@ def _sync_centos_repo_configuration(guest_executor, timestamp: str) -> bool:
 
 def _ensure_td_agent_repo(guest_executor, timestamp: str) -> bool:
     """Ensure td-agent repo definition exists and points to a working major version."""
+    if _guest_path_protected(TD_AGENT_REPO_PATH):
+        print(f"   -> Skipping td-agent repo configuration; {TD_AGENT_REPO_PATH} managed externally.")
+        return True
     guest_executor(f"mkdir -p {shlex.quote(CENTOS_REPO_DIR)}", check_exit_code=False)
     release_macros = ("%centos_ver", "%rhel")
     release_ver = "7"
@@ -2004,6 +1876,9 @@ def _ensure_http_proxy_configuration(guest_executor, timestamp: str) -> bool:
     """Ensure /etc/profile exports http/https proxy variables when they are missing."""
     proxy_url = "http://172.16.162.6:3128"
     profile_path = "/etc/profile"
+    if _guest_path_protected(profile_path):
+        print(f"   -> Skipping proxy configuration updates because {profile_path} is protected.")
+        return True
     backup_path = f"{profile_path}-{timestamp}.bak"
     exists_exit, _, _ = guest_executor(
         f"test -f {shlex.quote(profile_path)}",
@@ -3143,6 +3018,14 @@ def main() -> None:
     global GUEST_ROOT_PWD, GUEST_ADMIN_PWD
 
     cli_args = _parse_cli_arguments()
+    if getattr(cli_args, "enable_standard_config_edits", False):
+        unregister_protected_guest_paths(DEFAULT_PROTECTED_GUEST_PATHS)
+        print("[INFO] Standard config protection disabled; sensitive guest files may be modified.")
+    additional_protected = getattr(cli_args, "protected_guest_files", None) or []
+    if additional_protected:
+        register_protected_guest_paths(additional_protected)
+        for protected_path in additional_protected:
+            print(f"[INFO] Protecting guest file: {_normalize_guest_path(protected_path)}")
     provided_source_vm_name = (cli_args.source_vm_name or "").strip()
 
     # ------------------------------------------------
