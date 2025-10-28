@@ -1323,6 +1323,9 @@ def _sync_firewalld_configuration_to_prd(
     if not _is_service_active(guest_executor, "firewalld"):
         print("   -> firewalld inactive; skipping firewalld configuration sync.")
         return True
+    # firewalld zone XML reconciliation is currently disabled.
+    print("   -> firewalld zone XML rewrite is disabled; skipping firewalld configuration sync.")
+    return True
     zone_names: Set[str] = set()
     exit_code, zones_output, _ = guest_executor("firewall-cmd --get-zones", check_exit_code=False)
     if exit_code == 0 and zones_output:

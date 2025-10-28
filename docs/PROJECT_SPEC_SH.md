@@ -32,6 +32,7 @@
 - STG 範囲の IP（例: `172.16.170.x`）を PRD 範囲に変換。
 - ホスト名末尾 `s` -> `p`、および `stg` を含むトークンを `prd` に置換。
 - HTTPD fuel/app/config/newproduction の存在および `app.php` 等 5 ファイルを検証。
+- `/etc/yum.repos.d/td.repo` は PRD 仕様 (`https://packages.treasuredata.com/4/...`) に統一し、疎通できない場合は v3 へフォールバックして再確認。v4/v3 どちらも到達不可ならエラーとして通知。
 - 実際に書き換える場合はバックアップを同じディレクトリに `*.bak_<timestamp>` 形式で生成。
 - 変換ログ（ロールバック用）を `/tmp/<ユーザー名>/find_and_extract/<hostname>_<timestamp>_transform.log` に出力。
 
