@@ -3,8 +3,11 @@
 ## Overview
 
 - **Objective**: Seamlessly migrate a staging (STG) VM to production (PRD) by automating clone, registration, guest configuration, and validation steps while enforcing PRD configuration standards.
+
 - **Primary entry point**: `cloneAndVmotion.py`
+
 - **Key supporting modules**: `network_utils.py`, `guest_commands.py`, `firewalld_schema.py`, schema definitions under `schemas/`.
+
 - **Supported guests**: RHEL/CentOS family with firewalld, chrony/ntpd, yum, and td-agent tooling available. Hosts must run VMware Tools with Guest Operations enabled.
 
 ---
@@ -12,23 +15,41 @@
 ## End-to-End Workflow
 
 1. **Phase 0 - Pre-flight**
+
    - Authenticate against source and destination vCenter instances.
+
    - Confirm the target VM exists and verify VMware Tools status.
+
 2. **Phase 1 - Data Collection**
+
    - Gather NIC/IP/DNS/route data through VMware Tools and the vSphere REST SDK.
+
    - Capture firewalld zone definitions, NTP configs, yum repositories, and proxy settings.
+
    - Validate that STG->PRD transformation rules apply cleanly; log anomalies for follow-up.
+
 3. **Phase 2 - User Confirmation**
+
    - Present collected metadata and planned changes.
+
    - Await operator approval before mutating objects or guest configuration.
+
 4. **Phase 3 - Clone and Register**
+
    - Clone the source VM to the staging datastore, strip NICs, and unregister.
+
    - Register the clone on the destination vCenter and rebuild NICs against PRD networks.
+
 5. **Phase 4 - Guest Configuration**
+
    - Reconfigure the guest OS (hosts file, firewalld, NTP, yum repos, proxies, td-agent repo, iptables) using the shell-based writer described below.
+
 6. **Phase 5 - Verification and Wrap-up**
+
    - Validate configuration via SDK queries or `nmcli`, depending on availability.
+
    - Run connectivity checks, ensure firewalld allows SSH from the operator subnet.
+
    - Summarise results with backups and warnings to guide any manual clean-up.
 
 ---
@@ -36,20 +57,35 @@
 ## Guest Configuration Tasks
 
 | Component | Action | Notes |
+
 | --- | --- | --- |
+
 | `/etc/hosts` | Transform STG hostnames/IPs to PRD equivalents; warn if staging entries remain. | Uses iterative `transform_text_to_prd`. |
+
 | `firewalld` | Enforce zone plans (interfaces, sources, ports, rich rules) sourced from STG. | Backed by JSON schema validation; creates timestamped backups before changes. |
+
 | `chrony`/`ntpd` | Convert NTP servers to PRD addresses; verify staging IPs are removed. | Applies text transformations and targeted regex replacements. |
+
 | `yum` repos | Disable `mirrorlist`, point `baseurl` to `https://vault.centos.org`, enforce HTTPS. | Retains per-file backups and retries TLS repairs before warning. |
+
 | `td-agent` repo | Ensure `/etc/yum.repos.d/td.repo` exists, probing v4 then v3 endpoints. | Auto-detects release/arch via `rpm -E`. |
+
 | `/etc/profile` | Append PRD proxy exports when absent; verify via environment snapshot. | Keeps `-YYYYMMDD.bak` backup. |
+
 | `iptables` | Apply PRD rule set and reload service (systemd or legacy service command). | Warns if reload fails. |
 
+> **Protected paths:** The workflow keeps `/etc/profile`, `/etc/hosts`, and standard chrony/ntp configuration files read-only by default. Pass `--enable-standard-config-edits` when those files must be updated, and use `--protect-guest-file /path` to extend the protected set.
+
 All file modifications are performed via the `_write_guest_file` helper, which:
+
 1. Verifies the target directory exists.
+
 2. Creates a temporary file with `mktemp` (preferring the target directory).
+
 3. Uses `bash -lc` with a heredoc to write the content (no Python payloads, no base64).
+
 4. Preserves ownership and permissions based on `stat -c '%a %u %g'` for existing files.
+
 5. Atomically replaces the original file via `mv` and cleans up temp files on failure.
 
 ---
@@ -57,12 +93,19 @@ All file modifications are performed via the `_write_guest_file` helper, which:
 ## Firewalld Zone Schema Handling
 
 - `firewalld_schema.py` defines `FirewalldZonePlan` and `FirewalldZoneSchemaValidator`. The validator consumes `schemas/firewalld_zone_schema.json` to ensure collected data only contains supported keys.
+
 - During data collection, each zone is read using `firewall-cmd --permanent --list-*` commands. Zones that fail validation are skipped with a debug log.
+
 - `_sync_firewalld_configuration_to_prd` receives the list of validated plans and enforces them on the destination VM:
+
   - Interfaces: Treats the plan as authoritative (empty list removes all interfaces).
+
   - Sources, ports, rich rules: Applies `transform_text_to_prd` to convert STG IPs/domains, removes unexpected entries, and adds missing ones.
+
   - Zone XML backups are written once per zone before any modification (`/etc/firewalld/zones/<zone>.xml-YYYYMMDD.bak`).
+
   - A single `firewall-cmd --reload` is issued when changes occur; failures downgrade the overall success flag.
+
 - The legacy transformation-only branch remains for environments where no source plan is available.
 
 ---
@@ -70,7 +113,9 @@ All file modifications are performed via the `_write_guest_file` helper, which:
 ## Command Logging and Reporting
 
 - `guest_commands.py` emits every planned command through the registered logger (`register_command_execution`). Each entry is stored with a friendly description generated by `_describe_command` or provided explicitly via `remember_command_description`.
+
 - The execution summary printed by `_print_execution_summary()` now lists commands in chronological order, pairing raw shell invocations with short Japanese descriptions for operators.
+
 - `[OK]`, `[WARN]`, and `[ERROR]` log lines are also collected throughout execution, giving operators a concise success/failure view to share after the run.
 
 ---
@@ -78,8 +123,11 @@ All file modifications are performed via the `_write_guest_file` helper, which:
 ## Backup Strategy and Rollback Aids
 
 - Every file mutation creates a timestamped `-YYYYMMDD.bak` copy in place (hosts, profile, firewalld zone XMLs, NTP configs, yum repos, td-agent repo, iptables).
+
 - Firewalld rewrites ensure only a single backup per zone per run to avoid clutter.
+
 - TLS repair attempts are logged step-by-step; unresolved issues downgrade to `[WARN]` while leaving the original files untouched.
+
 - Execution summary highlights backup paths so operators can roll back manually if required.  For the shell-side helper (`find_and_extract.sh`), see `docs/FIND_AND_EXTRACT_TOOL.md` for automated transform/rollback guidance.
 
 ---
@@ -87,7 +135,11 @@ All file modifications are performed via the `_write_guest_file` helper, which:
 ## Future Enhancements
 
 1. **Diff preview tooling** - Integrate `find_and_extract` logic to show diffs before applying guest changes.
+
 2. **Automated report** - Generate HTML/Markdown run reports summarising commands, backups, and warnings.
+
 3. **Extended OS coverage** - Run full validation on RHEL 8/9 and Ubuntu LTS releases, adjusting scripts where necessary.
+
 4. **Test automation** - Add integration tests for the bash-based writer and firewalld zone reconciliation logic.
+
 5. **Rollback automation** - Provide helper scripts to restore from the generated backups on demand.
