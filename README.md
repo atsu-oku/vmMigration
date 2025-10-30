@@ -164,4 +164,6 @@ Additional guest OS reports are welcome; please file issues with findings.
 
 - `docs/MIGRATION_FEATURES_EN.md`: Details recent enhancements such as command logging, firewalld schema synchronisation, and shell-only guest writes.
 
+- `../find_and_extract_tool/README.md`: Standalone STG->PRD inspection and transform helper (`find_and_extract.sh`).
+
 Feel free to open issues or PRs to improve the tooling. The maintainers welcome feedback based on lab or production migrations.

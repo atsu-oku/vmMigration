@@ -4,7 +4,7 @@
 
 - **Objective**: Move a staging VM running on vSphere into the production environment and align the in-guest configuration with PRD standards.
 
-- **Key files**: `cloneAndVmotion.py`, `network_utils.py`, shell tool `find_and_extract.sh` (documented in `docs/PROJECT_SPEC_SH.md`).
+- **Key files**: `cloneAndVmotion.py`, `network_utils.py`. The STG diff helper now lives in the sibling project `../find_and_extract_tool/find_and_extract.sh` (documented in `../find_and_extract_tool/docs/PROJECT_SPEC_SH.md`).
 
 - **Target guest OS**: RHEL / CentOS family with firewalld, chrony/ntpd, yum repos, td-agent and related tooling available.
 
@@ -152,7 +152,7 @@ etwork_utils.py
 
 - Validates `/var/www/com/ipet-ins/<system>/fuel/app/config/newproduction` structures when `/var` is targeted and records missing assets.
 
-- Writes hit/preview logs beneath `/tmp/<user>/find_and_extract/`; see `docs/PROJECT_SPEC_SH.md` for operational details.
+- Writes hit/preview logs beneath `/tmp/<user>/find_and_extract/`; see `../find_and_extract_tool/docs/PROJECT_SPEC_SH.md` for operational details.
 
 ---
 
