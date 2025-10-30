@@ -10,7 +10,7 @@ This document summarizes the recent enhancements made to the staged-to-productio
 
 - `_print_execution_summary()` prints commands in chronological order at the end of the run, alongside the existing success and failure sections. Each entry shows the description first, then the exact shell command for easy replay.
 
-- When `find_and_extract.sh` is used during STG->PRD prep, its `transform` subcommand now emits structured change logs under `/tmp/<user>/find_and_extract/`.  These logs can be replayed via `find_and_extract.sh rollback …` to restore individual files or an entire run (details in `docs/FIND_AND_EXTRACT_TOOL.md`).
+- When `find_and_extract.sh` (now maintained in `../find_and_extract_tool/`) is used during STG->PRD prep, its `transform` subcommand emits structured change logs under `/tmp/<user>/find_and_extract/`. These logs can be replayed via `find_and_extract.sh rollback …` to restore individual files or an entire run (details in `../find_and_extract_tool/docs/FIND_AND_EXTRACT_TOOL.md`).
 
 ## Guest File Writes Without Python Payloads
 
