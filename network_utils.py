@@ -250,6 +250,7 @@ def transform_text_to_prd(content: str) -> Tuple[str, bool]:
         return "p"
 
     updated = STG_HOST_SUFFIX_DIGIT_PATTERN.sub(_replace_hostname, updated)
+
     def _replace_domain(match: re.Match[str]) -> str:
         nonlocal changed
         changed = True
@@ -778,7 +779,11 @@ def ensure_firewall_allows_ssh(
         if added_zones:
             command_executor("firewall-cmd --reload", check_exit_code=False)
         if missing_zones:
-            print(f"      - firewalld: skipped zones without rule updates due to query errors: {', '.join(sorted(missing_zones))}")
+            missing_summary = ", ".join(sorted(missing_zones))
+            print(
+                "      - firewalld: skipped zones without rule updates due to "
+                f"query errors: {missing_summary}"
+            )
         if added_zones:
             print(f"      - firewalld: added SSH allow rule in zones {', '.join(sorted(added_zones))} ({source_ip})")
             return
@@ -936,11 +941,11 @@ def configure_interface_without_nmcli(
                 except ValueError:
                     print(f"   [WARN] Skipping route {network_base}/{prefix_value}: invalid prefix.")
                     continue
-                _run_guest_command(
-                    f"route del -net {network_base} netmask {route_netmask} dev {interface_name} >/dev/null 2>&1 || true",
-                    record_failure=False,
-                    fatal=False,
+                delete_route_cmd = (
+                    f"route del -net {network_base} netmask {route_netmask} "
+                    f"dev {interface_name} >/dev/null 2>&1 || true"
                 )
+                _run_guest_command(delete_route_cmd, record_failure=False, fatal=False)
                 exit_code, _, _ = _run_guest_command(
                     f"route add -net {network_base} netmask {route_netmask} gw {gateway} dev {interface_name}",
                     fatal=False,
@@ -1189,7 +1194,11 @@ def verify_destination_network_with_sdk(
         LOGGER.warning("SDK verification failed to read interfaces: %s", error)
         return False
     if isinstance(interfaces_payload, Mapping):
-        value = interfaces_payload.get("value") or interfaces_payload.get("interfaces") or interfaces_payload.get("items")
+        value = (
+            interfaces_payload.get("value")
+            or interfaces_payload.get("interfaces")
+            or interfaces_payload.get("items")
+        )
         interfaces: Iterable[Any] = value if isinstance(value, list) else []
     elif isinstance(interfaces_payload, list):
         interfaces = interfaces_payload

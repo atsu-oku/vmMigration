@@ -1268,8 +1268,8 @@ def _rewrite_centos_repo_content(repo_content: str) -> Tuple[str, bool]:
                     suffix = suffix.lstrip("/")
                     working = f"https://vault.centos.org/{suffix}"
                 elif "centos.org" in lower_working:
-                    # Non-vault CentOS endpoints -> ensure HTTPS
-                    working = working
+                    # Non-vault CentOS endpoints already normalized above.
+                    pass
                 new_line = f"{indent}baseurl={working}"
                 if new_line != line:
                     updated_lines.append(new_line)
