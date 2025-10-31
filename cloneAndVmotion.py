@@ -2838,8 +2838,73 @@ class CloneAndVmotionWorkflow:
         state.migrated_vm_name_for_rollback = state.clone_name
         print("[OK] VM registration completed.")
 
+    def _ensure_dest_session_alive(
+        self,
+        *,
+        refresh_content: bool = True,
+        refresh_vm: bool = True,
+    ) -> None:
+        """Ensure the destination vCenter session is connected; reconnect if necessary."""
+        state = self.state
+        session = self.si_dest
+        reconnect_reason: Optional[str] = None
+
+        if session is None:
+            reconnect_reason = "initial connection missing"
+        else:
+            try:
+                session.CurrentTime()
+            except vim.fault.NotAuthenticated:
+                reconnect_reason = "session expired"
+            except Exception:  # pylint: disable=broad-exception-caught
+                LOGGER.debug("Destination vCenter health check failed; will attempt reconnect.", exc_info=True)
+                reconnect_reason = "session health check failed"
+
+        if reconnect_reason is None:
+            if refresh_content and self.content_dest is None:
+                self.content_dest = self.si_dest.RetrieveContent()
+            return
+
+        print(
+            f"   [INFO] Destination vCenter session dropped ({reconnect_reason}); attempting to reconnect..."
+        )
+        if state.dest_keepalive_handle:
+            _stop_keepalive_thread(state.dest_keepalive_handle)
+            state.dest_keepalive_handle = None
+
+        if self.si_dest is not None:
+            try:
+                Disconnect(self.si_dest)
+            except Exception:  # pylint: disable=broad-exception-caught
+                LOGGER.debug("Ignoring error while disconnecting stale destination session.", exc_info=True)
+
+        self.content_dest = None
+        self.si_dest = authenticate_vcenter(
+            VCSA_HOST_DEST,
+            VCSA_USER,
+            self.vcsa_pwd_dest,
+            self.ctx,
+            host_env_var=ENV_DEST_HOST_VAR,
+        )
+        print("   [OK] Reconnected to destination vCenter.")
+        if refresh_content or self.content_dest is None:
+            self.content_dest = self.si_dest.RetrieveContent()
+        state.dest_keepalive_handle = _start_keepalive_thread(self.si_dest, "dest-vcenter")
+
+        if refresh_vm:
+            vm_name = state.migrated_vm_name_for_rollback or state.clone_name
+            if vm_name:
+                state.migrated_vm = wait_for_vm_availability(
+                    self.content_dest,
+                    vm_name,
+                    retries=60,
+                    delay_seconds=2,
+                )
+                state.migrated_vm_for_rollback = state.migrated_vm
+
     def _recreate_destination_nics(self) -> None:
         state = self.state
+        self._ensure_dest_session_alive(refresh_content=True, refresh_vm=True)
         migrated_vm = state.migrated_vm
         if not migrated_vm or not self.content_dest:
             raise RuntimeError("Destination VM context is not available; registration may have failed.")
