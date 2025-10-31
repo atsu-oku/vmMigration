@@ -1268,8 +1268,8 @@ def _rewrite_centos_repo_content(repo_content: str) -> Tuple[str, bool]:
                     suffix = suffix.lstrip("/")
                     working = f"https://vault.centos.org/{suffix}"
                 elif "centos.org" in lower_working:
-                    # Non-vault CentOS endpoints -> ensure HTTPS
-                    working = working
+                    # Non-vault CentOS endpoints already normalized above.
+                    pass
                 new_line = f"{indent}baseurl={working}"
                 if new_line != line:
                     updated_lines.append(new_line)
@@ -1527,8 +1527,36 @@ def _sync_firewalld_configuration_to_prd(
             for rule in (rich_stdout or "").splitlines()
             if rule.strip()
         ]
+        services_exit, services_stdout, services_err = guest_executor(
+            f"firewall-cmd --permanent --zone={shlex.quote(zone)} --list-services",
+            check_exit_code=False,
+        )
+        if services_exit == 0:
+            services = {entry.strip() for entry in (services_stdout or "").split() if entry.strip()}
+            if "ssh" in services:
+                print(
+                    f"   -> Zone '{zone}' already exposes SSH service broadly; skipping updates to preserve configuration."
+                )
+                continue
+        else:
+            if services_err:
+                LOGGER.debug(
+                    "Failed to list firewalld services for zone '%s': %s",
+                    zone,
+                    services_err.strip(),
+                )
         if rule_value in current_rules:
             print(f"   -> Zone '{zone}' already allows SSH from {SSH_OVERRIDE_SOURCE_IP}.")
+            continue
+        conflicting_rules = [
+            rule
+            for rule in current_rules
+            if "service name=\"ssh\"" in rule and f"source address=\"{SSH_OVERRIDE_SOURCE_IP}\"" not in rule
+        ]
+        if conflicting_rules:
+            print(
+                f"   -> Zone '{zone}' has existing SSH rich rules; skipping to avoid altering configuration."
+            )
             continue
 
         zone_file = f"/etc/firewalld/zones/{zone}.xml"
@@ -1809,39 +1837,46 @@ def _ensure_td_agent_repo(guest_executor, timestamp: str) -> bool:
 
 
 def _sync_iptables_configuration_to_prd(guest_executor, timestamp: str) -> bool:
-    """Update /etc/sysconfig/iptables to PRD equivalents when the iptables service is active."""
+    """Ensure iptables permits SSH from the approved source without rewriting existing rules."""
+    _ = timestamp  # Timestamp retained for signature compatibility; backups handled by iptables-save.
     if not _is_service_active(guest_executor, "iptables"):
         print("   -> iptables service inactive; skipping iptables configuration sync.")
         return True
-    config_path = "/etc/sysconfig/iptables"
-    exit_code, config_content, config_err = guest_executor(f"cat {shlex.quote(config_path)}", check_exit_code=False)
+    exit_code, _, _ = guest_executor("command -v iptables", check_exit_code=False)
     if exit_code != 0:
-        print(f"   [WARN] Unable to read iptables configuration '{config_path}': {(config_err or '').strip() or exit_code}")
-        return False
-    updated_config, changed = transform_text_to_prd(config_content)
-    if not changed:
-        print(f"   -> {config_path} already aligned with PRD entries.")
+        print("   -> iptables command unavailable; skipping iptables configuration sync.")
         return True
-    backup_path = f"{config_path}-{timestamp}.bak"
-    backup_cmd = (
-        f"[ -f {shlex.quote(backup_path)} ] || "
-        f"cp {shlex.quote(config_path)} {shlex.quote(backup_path)}"
-    )
-    backup_exit, _, backup_err = guest_executor(backup_cmd, check_exit_code=False)
-    if backup_exit != 0:
-        print(f"   [WARN] Unable to back up iptables configuration '{config_path}': {(backup_err or '').strip() or backup_exit}")
+    health_code, iptables_state, health_err = guest_executor("iptables -S", check_exit_code=False)
+    if health_code != 0:
+        print(f"   [WARN] Unable to inspect iptables rules: {(health_err or '').strip() or health_code}")
         return False
-    write_exit, _, write_err = _write_guest_file(guest_executor, config_path, updated_config)
-    if write_exit != 0:
-        print(f"   [WARN] Failed to update iptables configuration '{config_path}': {(write_err or '').strip() or write_exit}")
+    lines = [line.strip() for line in (iptables_state or "").splitlines() if line.strip()]
+    ssh_accept_lines = [
+        line
+        for line in lines
+        if line.startswith(("-A INPUT", "-I INPUT"))
+        and "--dport 22" in line
+        and "-j ACCEPT" in line
+    ]
+    conflicting_accepts = [
+        line for line in ssh_accept_lines if f"-s {SSH_OVERRIDE_SOURCE_IP}" not in line
+    ]
+    if conflicting_accepts:
+        print(
+            "   [WARN] Existing iptables SSH rules allow other sources; skipping updates to avoid altering configuration."
+        )
         return False
-    reload_exit, _, reload_err = guest_executor("systemctl reload iptables", check_exit_code=False)
-    if reload_exit != 0:
-        reload_exit, _, reload_err = guest_executor("service iptables reload >/dev/null 2>&1", check_exit_code=False)
-    if reload_exit != 0:
-        print(f"   [WARN] Unable to reload iptables after configuration update: {(reload_err or '').strip() or reload_exit}")
+    matching_rule = any(line for line in ssh_accept_lines if f"-s {SSH_OVERRIDE_SOURCE_IP}" in line)
+    if matching_rule:
+        print("   -> iptables already restricts SSH to the approved source.")
+        return True
+    add_rule_cmd = f"iptables -I INPUT 1 -p tcp -s {SSH_OVERRIDE_SOURCE_IP} --dport 22 -j ACCEPT"
+    add_exit, _, add_err = guest_executor(add_rule_cmd, check_exit_code=False)
+    if add_exit != 0:
+        print(f"   [WARN] Failed to add iptables SSH allow rule: {(add_err or '').strip() or add_exit}")
         return False
-    print(f"   -> Updated iptables configuration for PRD environment (backup: {backup_path}).")
+    guest_executor("iptables-save > /etc/sysconfig/iptables", check_exit_code=False)
+    print(f"   -> Added iptables SSH allow rule for {SSH_OVERRIDE_SOURCE_IP}.")
     return True
 
 

@@ -250,6 +250,7 @@ def transform_text_to_prd(content: str) -> Tuple[str, bool]:
         return "p"
 
     updated = STG_HOST_SUFFIX_DIGIT_PATTERN.sub(_replace_hostname, updated)
+
     def _replace_domain(match: re.Match[str]) -> str:
         nonlocal changed
         changed = True
@@ -719,25 +720,10 @@ def ensure_firewall_allows_ssh(
         restricted_zones = {"heartbeat"}
         added_zones: List[str] = []
         missing_zones: List[str] = []
-        removed_zones: List[str] = []
         for zone in zones:
             zone_lower = zone.lower()
             if zone_lower in restricted_zones:
-                removal_cmd = (
-                    f"firewall-cmd --permanent --zone={zone} "
-                    f"--query-rich-rule='{rich_rule_def}'"
-                )
-                removal_exit, _, _ = command_executor(removal_cmd, check_exit_code=False)
-                if removal_exit == 0:
-                    delete_cmd = (
-                        f"firewall-cmd --permanent --zone={zone} "
-                        f"--remove-rich-rule='{rich_rule_def}'"
-                    )
-                    delete_exit, _, delete_err = command_executor(delete_cmd, check_exit_code=False)
-                    if delete_exit == 0:
-                        removed_zones.append(zone)
-                    else:
-                        LOGGER.debug("Failed to remove SSH rich rule in zone '%s': %s", zone, delete_err)
+                LOGGER.debug("Skipping zone '%s' due to guard rails.", zone)
                 continue
             if zone_lower == "public":
                 continue
@@ -750,8 +736,36 @@ def ensure_firewall_allows_ssh(
                 missing_zones.append(zone)
                 continue
             existing_rules = [line.strip() for line in (list_stdout or "").splitlines() if line.strip()]
+            services_exit, services_stdout, services_err = command_executor(
+                f"firewall-cmd --permanent --zone={zone} --list-services",
+                check_exit_code=False,
+            )
+            if services_exit == 0:
+                services = {entry.strip() for entry in (services_stdout or "").split() if entry.strip()}
+                if "ssh" in services:
+                    print(
+                        f"      - firewalld: zone '{zone}' already exposes SSH service broadly; skipping updates."
+                    )
+                    continue
+            else:
+                if services_err:
+                    LOGGER.debug(
+                        "Failed to read services for zone '%s': %s",
+                        zone,
+                        services_err.strip(),
+                    )
             if rich_rule_def in existing_rules:
                 print(f"      - firewalld: SSH allow rule already present in zone '{zone}' ({source_ip})")
+                continue
+            conflicting_rules = [
+                rule
+                for rule in existing_rules
+                if "service name=\"ssh\"" in rule and f"source address=\"{source_ip}\"" not in rule
+            ]
+            if conflicting_rules:
+                print(
+                    f"      - firewalld: zone '{zone}' has existing SSH rich rules; skipping to preserve configuration."
+                )
                 continue
             rich_rule_cmd = (
                 f"firewall-cmd --permanent --zone={zone} "
@@ -762,12 +776,14 @@ def ensure_firewall_allows_ssh(
                 added_zones.append(zone)
             else:
                 LOGGER.debug("Failed to add firewalld rich rule in zone '%s': %s", zone, add_err)
-        if removed_zones or added_zones:
+        if added_zones:
             command_executor("firewall-cmd --reload", check_exit_code=False)
-        if removed_zones:
-            print(f"      - firewalld: removed SSH allow rule from zones {', '.join(sorted(removed_zones))}")
         if missing_zones:
-            print(f"      - firewalld: skipped zones without rule updates due to query errors: {', '.join(sorted(missing_zones))}")
+            missing_summary = ", ".join(sorted(missing_zones))
+            print(
+                "      - firewalld: skipped zones without rule updates due to "
+                f"query errors: {missing_summary}"
+            )
         if added_zones:
             print(f"      - firewalld: added SSH allow rule in zones {', '.join(sorted(added_zones))} ({source_ip})")
             return
@@ -780,14 +796,29 @@ def ensure_firewall_allows_ssh(
         if health_code != 0:
             LOGGER.debug("iptables sanity check failed: %s", health_err)
         else:
+            lines = [line.strip() for line in (iptables_state or "").splitlines() if line.strip()]
             if not firewalld_active:
-                lines = [line.strip() for line in (iptables_state or "").splitlines() if line.strip()]
                 policy_lines = [line for line in lines if line.startswith("-P ")]
                 rule_lines = [line for line in lines if line.startswith("-A ") or line.startswith("-I ")]
                 policies_accept = policy_lines and all(line.upper().endswith(" ACCEPT") for line in policy_lines)
                 if policies_accept and not rule_lines:
                     print("      - firewalld inactive and iptables policies ACCEPT; no firewall changes needed.")
                     return
+            ssh_accept_lines = [
+                line
+                for line in lines
+                if line.startswith(("-A INPUT", "-I INPUT"))
+                and "--dport 22" in line
+                and "-j ACCEPT" in line
+            ]
+            conflicting_accepts = [
+                line for line in ssh_accept_lines if f"-s {source_ip}" not in line
+            ]
+            if conflicting_accepts:
+                print(
+                    "      - iptables: existing SSH rules already allow other sources; skipping updates."
+                )
+                return
             check_rule_cmd = f"iptables -C INPUT -p tcp -s {source_ip} --dport 22 -j ACCEPT"
             exit_code, _, _ = command_executor(check_rule_cmd, check_exit_code=False)
             if exit_code != 0:
@@ -910,11 +941,11 @@ def configure_interface_without_nmcli(
                 except ValueError:
                     print(f"   [WARN] Skipping route {network_base}/{prefix_value}: invalid prefix.")
                     continue
-                _run_guest_command(
-                    f"route del -net {network_base} netmask {route_netmask} dev {interface_name} >/dev/null 2>&1 || true",
-                    record_failure=False,
-                    fatal=False,
+                delete_route_cmd = (
+                    f"route del -net {network_base} netmask {route_netmask} "
+                    f"dev {interface_name} >/dev/null 2>&1 || true"
                 )
+                _run_guest_command(delete_route_cmd, record_failure=False, fatal=False)
                 exit_code, _, _ = _run_guest_command(
                     f"route add -net {network_base} netmask {route_netmask} gw {gateway} dev {interface_name}",
                     fatal=False,
@@ -1163,7 +1194,11 @@ def verify_destination_network_with_sdk(
         LOGGER.warning("SDK verification failed to read interfaces: %s", error)
         return False
     if isinstance(interfaces_payload, Mapping):
-        value = interfaces_payload.get("value") or interfaces_payload.get("interfaces") or interfaces_payload.get("items")
+        value = (
+            interfaces_payload.get("value")
+            or interfaces_payload.get("interfaces")
+            or interfaces_payload.get("items")
+        )
         interfaces: Iterable[Any] = value if isinstance(value, list) else []
     elif isinstance(interfaces_payload, list):
         interfaces = interfaces_payload
