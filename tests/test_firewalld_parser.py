@@ -28,6 +28,22 @@ class FirewalldManagerTests(unittest.TestCase):
 
         apply_zone_sources("public", ["172.16.163.0/24", "10.0.0.0/8"], executor)
         self.assertIn("firewall-cmd --zone public --add-source 10.0.0.0/8 --permanent", executed)
+        command_log = " ; ".join(executed)
+        self.assertNotIn("--set-default-zone", command_log)
+
+    def test_apply_zone_sources_preserves_link_local(self) -> None:
+        executed = []
+
+        def executor(cmd: str, check_exit_code: bool = True) -> tuple[int, str, str]:
+            executed.append(cmd)
+            if "--list-sources" in cmd:
+                return 0, "169.254.0.0/16\n10.0.0.0/8\n", ""
+            return 0, "", ""
+
+        apply_zone_sources("trusted", ["10.0.0.0/8"], executor)
+        command_log = " ; ".join(executed)
+        self.assertNotIn("firewall-cmd --zone trusted --remove-source 169.254.0.0/16 --permanent", command_log)
+        self.assertNotIn("--set-default-zone", command_log)
 
     def test_apply_service_ports(self) -> None:
         executed = []
