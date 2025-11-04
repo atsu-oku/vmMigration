@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Set
 
 
 class SchemaValidator:
@@ -18,12 +18,17 @@ class SchemaValidator:
         self.allowed = set(schema.get("properties", {}).keys())
 
     def validate(self, data: Dict[str, Any]) -> None:
+        """Raise when required keys are missing or unsupported keys are present."""
         missing = self.required - data.keys()
         if missing:
             raise ValueError(f"Missing required keys: {sorted(missing)}")
         unknown = set(data.keys()) - self.allowed
         if unknown:
             raise ValueError(f"Unsupported keys present: {sorted(unknown)}")
+
+    def allowed_keys(self) -> Set[str]:
+        """Return the set of keys permitted by the schema."""
+        return set(self.allowed)
 
 
 SCHEMA_DIR = Path(__file__).resolve().parent / "schemas"
