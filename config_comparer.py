@@ -3,10 +3,12 @@
 
 from __future__ import annotations
 
-from utils.path_bootstrap import PROJECT_ROOT  # noqa: F401
-
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Set
+
+from utils.path_bootstrap import ensure_project_root
+
+ensure_project_root()
 
 from firewalld_parser import FirewalldZone
 from iptables_parser import IptablesConfig

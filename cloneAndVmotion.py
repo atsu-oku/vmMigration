@@ -393,11 +393,11 @@ def _tracking_print(*args, **kwargs) -> None:
     message = sep.join(str(arg) for arg in args)
     normalized = message.lstrip()
     if normalized.startswith("[OK]"):
-        log_success(normalized[len("[OK]") :].strip())
+        log_success(normalized[len("[OK]"):].strip())
     elif normalized.startswith("[WARN]"):
-        log_failure(normalized[len("[WARN]") :].strip())
+        log_failure(normalized[len("[WARN]"):].strip())
     elif normalized.startswith("[ERROR]"):
-        log_failure(normalized[len("[ERROR]") :].strip())
+        log_failure(normalized[len("[ERROR]"):].strip())
     _ORIGINAL_PRINT(*args, **kwargs)
 
 
