@@ -62,7 +62,7 @@ class GuestCommandExecutor:
         self.admin_pwd = admin_pwd
 
     def run(self, vm, command, check_exit_code: bool = True):
-        """Execute a shell command in the guest, falling back to admin when needed."""
+        """Execute command in the guest, falling back to admin when root fails."""
         global ROOT_LOGIN_DISABLED
 
         print("[GUEST-CMD] Planned command:")
@@ -78,13 +78,17 @@ class GuestCommandExecutor:
         if not ROOT_LOGIN_DISABLED and self.root_auth:
             try:
                 auth_used = "root"
-                exit_code, stdout, stderr = self._run_command(vm, self.root_auth, command)
+                exit_code, stdout, stderr = self._run_command(
+                    vm, self.root_auth, command
+                )
             except vim.fault.InvalidGuestLogin as error:
                 fallback_error = error
                 ROOT_LOGIN_DISABLED = True
                 self.root_auth = None
                 if self._can_use_admin():
-                    print("[GUEST-CMD] root authentication failed -> retrying as admin user.")
+                    print(
+                        "[GUEST-CMD] root authentication failed -> retrying as admin user."
+                    )
                     exit_code, stdout, stderr = self._run_as_admin(vm, command)
                     auth_used = "admin"
                 else:
@@ -98,7 +102,9 @@ class GuestCommandExecutor:
                     ROOT_LOGIN_DISABLED = True
                     self.root_auth = None
                     if self._can_use_admin():
-                        print("[GUEST-CMD] root authentication failed -> retrying as admin user.")
+                        print(
+                            "[GUEST-CMD] root authentication failed -> retrying as admin user."
+                        )
                         exit_code, stdout, stderr = self._run_as_admin(vm, command)
                         auth_used = "admin"
                     else:
@@ -111,11 +117,15 @@ class GuestCommandExecutor:
         if auth_used is None:
             if self._can_use_admin():
                 if not self.root_auth or ROOT_LOGIN_DISABLED:
-                    print("[GUEST-CMD] root authentication disabled; running command as admin user.")
+                    print(
+                        "[GUEST-CMD] root authentication disabled; running command as admin user."
+                    )
                 exit_code, stdout, stderr = self._run_as_admin(vm, command)
                 auth_used = "admin"
             else:
-                raise RuntimeError("Root authentication is disabled and admin credentials are unavailable.")
+                raise RuntimeError(
+                    "Root authentication is disabled and admin credentials are unavailable."
+                )
 
         print("[GUEST-CMD] STDOUT:\n---\n" + (stdout or "(none)") + "\n---")
         print("[GUEST-CMD] STDERR:\n---\n" + (stderr or "(none)") + "\n---")
@@ -145,17 +155,23 @@ class GuestCommandExecutor:
         print("[GUEST-CMD] Result: failure")
         combined_cli_output = ((stderr or "") + "\n" + (stdout or "")).lower()
         reason = (stderr or "").strip() or "Unknown error"
-        if "nmcli" in command and ("command not found" in combined_cli_output or exit_code == 127):
+        if "nmcli" in command and (
+            "command not found" in combined_cli_output or exit_code == 127
+        ):
             raise NmcliNotAvailableError(command)
         if exit_code != 0:
             reason = (stderr or "").strip() or "Exit code was not 0"
         elif stderr_indicates_error:
-            reason = (stderr or "").strip() or "Error text found in standard error output"
+            reason = (
+                stderr or ""
+            ).strip() or "Error text found in standard error output"
         if fallback_error is not None and auth_used == "admin":
             raise RuntimeError(
                 f"Failed to run command as admin user (exit code {exit_code}, reason: {reason})"
             ) from fallback_error
-        raise RuntimeError(f"Failed to execute command (exit code {exit_code}, reason: {reason})")
+        raise RuntimeError(
+            f"Failed to execute command (exit code {exit_code}, reason: {reason})"
+        )
 
     def _can_use_admin(self) -> bool:
         return bool(self.admin_auth and self.admin_pwd)
@@ -171,8 +187,8 @@ class GuestCommandExecutor:
         return (
             "{ orig_lang=${LANG-}; orig_lc_all=${LC_ALL-}; "
             "restore_locale() { "
-            'if [ -n \"$orig_lc_all\" ]; then export LC_ALL=\"$orig_lc_all\"; else unset LC_ALL; fi; '
-            'if [ -n \"$orig_lang\" ]; then export LANG=\"$orig_lang\"; else unset LANG; fi; '
+            'if [ -n "$orig_lc_all" ]; then export LC_ALL="$orig_lc_all"; else unset LC_ALL; fi; '
+            'if [ -n "$orig_lang" ]; then export LANG="$orig_lang"; else unset LANG; fi; '
             "}; "
             "trap restore_locale EXIT; "
             "export LC_ALL=C; "
@@ -185,7 +201,9 @@ class GuestCommandExecutor:
     def _run_command(self, vm, auth, command: str) -> Tuple[int, str, str]:
         stdout_path = f"/tmp/stdout_{os.urandom(4).hex()}.log"
         stderr_path = f"/tmp/stderr_{os.urandom(4).hex()}.log"
-        redirected_cmd = f"{self._wrap_command(command)} > {stdout_path} 2> {stderr_path}"
+        redirected_cmd = (
+            f"{self._wrap_command(command)} > {stdout_path} 2> {stderr_path}"
+        )
         spec = vim.vm.guest.ProcessManager.ProgramSpec(
             programPath="/bin/bash",
             arguments=f"-lc {shlex.quote(redirected_cmd)}",
@@ -203,7 +221,9 @@ class GuestCommandExecutor:
         exit_code = -1
         start_time = time.time()
         while time.time() - start_time < timeout_seconds:
-            procs = self.process_manager.ListProcessesInGuest(vm=vm, auth=auth, pids=[pid])
+            procs = self.process_manager.ListProcessesInGuest(
+                vm=vm, auth=auth, pids=[pid]
+            )
             if procs and procs[0].exitCode is not None:
                 exit_code = procs[0].exitCode
                 break
@@ -247,7 +267,9 @@ class GuestCommandExecutor:
 
     def _run_as_admin(self, vm, command: str) -> Tuple[int, str, str]:
         if not self._can_use_admin():
-            raise RuntimeError("Admin credentials are not available for guest operations.")
+            raise RuntimeError(
+                "Admin credentials are not available for guest operations."
+            )
         temp_password = None
         try:
             temp_password = self._create_temp_password_file(vm)
@@ -257,7 +279,9 @@ class GuestCommandExecutor:
             retry_exit_code, _, retry_stderr = result
             if self._requires_tty_retry(retry_exit_code, retry_stderr):
                 print("[GUEST-CMD] sudo requires a TTY; retrying via script wrapper.")
-                admin_command = self._build_sudo_command(command, temp_password, use_script_wrapper=True)
+                admin_command = self._build_sudo_command(
+                    command, temp_password, use_script_wrapper=True
+                )
                 _emit_command_log(admin_command)
                 result = self._run_command(
                     vm,
@@ -313,7 +337,9 @@ class GuestCommandExecutor:
                 pass
 
     @staticmethod
-    def _build_sudo_command(command: str, temp_password: str, use_script_wrapper: bool = False) -> str:
+    def _build_sudo_command(
+        command: str, temp_password: str, use_script_wrapper: bool = False
+    ) -> str:
         quoted_command = shlex.quote(command)
         base_cmd = f"sudo -S -p '' /bin/bash -lc {quoted_command}"
         if use_script_wrapper:
@@ -323,7 +349,9 @@ class GuestCommandExecutor:
     @staticmethod
     def _requires_tty_retry(exit_code: int, stderr: str) -> bool:
         stderr_lower = (stderr or "").lower()
-        return exit_code != 0 and ("no tty present" in stderr_lower or "must have a tty" in stderr_lower)
+        return exit_code != 0 and (
+            "no tty present" in stderr_lower or "must have a tty" in stderr_lower
+        )
 
 
 def execute_command_in_guest(
