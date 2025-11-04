@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from utils.path_bootstrap import PROJECT_ROOT  # noqa: F401
+
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Set
 
