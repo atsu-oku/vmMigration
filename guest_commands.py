@@ -62,6 +62,7 @@ class GuestCommandExecutor:
         self.admin_pwd = admin_pwd
 
     def run(self, vm, command, check_exit_code: bool = True):
+        """Execute a shell command in the guest, falling back to admin when needed."""
         global ROOT_LOGIN_DISABLED
 
         print("[GUEST-CMD] Planned command:")

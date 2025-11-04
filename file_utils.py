@@ -8,7 +8,7 @@ import shutil
 import tempfile
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable
 
 
 def ensure_directory(path: Path) -> None:
@@ -19,7 +19,9 @@ def ensure_directory(path: Path) -> None:
 def create_temp_file(directory: Path, prefix: str = "tmp_", suffix: str = "") -> Path:
     """Create an empty temporary file in the specified directory."""
     ensure_directory(directory)
-    descriptor, filename = tempfile.mkstemp(prefix=prefix, suffix=suffix, dir=str(directory))
+    descriptor, filename = tempfile.mkstemp(
+        prefix=prefix, suffix=suffix, dir=str(directory)
+    )
     os.close(descriptor)
     return Path(filename)
 
@@ -65,5 +67,6 @@ def replace_text(
     if path.exists():
         original_text = path.read_text(encoding=encoding)
     updated_text = transform(original_text)
-    write_text_with_backup(path, updated_text, encoding=encoding, make_backup=make_backup)
-
+    write_text_with_backup(
+        path, updated_text, encoding=encoding, make_backup=make_backup
+    )
