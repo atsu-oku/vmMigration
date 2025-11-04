@@ -14,6 +14,8 @@ class CurlError(RuntimeError):
 
 @dataclass
 class CurlResult:
+    """Structured response returned after invoking curl."""
+
     command: List[str]
     exit_code: int
     stdout: str
@@ -21,6 +23,7 @@ class CurlResult:
 
     @property
     def succeeded(self) -> bool:
+        """Return True when curl exited successfully."""
         return self.exit_code == 0
 
 
@@ -53,4 +56,3 @@ def run_curl(args: List[str], *, timeout: Optional[int] = 30) -> CurlResult:
 def head(url: str, *, timeout: Optional[int] = 30) -> CurlResult:
     """Perform an HTTP HEAD request."""
     return run_curl(["--head", url], timeout=timeout)
-
