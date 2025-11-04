@@ -4,9 +4,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, Iterable, List, Set
+import sys
 
-from utils.path_bootstrap import ensure_project_root
+if __package__:
+    from utils.path_bootstrap import ensure_project_root  # type: ignore[import]
+else:
+    ensure_project_root = None
+
+if ensure_project_root is None:
+    PROJECT_ROOT = Path(__file__).resolve().parent
+    if str(PROJECT_ROOT) not in sys.path:
+        sys.path.insert(0, str(PROJECT_ROOT))
+    from utils.path_bootstrap import ensure_project_root
 
 ensure_project_root()
 
