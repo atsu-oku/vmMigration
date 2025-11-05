@@ -1412,6 +1412,8 @@ def _configure_nic_with_nmcli(
             dns_servers_result,
             dns_overall_result,
         ) = _run_nmcli_configuration()
+        expected_dns_servers_local = dns_servers_result
+        expected_dns_overall_local = dns_overall_result
         return NmcliConfigResult(
             route_indices=selected_route_indices,
             route_lines=selected_route_lines,
