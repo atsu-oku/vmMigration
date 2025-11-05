@@ -1173,6 +1173,7 @@ def _configure_nic_with_nmcli(
     legacy_verification_command: Optional[str] = None
 
     def _run_nmcli_configuration() -> Tuple[List[int], List[str], List[str], List[str]]:
+        nonlocal expected_dns_servers_local, expected_dns_overall_local
         selected_route_indices: List[int] = []
         selected_route_lines: List[str] = []
         device_name_normalized = device_name.lower()
