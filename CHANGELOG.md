@@ -1,76 +1,120 @@
 # Version History
 
+## 2025-11-05 (DNS state propagation)
+
+- `cloneAndVmotion.py` now captures the DNS lists returned by `_run_nmcli_configuration()` back into the enclosing scope, ensuring later verification uses the exact values written by nmcli or the legacy fallback.
+- Introduced explicit local DNS copies inside the helper so deduplication only touches the per-run state; this removed the need for the previous `nonlocal` mutation and silenced the F823/E0606 static-analysis warnings.
+- Confirmed both nmcli and legacy paths emit consistent `NmcliConfigResult` data, keeping downstream reporting unchanged while improving readability.
+
+## 2025-11-04 (Lint tooling & documentation pass)
+
+- Expanded lint bootstrap support by factoring shared helpers, tightening type hints, and simplifying module imports so `cloneAndVmotion.py`, `config_comparer.py`, and supporting utilities stay mypy/flake8 compliant.
+- Refreshed operational docs (`SETUP.md`, `TODO.md`) and added in-line documentation for guest command helpers, curl client usage, and schema validators; the iptables schema now reflects the latest firewall attributes.
+- Authored `docs/REST_SOAP_USAGE.md` to capture the current REST vs SOAP workflow, including authentication patterns and request samples for clone-and-vMotion orchestration.
+
+## 2025-10-31 (Firewall hardening & lint cleanup)
+
+- Restricted SSH firewalld rules to the trusted bastion host and expanded automated tests so both parser and network utility coverage reflect the tightened policy.
+- Improved resiliency to destination vCenter session drops during guest NIC reconfiguration, retrying with clear logging instead of aborting the workflow mid-run.
+- Ran a broad lint cleanup across `cloneAndVmotion.py`, `network_utils.py`, and supporting modules, trimming legacy helpers and aligning formatting with project standards.
+- Finalised the transition away from the legacy find-and-extract tooling by removing the standalone script/schema and pointing documentation to the maintained sibling project.
+
 ## 2025-10-27 (Command logging & firewalld schema)
 
 - Added a structured command execution log so every guest command and its description appear in the final summary.
-- Replaced guest file writes with an mktemp + bash heredoc flow, removing the need for Python payloads or base64 transfers.
-- Captured source firewalld zones via JSON-schema-validated plans and synchronised interfaces, sources, ports, and rich rules on the destination VM.
-- Authored English documentation (`docs/MIGRATION_FEATURES_EN.md`) describing the latest workflow enhancements.
 
+- Replaced guest file writes with an mktemp + bash heredoc flow, removing the need for Python payloads or base64 transfers.
+
+- Captured source firewalld zones via JSON-schema-validated plans and synchronised interfaces, sources, ports, and rich rules on the destination VM.
+
+- Authored English documentation (`docs/MIGRATION_FEATURES_EN.md`) describing the latest workflow enhancements.
 
 ## 2025-10-26 (Guest command resilience & reporting)
 
 - Hardened guest command file downloads to retry with urllib when `requests` fails or returns non-200 responses, ensuring stdout/stderr capture succeeds.
+
 - Added a `--source-vm` CLI option for `cloneAndVmotion.py` so scripted runs can skip the interactive VM prompt.
+
 - Collected `[OK]`/`[WARN]`/`[ERROR]` messages into an execution summary that prints once the migration workflow finishes.
+
 - Reconciled firewalld zone interfaces using source-derived mappings before reload, preventing orphaned assignments.
+
 - Updated documentation to cover the new summary, CLI flag, and guest command fallback.
 
 ## 2025-10-20 (Legacy guest tooling support)
 
 - Reworked the legacy guest network configurator to detect `ip`, `ifconfig`, and `route`, falling back to net-tools when NetworkManager is absent.
+
 - Added detailed verification/diagnostics so failed legacy commands surface explicit warnings and the caller can reuse the exact verification command.
+
 - Updated the migration workflow to honour the expanded return signature, abort on legacy failures, and reuse the helper-provided verification when checking configured IPs.
+
 - Marked static route and persistence write errors as non-fatal so legacy guests keep progressing while still logging warnings.
+
 - Captured source interface names via guest operations and renamed destination NICs to match (including udev/ifcfg updates) before applying network settings.
 
 ## 2025-10-19 (Gateway fallback & auth hardening)
 
 - Tightened default-route inference to consider only explicit 0.0.0.0/0 entries from vSphere REST responses, preventing duplicate PRD defaults.
+
 - Added PRD segment fallback (third octet 160/162) with clear logging when the source VM has no default gateway.
+
 - Ensured root guest authentication is attempted once per run; subsequent commands use the sudo-capable user automatically.
+
 - Simplified SDK verification output by removing redundant route listings and documented the behaviour (README.md).
+
 - Validated end-to-end flow on RHEL 7.9 (NetworkManager + `nmcli`); recorded the platform in documentation.
 
 ## 2025-10-19 (Refactor)
 
 - Introduced `GuestCommandExecutor` to encapsulate guest command execution and simplify debugging.
+
 - Added `CloneAndVmotionWorkflow` / `WorkflowState` scaffolding so early migration phases observe SRP.
+
 - Centralised vCenter authentication via `authenticate_vcenter` helper to remove duplicated SmartConnect calls.
 
 ## 2025-10-18
 
 - Improved default-gateway inference to prefer vSphere route metadata and NIC subnet checks.
+
 - Normalised DNS verification output to remove false "missing DNS" warnings and clearly display actual/expected sets.
+
 - Filtered SDK route snapshots so only non-default discrepancies are reported.
+
 - Ensured `nmcli` connections remain in autoconnect mode and prevented duplicate static-route application.
+
 - Updated documentation (README/SETUP) to reflect the new verification behaviour and configuration options.
+
 - Switched `InsecureRequestWarning` imports to `urllib3` to avoid deprecation warnings when using `requests`.
 
 ## 2025-10-17
 
 - Hardened guest command error handling with clearer exit-code reasons and CLI output capture.
+
 - Fixed newline injection when staging admin passwords and ensured nmcli fallback logic short-circuits correctly.
+
 - Added vCenter keep-alive threading to prevent session expiry during long storage vMotion sequences.
 
 ## 2025-10-16
 
 - Added PRD static-route ownership tracking so each route is bound to the correct NIC during migration.
+
 - Added nmcli post-configuration validation to confirm IP/gateway/routes/DNS after vMotion.
 
 ## 2025-10-12
 
 - Fixed locale handling and output formatting so nmcli/ping behave consistently.
+
 - Hardened sudo fallback logic to improve resilience when rerunning key commands.
+
 - Restructured README.md / SETUP.md to clarify setup steps and usage.
 
 ## 2025-10-11
 
 - Organised the flow from clone -> IP configuration -> Storage vMotion.
+
 - Added connectivity verification and rollback steps using nmcli / ping inside the guest OS.
 
 ## 2025-10-10
 
 - Initial project setup, establishing the migration script foundation spanning source and destination vCenters.
-
-
