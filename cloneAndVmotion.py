@@ -1173,9 +1173,10 @@ def _configure_nic_with_nmcli(
     legacy_verification_command: Optional[str] = None
 
     def _run_nmcli_configuration() -> Tuple[List[int], List[str], List[str], List[str]]:
-        nonlocal expected_dns_servers_local, expected_dns_overall_local
         selected_route_indices: List[int] = []
         selected_route_lines: List[str] = []
+        local_expected_dns_servers = list(expected_dns_servers_local)
+        local_expected_dns_overall = list(expected_dns_overall_local)
         device_name_normalized = device_name.lower()
         mac_normalized = new_mac_lower.replace("-", ":") if new_mac_lower else ""
         old_mac_normalized = original_mac_lower.replace("-", ":")
@@ -1341,9 +1342,9 @@ def _configure_nic_with_nmcli(
             guest_command_executor(
                 f"nmcli connection modify '{con_name}' ipv4.dns '{dns_str}'"
             )
-            expected_dns_servers_local = deduped_dns[:]
-            if not expected_dns_overall_local:
-                expected_dns_overall_local = dedupe_preserving_order(deduped_dns)
+            local_expected_dns_servers = deduped_dns[:]
+            if not local_expected_dns_overall:
+                local_expected_dns_overall = dedupe_preserving_order(deduped_dns)
         else:
             guest_command_executor(
                 f"nmcli connection modify '{con_name}' ipv4.dns ''",
@@ -1374,8 +1375,8 @@ def _configure_nic_with_nmcli(
         return (
             selected_route_indices,
             selected_route_lines,
-            expected_dns_servers_local,
-            expected_dns_overall_local,
+            local_expected_dns_servers,
+            local_expected_dns_overall,
         )
 
     if not nmcli_supported:
@@ -1408,14 +1409,14 @@ def _configure_nic_with_nmcli(
         (
             selected_route_indices,
             selected_route_lines,
-            expected_dns_servers_local,
-            expected_dns_overall_local,
+            dns_servers_result,
+            dns_overall_result,
         ) = _run_nmcli_configuration()
         return NmcliConfigResult(
             route_indices=selected_route_indices,
             route_lines=selected_route_lines,
-            expected_dns_servers=expected_dns_servers_local,
-            expected_dns_overall=expected_dns_overall_local,
+            expected_dns_servers=dns_servers_result,
+            expected_dns_overall=dns_overall_result,
             legacy_success=True,
             legacy_verification_command=None,
             use_nmcli_connection=True,
