@@ -1,145 +1,123 @@
-# vSphere Migration Automation - Functional Specification
+# vSphere 移行自動化 ― Python 実装仕様
 
-## Overview
-
-- **Objective**: Seamlessly migrate a staging (STG) VM to production (PRD) by automating clone, registration, guest configuration, and validation steps while enforcing PRD configuration standards.
-
-- **Primary entry point**: `cloneAndVmotion.py`
-
-- **Key supporting modules**: `network_utils.py`, `guest_commands.py`, `firewalld_schema.py`, schema definitions under `schemas/`.
-
-- **Supported guests**: RHEL/CentOS family with firewalld, chrony/ntpd, yum, and td-agent tooling available. Hosts must run VMware Tools with Guest Operations enabled.
+Python 実装の観点から、主要コンポーネント、データフロー、エラーハンドリング、ログ出力、今後の拡張を整理します。コードベースの挙動に合わせ、`/etc` 配下の扱いなど最新の設計方針を反映しています。
 
 ---
 
-## End-to-End Workflow
+## 1. 目的と範囲
 
-1. **Phase 0 - Pre-flight**
-
-   - Authenticate against source and destination vCenter instances.
-
-   - Confirm the target VM exists and verify VMware Tools status.
-
-2. **Phase 1 - Data Collection**
-
-   - Gather NIC/IP/DNS/route data through VMware Tools and the vSphere REST SDK.
-
-   - Capture firewalld zone definitions, NTP configs, yum repositories, and proxy settings.
-
-   - Validate that STG->PRD transformation rules apply cleanly; log anomalies for follow-up.
-
-3. **Phase 2 - User Confirmation**
-
-   - Present collected metadata and planned changes.
-
-   - Await operator approval before mutating objects or guest configuration.
-
-4. **Phase 3 - Clone and Register**
-
-   - Clone the source VM to the staging datastore, strip NICs, and unregister.
-
-   - Register the clone on the destination vCenter and rebuild NICs against PRD networks.
-
-5. **Phase 4 - Guest Configuration**
-
-   - Reconfigure the guest OS (hosts file, firewalld, NTP, yum repos, proxies, td-agent repo, iptables) using the shell-based writer described below.
-
-6. **Phase 5 - Verification and Wrap-up**
-
-   - Validate configuration via SDK queries or `nmcli`, depending on availability.
-
-   - Run connectivity checks, ensure firewalld allows SSH from the operator subnet.
-
-   - Summarise results with backups and warnings to guide any manual clean-up.
+- **目的**: `cloneAndVmotion.py` がどのように STG→PRD 移行を実現するかを記述する。
+- **エントリーポイント**: `cloneAndVmotion.py`
+- **主要モジュール**: `guest_commands.py`, `network_utils.py`, `firewalld_manager.py`, `firewalld_schema.py`, `config_comparer.py`, `file_utils.py`
+- **対象ゲスト**: RHEL / CentOS 系で firewalld・chrony/ntpd・yum・td-agent を想定し、VMware Tools の Guest Operations が有効な環境。
 
 ---
 
-## Guest Configuration Tasks
+## 2. コードフロー
 
-| Component | Action | Notes |
+1. **Pre-flight (`_preflight_checks`)**  
+   - `authenticate_vcenter` でソース/宛先 vCenter に接続。  
+   - VMware Tools 状態を確認し `guestToolsRunning` でなければ中断。
 
-| --- | --- | --- |
+2. **データ収集 (`_collect_source_state`)**  
+   - REST SDK (requests) で NIC / DNS / ルート情報を取得し、利用不可の場合は SOAP Guest Operations へフォールバック。  
+   - firewalld ゾーンは `firewalld_manager.collect_zone_plans` で収集し `FirewalldZoneSchemaValidator` で検証。  
+   - NTP、yum、プロキシ設定を `guest_commands` 経由で取得。
 
-| `/etc/hosts` | Transform STG hostnames/IPs to PRD equivalents; warn if staging entries remain. | Uses iterative `transform_text_to_prd`. |
+3. **確認フェーズ (`_confirm_plan`)**  
+   - 収集結果と計画差分を整形して表示し、`input("Proceed? [y/N]")` で承認を取得。
 
-| `firewalld` | Enforce zone plans (interfaces, sources, ports, rich rules) sourced from STG. | Backed by JSON schema validation; creates timestamped backups before changes. |
+4. **クローン & 再登録 (`_clone_and_register`)**  
+   - `CloneSpecBuilder` でクローン仕様を構築し、NIC 削除 → PRD vCenter 登録 → NIC 再作成 → Storage vMotion を実行。
 
-| `chrony`/`ntpd` | Convert NTP servers to PRD addresses; verify staging IPs are removed. | Applies text transformations and targeted regex replacements. |
+5. **ゲスト設定 (`_configure_guest`)**  
+   - `GuestCommandExecutor` でゲストコマンドを実行。root 認証が失敗すると自動で sudo ユーザーへ切り替え。  
+   - 既定では firewalld rich-rule と iptables の SSH 制御のみ変更。  
+   - `--enable-standard-config-edits` 指定時に限り `_write_guest_file` を用いて `/etc/hosts`・NTP・yum/td-agent レポジトリ・`/etc/profile` を更新。
 
-| `yum` repos | Disable `mirrorlist`, point `baseurl` to `https://vault.centos.org`, enforce HTTPS. | Retains per-file backups and retries TLS repairs before warning. |
-
-| `td-agent` repo | Ensure `/etc/yum.repos.d/td.repo` exists, probing v4 then v3 endpoints. | Auto-detects release/arch via `rpm -E`. |
-
-| `/etc/profile` | Append PRD proxy exports when absent; verify via environment snapshot. | Keeps `-YYYYMMDD.bak` backup. |
-
-| `iptables` | Apply PRD rule set and reload service (systemd or legacy service command). | Warns if reload fails. |
-
-> **Protected paths:** The workflow keeps `/etc/profile`, `/etc/hosts`, and standard chrony/ntp configuration files read-only by default. Pass `--enable-standard-config-edits` when those files must be updated, and use `--protect-guest-file /path` to extend the protected set.
-
-All file modifications are performed via the `_write_guest_file` helper, which:
-
-1. Verifies the target directory exists.
-
-2. Creates a temporary file with `mktemp` (preferring the target directory).
-
-3. Uses `bash -lc` with a heredoc to write the content (no Python payloads, no base64).
-
-4. Preserves ownership and permissions based on `stat -c '%a %u %g'` for existing files.
-
-5. Atomically replaces the original file via `mv` and cleans up temp files on failure.
+6. **検証 (`_verify_and_summarise`)**  
+   - REST SDK または `nmcli` による検証、`ensure_firewall_allows_ssh` による最終チェックを実施。  
+   - `COMMAND_EXECUTION_LOG` と `[OK]/[WARN]/[ERROR]` を `_print_execution_summary` で整形。
 
 ---
 
-## Firewalld Zone Schema Handling
+## 3. ゲストコマンド実行 (`guest_commands.py`)
 
-- `firewalld_schema.py` defines `FirewalldZonePlan` and `FirewalldZoneSchemaValidator`. The validator consumes `schemas/firewalld_zone_schema.json` to ensure collected data only contains supported keys.
-
-- During data collection, each zone is read using `firewall-cmd --permanent --list-*` commands. Zones that fail validation are skipped with a debug log.
-
-- `_sync_firewalld_configuration_to_prd` receives the list of validated plans and enforces them on the destination VM:
-
-  - Interfaces: Treats the plan as authoritative (empty list removes all interfaces).
-
-  - Sources, ports, rich rules: Applies `transform_text_to_prd` to convert STG IPs/domains, removes unexpected entries, and adds missing ones.
-
-  - Zone XML backups are written once per zone before any modification (`/etc/firewalld/zones/<zone>.xml-YYYYMMDD.bak`).
-
-  - A single `firewall-cmd --reload` is issued when changes occur; failures downgrade the overall success flag.
-
-- The legacy transformation-only branch remains for environments where no source plan is available.
+- `GuestCommandExecutor.run(vm, command, ..., check_exit_code)` が SOAP Guest Operations を利用してコマンド実行。  
+- 実行前に `register_command_execution` でログに登録し、日本語説明 (`remember_command_description`) を紐付け。  
+- `vim.fault.InvalidGuestLogin` など root 認証エラーを検知すると `ROOT_LOGIN_DISABLED` をセットし sudo ユーザーへフェイルオーバー。  
+- 標準出力/標準エラーは `[GUEST-CMD]` 前置でロガーへ送信し、致命的なキーワードを検知したら `RuntimeError` を送出。
 
 ---
 
-## Command Logging and Reporting
+## 4. firewalld 同期 (`firewalld_schema.py` / `firewalld_manager.py`)
 
-- `guest_commands.py` emits every planned command through the registered logger (`register_command_execution`). Each entry is stored with a friendly description generated by `_describe_command` or provided explicitly via `remember_command_description`.
-
-- The execution summary printed by `_print_execution_summary()` now lists commands in chronological order, pairing raw shell invocations with short Japanese descriptions for operators.
-
-- `[OK]`, `[WARN]`, and `[ERROR]` log lines are also collected throughout execution, giving operators a concise success/failure view to share after the run.
-
----
-
-## Backup Strategy and Rollback Aids
-
-- Every file mutation creates a timestamped `-YYYYMMDD.bak` copy in place (hosts, profile, firewalld zone XMLs, NTP configs, yum repos, td-agent repo, iptables).
-
-- Firewalld rewrites ensure only a single backup per zone per run to avoid clutter.
-
-- TLS repair attempts are logged step-by-step; unresolved issues downgrade to `[WARN]` while leaving the original files untouched.
-
-- Execution summary highlights backup paths so operators can roll back manually if required. For the shell-side helper (`find_and_extract.sh`), see `../find_and_extract_tool/docs/FIND_AND_EXTRACT_TOOL.md` for automated transform/rollback guidance.
+- `FirewalldZonePlan`: ゾーン名、インターフェース、ソース、ポート、リッチルールを保持するデータクラス。  
+- `FirewalldZoneSchemaValidator`: `schemas/firewalld_zone_schema.json` を読み込み、収集したゾーンが想定スキーマに適合するか検証。  
+- `_sync_firewalld_configuration_to_prd`:
+  - ソース計画がある場合はリッチルール追加前にバックアップを取得し、`firewall-cmd --permanent` 経由で SSH rich-rule を追加。  
+  - `firewall-cmd --reload` は変更が発生したゾーンに限り実行。  
+  - ファイルを直接書き換えず、コマンド経由で反映。
 
 ---
 
-## Future Enhancements
+## 5. ネットワークユーティリティ (`network_utils.py`)
 
-1. **Diff preview tooling** - Integrate `find_and_extract` logic to show diffs before applying guest changes.
+- `calculate_ip_stg_to_prd` / `transform_text_to_prd`: STG IP・ドメインを PRD 形式へ変換。  
+- `determine_prd_static_routes`: STG 状態とルート情報から PRD の静的ルートを推定。  
+- `ensure_firewall_allows_ssh`: firewalld と iptables の組み合わせで SSH 例外を確認・追加。  
+- `ensure_connection_activation`: `nmcli` 実行後の疎通検証を自動化。  
+- その他、REST SDK 検証や DNS 抽出、ルート比較などのヘルパーを提供。
 
-2. **Automated report** - Generate HTML/Markdown run reports summarising commands, backups, and warnings.
+---
 
-3. **Extended OS coverage** - Run full validation on RHEL 8/9 and Ubuntu LTS releases, adjusting scripts where necessary.
+## 6. ファイル更新 (`file_utils.py`)
 
-4. **Test automation** - Add integration tests for the bash-based writer and firewalld zone reconciliation logic.
+- `write_text_with_backup(path, content)` が `_write_guest_file` を呼び出し、以下の順序で実行:  
+  1. `mktemp` で一時ファイル作成 (ターゲットディレクトリ優先)。  
+  2. `bash -lc` + heredoc で内容を書き込み。  
+  3. 既存ファイルがあれば `stat -c '%a %u %g'` でパーミッション/所有者を継承。  
+  4. `mv` で原子的に置換し、失敗時は一時ファイルを削除。  
+- `DEFAULT_PROTECTED_GUEST_PATHS` に含まれる `/etc` パスは既定で書き換え対象外。`--enable-standard-config-edits` で解除可能。追加保護は `--protect-guest-file`。
 
-5. **Rollback automation** - Provide helper scripts to restore from the generated backups on demand.
+---
+
+## 7. コマンドログとサマリー
+
+- `COMMAND_EXECUTION_LOG`: `(command, description)` の順で記録。  
+- `_describe_command` が代表的なコマンドの日本語説明を自動生成し、未知コマンドはそのまま記録。  
+- `_print_execution_summary` が `[OK]/[WARN]/[ERROR]` とコマンド一覧、バックアップパスをまとめて出力。
+
+---
+
+## 8. エラーハンドリング方針
+
+- vCenter 操作の失敗 (クローン、登録、Storage vMotion) は即時中断し、必要なロールバック手順を提示。  
+- firewalld/iptables 以外の `/etc` 操作は保護が有効な限り読み取りのみ。保護解除後に書き換えに失敗した場合は `[WARN]` を記録し、次工程へ進む。  
+- TLS 修復がすべて失敗した場合も `[WARN]` として処理を継続し、元ファイルは触れない。  
+- REST API が利用できない場合は SOAP Guest Operations へフォールバックするが、証明書やプロキシ設定の整備は範囲外。
+
+---
+
+## 9. テスト方針
+
+- **単体テスト**: `GuestCommandExecutor`, `transform_text_to_prd`, `determine_prd_static_routes` などをモック化して検証。  
+- **統合テスト**: 疎通確認フロー、firewalld rich-rule 追加、シェルフォールバックを仮想ゲストで実行。  
+- **回帰テスト**: デフォルトゲートウェイ欠落ケース、firewalld ゾーン無しケース、TLS エラー再現を含む。  
+- **機能ガード**: `--enable-standard-config-edits` の有無で `/etc` 書き換えの有無が変わることをテストで確認。
+
+---
+
+## 10. 将来拡張
+
+1. 差分プレビューの組み込み (`find_and_extract` 連携)。  
+2. HTML / JSON 形式のサマリーレポート出力。  
+3. RHEL 8/9, Ubuntu LTS など追加ディストリビューションでの E2E 検証。  
+4. `_write_guest_file` や firewalld 同期の自動テスト整備。  
+5. REST / SOAP SDK ラッパー整備によるテスト容易性向上。
+
+---
+
+## 11. まとめ
+
+`cloneAndVmotion.py` は vCenter API と Guest Operations を組み合わせ、STG→PRD 移行を高い追跡性で実現します。既定では firewalld と iptables の調整に留め、`--enable-standard-config-edits` を指定した場合のみ `/etc` の主要設定を安全に書き換えます。バックアップ生成と詳細ログにより監査性とロールバック容易性を確保しつつ、将来的な自動化拡張に備えています。
