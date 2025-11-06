@@ -1,24 +1,30 @@
-# Operational TODO
+# 運用 TODO リスト
 
-## Near Term
+近々対応したい項目とバックログを日本語で整理しています。状況に応じて優先度を見直してください。
 
-- [ ] Add automated smoke tests that exercise the connectivity checks with mocked SDK responses.
-- [ ] Expose the list of verification ping targets in a configuration file to simplify environment-specific tuning.
-- [ ] Document rollback procedures (VM deletion / datastore clean-up) with screenshots for the operations team.
-- [ ] Add regression coverage for the "no default gateway on STG" scenario to ensure the PRD fallback rule stays intact.
-- [ ] Complete workflow refactor by extracting the remaining migration phases into `CloneAndVmotionWorkflow`.
-- [ ] Split refactored logic into dedicated modules (e.g., guest commands, auth/helpers, workflow entry point).
-- [ ] Add unit-level coverage around `GuestCommandExecutor` and new workflow orchestrator.
-- [ ] Add regression coverage for firewalld zone plan reconciliation (interfaces/sources/ports/rich rules).
-- [ ] Exercise the bash-based `_write_guest_file` flow in a guest integration test to catch shell compatibility issues.
-- [ ] Update developer docs to describe the new module boundaries and workflow sequence.
-- [x] Refresh README/CHANGELOG (EN/JA) to document gateway fallback behaviour, root-auth suppression, and RHEL 7.9 validation notes.
-- [x] Publish English migration enhancement notes (`docs/MIGRATION_FEATURES_EN.md`).
+---
 
-## Backlog
+## 直近の優先事項
 
-- [ ] Evaluate supporting IPv6 configuration once PRD networks begin adopting dual-stack.
-- [ ] Investigate packaging an optional HTML report summarising migration results.
-- [ ] Consider building a small CLI wrapper that pre-validates credentials and network reachability before running the full script.
-- [ ] Explore generating typed SDK stubs or adapters to simplify future testing.
-- [ ] Run end-to-end validation on additional guest OS targets (RHEL 8.x, RHEL 9.x, modern Ubuntu releases).
+- [ ] 疎通確認フェーズを自動テスト化し、REST SDK 応答をモックしたスモークテストを整備する。
+- [ ] 疎通確認で利用する `ping` 先リストを外部設定ファイル化し、環境ごとの差し替えを容易にする。
+- [ ] 途中失敗時のロールバック手順 (VM 削除 / データストアの不要ファイル削除) をスクリーンショット付きで文書化する。
+- [ ] 「STG にデフォルトゲートウェイが存在しない」ケースを再現する回帰テストを追加し、PRD フォールバック判定が崩れないことを検証する。
+- [ ] `CloneAndVmotionWorkflow` へのロジック分離を完了させ、残存する移行フェーズコードをクラス構造へ収容する。
+- [ ] ゲストコマンド / 認証 / ワークフロー導線をモジュール単位に分割し、責務を明確化する。
+- [ ] `GuestCommandExecutor` と新ワークフローオーケストレータのユニットテストを追加する。
+- [ ] firewalld ゾーン計画の同期 (`interfaces` / `sources` / `ports` / `rich rules`) を網羅する回帰テストを整備する。
+- [ ] シェルベースの `_write_guest_file` ルートを実機ゲストでテストし、互換性問題を早期検知する。
+- [ ] モジュール分割後の開発者向けドキュメントを更新し、新しい境界と処理シーケンスを図示する。
+- [x] README / CHANGELOG (日本語・英語双方) を更新し、ゲートウェイ推定・root 認証制御・RHEL 7.9 検証結果を反映した。
+- [x] 英語版の移行機能サマリー (`docs/MIGRATION_FEATURES_EN.md`) を公開した。
+
+---
+
+## バックログ
+
+- [ ] PRD ネットワークがデュアルスタック化した際の IPv6 対応 (アドレス適用と検証) を検討する。
+- [ ] 移行結果を要約した HTML レポート生成オプションを評価する。
+- [ ] 実行前に資格情報や疎通性をチェックする CLI ラッパーを試作する。
+- [ ] REST / SOAP SDK の型付けスタブやアダプター生成を検討し、テスト容易性を高める。
+- [ ] RHEL 8.x / 9.x / Ubuntu LTS など追加ゲスト OS でのエンドツーエンド検証を実施する。

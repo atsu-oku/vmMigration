@@ -1,211 +1,126 @@
-# vSphere Migration Automation - Functional Specification
+# vSphere 移行自動化 ― 機能仕様書
 
-## Overview
-
-- **Objective**: Move a staging VM running on vSphere into the production environment and align the in-guest configuration with PRD standards.
-
-- **Key files**: `cloneAndVmotion.py`, `network_utils.py`. The STG diff helper now lives in the sibling project `../find_and_extract_tool/find_and_extract.sh` (documented in `../find_and_extract_tool/docs/PROJECT_SPEC_SH.md`).
-
-- **Target guest OS**: RHEL / CentOS family with firewalld, chrony/ntpd, yum repos, td-agent and related tooling available.
+本書は STG→PRD 移行ツール群の全体像を説明します。目的、前提条件、処理フェーズ、ゲスト設定、関連モジュール、今後の拡張案を整理し、日本語で最新の実装に合わせています。
 
 ---
 
-## End-to-End Flow
+## 1. 概要
 
-1. **Phase 0 - Pre-flight**
-
-   - Exercise vCenter authentication against source and destination endpoints.
-
-   - Verify the target VM exists and confirm VMware Tools status.
-
-2. **Phase 1 - Data collection**
-
-   - Gather NIC, IP, DNS, route, firewall, NTP, and repository information.
-
-   - Validate that STG->PRD transformation rules apply cleanly.
-
-3. **Phase 2 - User confirmation**
-
-   - Present detected diffs and obtain approval to proceed.
-
-   - (Planned) Generate an automatic diff report via find_and_extract.
-
-4. **Phase 3 - Clone and register**
-
-   - Create the clone, register it, rebuild NICs, and execute Storage vMotion.
-
-5. **Phase 4 - Guest configuration**
-
-   - Update /etc/hosts, firewalld, NTP, repositories, proxy exports, and iptables.
-
-6. **Phase 5 - Verification and wrap-up**
-
-   - Run SDK-based validation and collect warnings.
-
-   - Provide backup locations and rollback guidance.
+- **目的**: STG 側で稼働中の VM を PRD 環境へ移行し、必要なゲスト設定を PRD 規約に合わせる。
+- **主要スクリプト**: `cloneAndVmotion.py` (エントリーポイント)、`network_utils.py`、`guest_commands.py`、`firewalld_manager.py`。
+- **関連プロジェクト**: STG 差分抽出ツール `find_and_extract.sh` は姉妹リポジトリ `../find_and_extract_tool/` でメンテナンス。
+- **対象ゲスト OS**: RHEL / CentOS 系 (firewalld, chrony/ntpd, yum, td-agent を想定)。
 
 ---
 
-## Guest Configuration Flow (_sync_prd_system_configuration)
+## 2. エンドツーエンドの流れ
 
-1. **/etc/hosts**
+### Phase 0 - 事前確認
+- ソース / 宛先 vCenter へ認証し、対象 VM の存在と VMware Tools 状態 (`guestToolsRunning`) を確認。
 
-   - Repeatedly apply  ransform_text_to_prd until staging patterns disappear.
+### Phase 1 - データ収集
+- NIC, IP, DNS, ルート、firewalld、NTP、yum レポジトリ、プロキシ設定を取得。
+- JSON Schema (firewalld など) で構造検証し、不整合は警告として記録。
 
-   - Raise a warning if STG entries remain.
+### Phase 2 - オペレーター確認
+- 収集結果と差分プランを提示し、承認 (`y`) を取得してから変更フェーズへ進む。
 
-   - Use the safe mktemp -> mv replacement flow and keep /etc/hosts-YYYYMMDD.bak.
+### Phase 3 - クローン & 再登録
+- ソース vCenter 上で VM をクローンし NIC を除去。
+- クローンを宛先 vCenter へ登録し、PRD ネットワーク向けに NIC を再作成。
+- Storage vMotion で最終データストアへ移動。
 
-2. **firewalld**
+### Phase 4 - ゲスト構成
+- 既定設定: firewalld rich-rule 追加と iptables の SSH 制御のみを変更。
+- オプション: `--enable-standard-config-edits` を指定すると `/etc/hosts`、NTP、yum/td-agent レポジトリ、`/etc/profile` も PRD 化 (バックアップ付き)。
+- NetworkManager が無い場合はシェルベースのレガシー手順へ自動切り替え。
 
-   - Pull zone XML, convert sources and rich rules to PRD ranges.
-
-   - Remove the SSH rule from the heartbeat zone.
-
-   - Preserve interface assignments and reattach them after conversion (pending work).
-
-   - Apply the changes with firewall-cmd --reload.
-
-3. **chrony / ntpd**
-
-   - Scan files such as /etc/chrony.conf and /etc/ntp.conf.
-
-   - Run  ransform_text_to_prd plus regex replacements to flip 172.16.17x.*to 172.16.16x.* (pending implementation).
-
-   - Write back after generating a backup.
-
-4. **CentOS repositories**
-
-   - Inspect every /etc/yum.repos.d/*.repo, comment out mirrorlist entries.
-
-   - Force gaseurl to <https://vault.centos.org/centos/>.
-
-   - On TLS errors attempt CA refresh -> curl-openssl install; fall back to warning-only if repairs fail.
-
-5. **td-agent repository (/etc/yum.repos.d/td.repo)**
-
-   - Resolve releasever and search dynamically via rpm macros.
-
-   - Probe the v4 repository with curl; downgrade to v3 when unreachable.
-
-   - Create a backup before writing the new file.
-
-6. **iptables**
-
-   - Rewrite /etc/sysconfig/iptables to PRD rules.
-
-   - Retry systemctl reload iptables (or service iptables reload) until it succeeds or exhausts attempts.
-
-7. **Proxy settings (/etc/profile)**
-
-   - Append PRD proxy exports (still to be implemented).
-
-   - Source the profile and verify with env | grep -i http.
-
-   - Emit warnings when the environment update fails.
-
-> All writes rely on the mktemp -> mv pattern to preserve ownership and permissions. Backups live beside the source file with a -YYYYMMDD.bak suffix.
+### Phase 5 - 検証と完了
+- REST SDK または `nmcli` で検証、`ping` による疎通確認、firewalld SSH 設定の再確認を実施。
+- バックアップパスと `[OK]` / `[WARN]` / `[ERROR]` を含むサマリーを出力。
 
 ---
 
-## Key Helpers in
+## 3. ゲスト構成タスク (_sync_prd_system_configuration)
 
-etwork_utils.py
+| コンポーネント | 既定動作 | `--enable-standard-config-edits` 指定時 |
+| --- | --- | --- |
+| firewalld | `firewall-cmd --permanent` で Bastion 向け SSH rich-rule を追加し、必要時にリロード。`/etc/firewalld/zones/*.bak` を生成。 | 同左 |
+| iptables | 既存 SSH 設定を確認し、必要なら `iptables -I` + `iptables-save > /etc/sysconfig/iptables` で反映。 | 同左 |
+| `/etc/hosts` | 読み取りのみ。 | `transform_text_to_prd` / 差分確認後にバックアップ (`/etc/hosts-YYYYMMDD.bak`) を作成して書き換え。 |
+| `/etc/profile` | 読み取りのみ。 | PRD プロキシを追加しバックアップ取得。 |
+| NTP (`/etc/chrony.conf` 等) | 読み取りのみ。 | STG IP を PRD IP に変換し、バックアップを作成した上で更新。 |
+| yum レポジトリ | 読み取りのみ。 | `vault.centos.org` へ書き換え、`*.repo-YYYYMMDD.bak` を保存。 |
+| td-agent レポジトリ | 存在確認。 | v4 リポジトリを優先し、到達不可時は v3 へフォールバック。 |
 
-- calculate_ip_stg_to_prd(ip): Translate staging addresses (third octet 170-179) to PRD equivalents.
-
-- ransform_text_to_prd(text): Replace staging IPs, trailing host suffix s, and ipet-ins domains with PRD forms.
-
-- determine_prd_static_routes(...): Choose PRD static routes by prioritising MNG segment NICs (third octet 161/163).
-
-- ensure_firewall_allows_ssh(exec, source_ip): Add SSH allowance and remove it from the heartbeat zone as required.
-
-- ensure_connection_activation(...): Make sure the nmcli connection is up, validating connectivity with ping.
-
-- Additional helpers cover DNS extraction, SDK verification, and post-migration consistency checks.
+> ファイルを書き換える際は `_write_guest_file` (mktemp + heredoc + mv) を使用し、既存パーミッションを維持。
 
 ---
 
-## TLS Error Mitigation (_run_curl_with_tls_repairs)
+## 4. 主なヘルパー (`network_utils.py`)
 
-1. Execute curl and classify TLS-related failures.
-
-2. Refresh CA bundles via update-ca-trust or yum reinstall ca-certificates nss curl.
-
-3. If problems persist, install curl-openssl or reinstall curl.
-
-4. When all recovery steps fail, log a warning and continue the workflow.
-
----
-
-## Shell Tool find_and_extract.sh
-
-- Provides `scan`, `transform`, and `rollback` subcommands to locate staging artefacts and convert them into PRD-compliant values.
-
-- Runs `transform` in dry-run mode by default, producing contextual diffs and prompting before applying changes.
-
-- Creates per-file backups plus a tab-separated rollback log, allowing targeted restores via `rollback --file`.
-
-- Skips binary files, files larger than 1 MiB, and protected configs such as `/etc/nginx/nginx.conf` and `/etc/httpd/httpd.conf`.
-
-- Normalises `/etc/yum.repos.d/td.repo` to the v4 Treasure Data endpoint, automatically falling back to v3 when connectivity checks (performed via the configured proxy) fail, and raises an alert if both endpoints are unreachable.
-
-- Validates `/var/www/com/ipet-ins/<system>/fuel/app/config/newproduction` structures when `/var` is targeted and records missing assets.
-
-- Writes hit/preview logs beneath `/tmp/<user>/find_and_extract/`; see `../find_and_extract_tool/docs/PROJECT_SPEC_SH.md` for operational details.
+- `calculate_ip_stg_to_prd`: 第 3 オクテット 170-179 → 160-169 へ変換。
+- `transform_text_to_prd`: STG の IP/ホスト名/ドメインを PRD 形式へ置換。
+- `determine_prd_static_routes`: STG 情報から PRD 向け静的ルートを推定 (MNG セグメント優先)。
+- `ensure_firewall_allows_ssh`: firewalld/iptables の SSH 例外を確認し、必要なら追加。
+- `ensure_connection_activation`: `nmcli` 実行後の疎通確認を自動化。
+- その他: DNS 抽出・REST SDK 検証・ルート比較などを提供。
 
 ---
 
-## Handling Success vs Warning States
+## 5. TLS エラー対処 (_run_curl_with_tls_repairs)
 
-- Missing target file -> skip without failing the overall run.
-
-- Unable to back up or write -> flag [WARN], mark the specific task failed, and lower the overall success flag.
-
-- STG artefacts remain after conversion -> raise [WARN] and request operator review.
-
-- TLS still unreachable after repair attempts -> log [WARN] while continuing execution.
-
-- Environment variables not applied -> [WARN] Proxy environment variables may not be active....
+1. curl 実行結果から TLS 由来の失敗か判定。
+2. `update-ca-trust` / `yum reinstall ca-certificates nss curl` による CA 更新を試行。
+3. 必要に応じて `curl-openssl` の導入や curl 再インストールを実行。
+4. すべて失敗した場合は `[WARN]` を記録し、既存ファイルは変更せず次工程へ進む。
 
 ---
 
-## Future Enhancements
+## 6. シェルツール `find_and_extract.sh`
 
-1. **Diff report before editing** - display find_and_extract results via Python to narrow the scope.
-
-2. **Preview mode for automated fixes** - show the proposed diff and apply only after approval.
-
-3. **Rollback assistance** - list available backups with ready-to-run restore commands.
-
-4. **Port the logic to Python** - migrate the bash matching logic into a Python module and expose a unified CLI.
-
-5. **CI/CD integration** - provide dry-runs, unit tests, and SDK-level verification in automation.
+- `scan` / `transform` / `rollback` サブコマンドで STG アーティファクトを検出・変換・復旧。
+- 既定はドライランで差分プレビューを提示し、承認後に適用。
+- 1 ファイルごとにバックアップとロールバックログ (TSV) を生成。
+- Treasure Data (td-agent) リポジトリは v4 を優先し、到達不可時に v3 へ切り替え。
+- `/tmp/<user>/find_and_extract/` に結果を保存。詳細は姉妹リポジトリのドキュメントを参照。
 
 ---
 
-## Appendix: Main Outputs
+## 7. 例外・警告の扱い
 
-| File | Description |
-
-|-----------|-----------|
-
-| /etc/hosts-YYYYMMDD.bak | Backup taken before rewriting hosts |
-
-| /etc/firewalld/zones/*.bak | firewalld zone XML backups |
-
-| /etc/sysconfig/iptables-YYYYMMDD.bak | iptables backup |
-
-| /etc/profile-YYYYMMDD.bak | Proxy backup before editing |
-
-| /etc/yum.repos.d/*.repo-YYYYMMDD.bak | CentOS repo backups |
-
-| /etc/yum.repos.d/td.repo-YYYYMMDD.bak | td-agent repo backup |
-
-| /tmp/<user>/find_and_extract_3.2.4.0/ | Diff analysis logs |
+- 対象ファイルが存在しない → スキップし、処理は継続。
+- バックアップ失敗 / 書き込み失敗 → `[WARN]` を記録し、対象ファイルの更新を中止。
+- 変換後も STG 情報が残る → `[WARN]` で通知し、手動確認を促す。
+- TLS 修復が完了しない → `[WARN]` を残しつつ処理を継続。
+- 重大な vCenter 操作失敗 (クローン、再登録など) → 即時中断しロールバック手順を案内。
 
 ---
 
-## Summary
+## 8. 将来拡張案
 
-This project automates STG->PRD VM migrations on vSphere by coordinating network, firewall, NTP, repo, and proxy configuration changes inside the guest. It keeps backups, retries TLS fixes, surfaces warnings, and leaves room for future automation around diff detection and self-healing.
+1. **差分プレビュー統合**: `find_and_extract` の結果を Python ワークフローに統合し、自動承認フローを実装。
+2. **プレビュー承認モード**: 変更予定を提示し、明示承認後に実適用。
+3. **ロールバック支援強化**: 生成バックアップの一覧と復旧コマンドを自動提示。
+4. **Python への移植**: bash ロジックを Python モジュールへ移し、統一 CLI を提供。
+5. **CI/CD 連携**: ドライランや REST/SOAP 検証をパイプラインに組み込み、自動テストを拡充。
+
+---
+
+## 9. 主な成果物 / バックアップ
+
+| パス | 内容 |
+| --- | --- |
+| `/etc/firewalld/zones/<zone>.xml-YYYYMMDD.bak` | firewalld ゾーン XML のバックアップ |
+| `/etc/sysconfig/iptables-YYYYMMDD.bak` | iptables の保存結果 (ルール追加時) |
+| `/etc/hosts-YYYYMMDD.bak` | `--enable-standard-config-edits` 指定時のバックアップ |
+| `/etc/profile-YYYYMMDD.bak` | 同上 (プロキシ更新) |
+| `/etc/yum.repos.d/*.repo-YYYYMMDD.bak` | 同上 (yum レポジトリ更新) |
+| `/etc/yum.repos.d/td.repo-YYYYMMDD.bak` | 同上 (td-agent レポジトリ更新) |
+| `/tmp/<user>/find_and_extract/` | 差分解析およびロールバックログ |
+
+---
+
+## 10. まとめ
+
+このプロジェクトは vCenter API 操作とゲスト内コマンド実行を組み合わせ、STG→PRD 移行を自動化します。既定では firewalld と iptables の調整に留め、`--enable-standard-config-edits` を明示した場合のみ `/etc` 配下の標準構成を安全に書き換えます。バックアップと詳細ログ、警告のサマリー化により、監査性とロールバック容易性を両立しつつ今後の自動化拡張に備えています。

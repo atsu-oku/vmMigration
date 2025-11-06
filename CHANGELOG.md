@@ -1,120 +1,97 @@
-# Version History
+# 変更履歴
 
-## 2025-11-05 (DNS state propagation)
+> 日付は開発ブランチでの適用日を示します。機能追加やドキュメント更新を含む主な変更点を詳細に記載しています。
 
-- `cloneAndVmotion.py` now captures the DNS lists returned by `_run_nmcli_configuration()` back into the enclosing scope, ensuring later verification uses the exact values written by nmcli or the legacy fallback.
-- Introduced explicit local DNS copies inside the helper so deduplication only touches the per-run state; this removed the need for the previous `nonlocal` mutation and silenced the F823/E0606 static-analysis warnings.
-- Confirmed both nmcli and legacy paths emit consistent `NmcliConfigResult` data, keeping downstream reporting unchanged while improving readability.
+---
 
-## 2025-11-04 (Lint tooling & documentation pass)
+## 2025-11-05 - DNS 状態伝搬の安定化
 
-- Expanded lint bootstrap support by factoring shared helpers, tightening type hints, and simplifying module imports so `cloneAndVmotion.py`, `config_comparer.py`, and supporting utilities stay mypy/flake8 compliant.
-- Refreshed operational docs (`SETUP.md`, `TODO.md`) and added in-line documentation for guest command helpers, curl client usage, and schema validators; the iptables schema now reflects the latest firewall attributes.
-- Authored `docs/REST_SOAP_USAGE.md` to capture the current REST vs SOAP workflow, including authentication patterns and request samples for clone-and-vMotion orchestration.
+- `cloneAndVmotion.py` 内で `_run_nmcli_configuration()` が返す DNS リストを呼び出し元へ正確に伝搬するよう修正。`nmcli` / レガシー経路双方で適用値と検証値が一致します。
+- ヘルパー内部の DNS リストを局所コピーとして扱い、重複除去が他スコープへ影響しないよう整理。`nonlocal` 参照を廃止し、F823/E0606 警告を解消しました。
+- `NmcliConfigResult` の構造を nmcli / レガシーパスで統一し、後続のレポート処理を簡素化。挙動は従来から変更ありません。
 
-## 2025-10-31 (Firewall hardening & lint cleanup)
+## 2025-11-04 - リント環境刷新とドキュメント強化
 
-- Restricted SSH firewalld rules to the trusted bastion host and expanded automated tests so both parser and network utility coverage reflect the tightened policy.
-- Improved resiliency to destination vCenter session drops during guest NIC reconfiguration, retrying with clear logging instead of aborting the workflow mid-run.
-- Ran a broad lint cleanup across `cloneAndVmotion.py`, `network_utils.py`, and supporting modules, trimming legacy helpers and aligning formatting with project standards.
-- Finalised the transition away from the legacy find-and-extract tooling by removing the standalone script/schema and pointing documentation to the maintained sibling project.
+- `cloneAndVmotion.py`、`config_comparer.py` など主要モジュールの型ヒントと import を整理し、mypy / flake8 の通過を安定化。
+- `SETUP.md`、`TODO.md` を更新し、ゲストコマンドヘルパー、curl クライアント、スキーマバリデーターのドキュメントを補強。
+- iptables スキーマに最新のファイアウォール属性を反映し、JSON Schema 検証が現行ポリシーへ追随するよう更新。
+- `docs/REST_SOAP_USAGE.md` を追加し、REST / SOAP を組み合わせたクローン + vMotion ワークフローのリクエスト例と運用上の注意を体系化。
 
-## 2025-10-27 (Command logging & firewalld schema)
+## 2025-10-31 - ファイアウォール強化と lint 修正
 
-- Added a structured command execution log so every guest command and its description appear in the final summary.
+- SSH の firewalld ルールをバスティオンホストのみに制限。パーサーおよびネットワークユーティリティのテスト範囲を拡張し、新ポリシーへ対応。
+- 宛先 vCenter セッションが NIC 再設定中に切断された場合でもリトライで復旧できるよう改善。中断時は明確なログを記録。
+- `cloneAndVmotion.py`、`network_utils.py` ほかを横断的にフォーマット整備し、レガシーヘルパーを整理。
+- 旧 `find_and_extract` ツールを廃止し、メンテ継続中の姉妹リポジトリへ誘導するようドキュメントを更新。
 
-- Replaced guest file writes with an mktemp + bash heredoc flow, removing the need for Python payloads or base64 transfers.
+## 2025-10-27 - コマンドログと firewalld スキーマ対応
 
-- Captured source firewalld zones via JSON-schema-validated plans and synchronised interfaces, sources, ports, and rich rules on the destination VM.
+- すべてのゲストコマンドと説明を構造化ログとして記録し、実行サマリーに反映。監査や再試行が容易になりました。
+- ゲストファイル書き込みを mktemp + bash heredoc の純シェル手法へ移行し、Python ペイロードや base64 転送を排除。
+- firewalld ゾーンを JSON Schema で検証したうえでインターフェース / ソース / ポート / リッチルールを PRD VM に同期する仕組みを導入。
+- `docs/MIGRATION_FEATURES_EN.md` (英語) を追加し、最新ワークフロー改善点をまとめました。
 
-- Authored English documentation (`docs/MIGRATION_FEATURES_EN.md`) describing the latest workflow enhancements.
+## 2025-10-26 - ゲストコマンド耐障害性とレポート強化
 
-## 2025-10-26 (Guest command resilience & reporting)
+- `requests` で stdout/stderr ダウンロードに失敗した場合、自動的に `urllib` へフォールバックする再試行ロジックを追加。
+- `cloneAndVmotion.py --source-vm` オプションを追加し、スクリプト実行時に VM 名を事前指定できるようにしました。
+- `[OK]`/`[WARN]`/`[ERROR]` メッセージを統合した実行サマリーを追加し、完了後に一括確認できるよう改善。
+- firewalld ゾーンのインターフェースを事前に再結合してからリロードすることで、孤立ゾーンが発生しないよう対処。
+- 新サマリー / CLI フラグ / ゲストコマンドフォールバックについて README を更新。
 
-- Hardened guest command file downloads to retry with urllib when `requests` fails or returns non-200 responses, ensuring stdout/stderr capture succeeds.
+## 2025-10-20 - レガシーゲストサポートの拡充
 
-- Added a `--source-vm` CLI option for `cloneAndVmotion.py` so scripted runs can skip the interactive VM prompt.
+- NetworkManager 非搭載環境で `ip` / `ifconfig` / `route` を自動判別し、利用可能なツールで設定・検証するレガシールートを再構築。
+- 失敗時の詳細な警告ログと検証コマンドを出力することで、手動再確認を容易化。
+- レガシー設定の戻り値を拡張し、失敗時はワークフローを中断、検証用コマンドを再利用できるよう調整。
+- 静的ルートや永続化の失敗は警告扱いとし、ゲストが進捗できるように変更。
+- ソースの NIC 名をゲスト Operations で取得し、宛先の NIC 名を揃えた上で設定を適用するよう改善。
 
-- Collected `[OK]`/`[WARN]`/`[ERROR]` messages into an execution summary that prints once the migration workflow finishes.
+## 2025-10-19 - ゲートウェイのフォールバックと認証強化
 
-- Reconciled firewalld zone interfaces using source-derived mappings before reload, preventing orphaned assignments.
+- デフォルトルート推定を REST ルート情報の 0.0.0.0/0 のみを対象に再設計し、PRD 側で重複デフォルトが生まれないよう対処。
+- デフォルトルートが取得できない場合でも PRD セグメント規則 (第 3 オクテット 160/162) に基づく推定を追加し、ログで根拠を明示。
+- root 認証は 1 度のみ試行し、失敗後は sudo 権限ユーザーへ自動切り替え。再試行によるロックアウトを防止。
+- SDK 検証出力の冗長なルート表示を整理し README に挙動を追記。
+- RHEL 7.9 (NetworkManager + `nmcli`) でのフローを検証し、サポート実績として記録。
 
-- Updated documentation to cover the new summary, CLI flag, and guest command fallback.
+## 2025-10-19 - リファクタリング
 
-## 2025-10-20 (Legacy guest tooling support)
+- `GuestCommandExecutor` を導入し、ゲストコマンド実行とデバッグパスを一元管理。
+- `CloneAndVmotionWorkflow` / `WorkflowState` を追加し、移行フェーズの SRP を改善。
+- vCenter 認証処理を `authenticate_vcenter` に集約し、SmartConnect 呼び出しの重複を排除。
 
-- Reworked the legacy guest network configurator to detect `ip`, `ifconfig`, and `route`, falling back to net-tools when NetworkManager is absent.
+## 2025-10-18 - 検証とログの改善
 
-- Added detailed verification/diagnostics so failed legacy commands surface explicit warnings and the caller can reuse the exact verification command.
+- デフォルトゲートウェイ推定ロジックを刷新し、vSphere ルート情報と NIC サブネットの優先順位を調整。
+- DNS 検証出力を正規化し、「欠損 DNS」の誤検出を解消。期待値と実測値を明示的に表示。
+- SDK ルート差分のうちデフォルトルートを除外して表示。実際に対応が必要な差分のみが残るよう変更。
+- `nmcli` 接続の autoconnect 維持、重複静的ルート適用の防止を追加。
+- README / SETUP を更新し、新しい検証挙動と設定オプションを記載。
+- `InsecureRequestWarning` の import を `urllib3` へ切り替え、`requests` 使用時の deprecation 警告を回避。
 
-- Updated the migration workflow to honour the expanded return signature, abort on legacy failures, and reuse the helper-provided verification when checking configured IPs.
+## 2025-10-17 - ゲストコマンドの安定化
 
-- Marked static route and persistence write errors as non-fatal so legacy guests keep progressing while still logging warnings.
+- コマンド失敗時のエラーメッセージを整理し、終了コードや詳細情報を明示。
+- 管理者パスワードの改行混入を修正し、`nmcli` フォールバックが正しく切り替わるよう調整。
+- Storage vMotion 中のセッションタイムアウトを防ぐ keep-alive スレッドを導入。
 
-- Captured source interface names via guest operations and renamed destination NICs to match (including udev/ifcfg updates) before applying network settings.
+## 2025-10-16 - PRD ルートと検証の強化
 
-## 2025-10-19 (Gateway fallback & auth hardening)
+- PRD 静的ルートの所有 NIC を追跡し、移行時に正しい NIC へ紐付けるよう改善。
+- `nmcli` 設定後の検証を追加し、IP / GW / ルート / DNS の整合性を確認。
 
-- Tightened default-route inference to consider only explicit 0.0.0.0/0 entries from vSphere REST responses, preventing duplicate PRD defaults.
+## 2025-10-12 - ロケール整備と sudo フォールバック
 
-- Added PRD segment fallback (third octet 160/162) with clear logging when the source VM has no default gateway.
+- `nmcli` / `ping` の動作がロケール差異で変わらないよう、ロケール設定と出力整形を統一。
+- sudo フォールバックの堅牢性を向上させ、再実行時に失敗しづらい構成へ調整。
+- README / SETUP を再構成し、セットアップ手順と利用手順を明確化。
 
-- Ensured root guest authentication is attempted once per run; subsequent commands use the sudo-capable user automatically.
+## 2025-10-11 - ワークフロー整理
 
-- Simplified SDK verification output by removing redundant route listings and documented the behaviour (README.md).
+- クローン → IP 設定 → Storage vMotion の流れを明文化し、コードと手順書を同期。
+- ゲスト内での疎通確認とロールバック手順を `nmcli` / `ping` ベースで追加。
 
-- Validated end-to-end flow on RHEL 7.9 (NetworkManager + `nmcli`); recorded the platform in documentation.
+## 2025-10-10 - 初期セットアップ
 
-## 2025-10-19 (Refactor)
-
-- Introduced `GuestCommandExecutor` to encapsulate guest command execution and simplify debugging.
-
-- Added `CloneAndVmotionWorkflow` / `WorkflowState` scaffolding so early migration phases observe SRP.
-
-- Centralised vCenter authentication via `authenticate_vcenter` helper to remove duplicated SmartConnect calls.
-
-## 2025-10-18
-
-- Improved default-gateway inference to prefer vSphere route metadata and NIC subnet checks.
-
-- Normalised DNS verification output to remove false "missing DNS" warnings and clearly display actual/expected sets.
-
-- Filtered SDK route snapshots so only non-default discrepancies are reported.
-
-- Ensured `nmcli` connections remain in autoconnect mode and prevented duplicate static-route application.
-
-- Updated documentation (README/SETUP) to reflect the new verification behaviour and configuration options.
-
-- Switched `InsecureRequestWarning` imports to `urllib3` to avoid deprecation warnings when using `requests`.
-
-## 2025-10-17
-
-- Hardened guest command error handling with clearer exit-code reasons and CLI output capture.
-
-- Fixed newline injection when staging admin passwords and ensured nmcli fallback logic short-circuits correctly.
-
-- Added vCenter keep-alive threading to prevent session expiry during long storage vMotion sequences.
-
-## 2025-10-16
-
-- Added PRD static-route ownership tracking so each route is bound to the correct NIC during migration.
-
-- Added nmcli post-configuration validation to confirm IP/gateway/routes/DNS after vMotion.
-
-## 2025-10-12
-
-- Fixed locale handling and output formatting so nmcli/ping behave consistently.
-
-- Hardened sudo fallback logic to improve resilience when rerunning key commands.
-
-- Restructured README.md / SETUP.md to clarify setup steps and usage.
-
-## 2025-10-11
-
-- Organised the flow from clone -> IP configuration -> Storage vMotion.
-
-- Added connectivity verification and rollback steps using nmcli / ping inside the guest OS.
-
-## 2025-10-10
-
-- Initial project setup, establishing the migration script foundation spanning source and destination vCenters.
+- プロジェクトの初期構築。ソース / 宛先 vCenter を跨いだ移行スクリプト基盤を整備。
