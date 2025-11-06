@@ -16,26 +16,32 @@
 ## 2. エンドツーエンドの流れ
 
 ### Phase 0 - 事前確認
+
 - ソース / 宛先 vCenter へ認証し、対象 VM の存在と VMware Tools 状態 (`guestToolsRunning`) を確認。
 
 ### Phase 1 - データ収集
+
 - NIC, IP, DNS, ルート、firewalld、NTP、yum レポジトリ、プロキシ設定を取得。
 - JSON Schema (firewalld など) で構造検証し、不整合は警告として記録。
 
 ### Phase 2 - オペレーター確認
+
 - 収集結果と差分プランを提示し、承認 (`y`) を取得してから変更フェーズへ進む。
 
 ### Phase 3 - クローン & 再登録
+
 - ソース vCenter 上で VM をクローンし NIC を除去。
 - クローンを宛先 vCenter へ登録し、PRD ネットワーク向けに NIC を再作成。
 - Storage vMotion で最終データストアへ移動。
 
 ### Phase 4 - ゲスト構成
+
 - 既定設定: firewalld rich-rule 追加と iptables の SSH 制御のみを変更。
 - オプション: `--enable-standard-config-edits` を指定すると `/etc/hosts`、NTP、yum/td-agent レポジトリ、`/etc/profile` も PRD 化 (バックアップ付き)。
 - NetworkManager が無い場合はシェルベースのレガシー手順へ自動切り替え。
 
 ### Phase 5 - 検証と完了
+
 - REST SDK または `nmcli` で検証、`ping` による疎通確認、firewalld SSH 設定の再確認を実施。
 - バックアップパスと `[OK]` / `[WARN]` / `[ERROR]` を含むサマリーを出力。
 
