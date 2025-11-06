@@ -114,6 +114,7 @@ FAILURE_EVENTS: List[str] = []
 @dataclass
 class CommandLogEntry:
     """Capture a record of a guest command and its human-friendly description."""
+
     command: str
     description: str
 
@@ -393,11 +394,11 @@ def _tracking_print(*args, **kwargs) -> None:
     message = sep.join(str(arg) for arg in args)
     normalized = message.lstrip()
     if normalized.startswith("[OK]"):
-        log_success(normalized[len("[OK]"):].strip())
+        log_success(normalized[len("[OK]") :].strip())
     elif normalized.startswith("[WARN]"):
-        log_failure(normalized[len("[WARN]"):].strip())
+        log_failure(normalized[len("[WARN]") :].strip())
     elif normalized.startswith("[ERROR]"):
-        log_failure(normalized[len("[ERROR]"):].strip())
+        log_failure(normalized[len("[ERROR]") :].strip())
     _ORIGINAL_PRINT(*args, **kwargs)
 
 
@@ -1134,9 +1135,13 @@ def _attempt_rest_guest_update(
             else None
         )
         print("   -> Updated NIC successfully via REST guest networking API.")
-        return True, use_sdk_networking, False, dns_update, [
-            route_idx for route_idx, _ in routes_for_nic
-        ]
+        return (
+            True,
+            use_sdk_networking,
+            False,
+            dns_update,
+            [route_idx for route_idx, _ in routes_for_nic],
+        )
     except WORKFLOW_RECOVERABLE_EXCEPTIONS as sdk_update_error:
         LOGGER.warning(
             "REST guest networking update failed; falling back to guest operations: %s",
@@ -1188,9 +1193,7 @@ def _configure_nic_with_nmcli(
             nmcli_fields = NMCLI_FIELDS_NO_TYPE
             nmcli_list_cmd = f"nmcli -t -f {','.join(nmcli_fields)} connection show"
             _, nmcli_output, _ = guest_command_executor(nmcli_list_cmd)
-        parsed_connections = parse_nmcli_connection_output(
-            nmcli_output, nmcli_fields
-        )
+        parsed_connections = parse_nmcli_connection_output(nmcli_output, nmcli_fields)
         existing_connections = []
         uuid_to_device: Dict[str, str] = {}
         for entry in parsed_connections:
@@ -1254,8 +1257,10 @@ def _configure_nic_with_nmcli(
                         and name_compact not in guest_iface_names_compact
                     ):
                         orphaned_interface = True
-                elif alias_targets and name_compact and any(
-                    target in name_compact for target in alias_targets_compact
+                elif (
+                    alias_targets
+                    and name_compact
+                    and any(target in name_compact for target in alias_targets_compact)
                 ):
                     orphaned_interface = True
             mac_match = False
@@ -1424,9 +1429,7 @@ def _configure_nic_with_nmcli(
             use_nmcli_connection=True,
         )
     except NmcliNotAvailableError:
-        print(
-            "   -> nmcli command unavailable; applying legacy network configuration."
-        )
+        print("   -> nmcli command unavailable; applying legacy network configuration.")
         (
             selected_route_indices,
             selected_route_lines,
@@ -2808,6 +2811,7 @@ def _ensure_http_proxy_configuration(guest_executor, timestamp: str) -> bool:
 @dataclass
 class WorkflowState:
     """Mutable runtime state used to coordinate clone and migration operations."""
+
     clone_name: Optional[str] = None
     vmx_path: Optional[str] = None
     new_vm_on_source: Optional[Any] = None
@@ -2833,6 +2837,7 @@ class WorkflowState:
 @dataclass
 class SourceVmDetails:
     """Snapshot of network-related state pulled from the source VM before migration."""
+
     nic_plans: List[NicPlanType]
     dns_servers: List[str]
     default_gateway: Optional[str]
@@ -3413,6 +3418,7 @@ def collect_source_vm_metadata(
 @dataclass
 class GuestInterfaceContext:
     """Intermediate mapping of guest NIC metadata used when rewriting interfaces."""
+
     device_name: str
     interface_names: Set[str]
     interface_names_compact: Set[str]
@@ -4043,7 +4049,12 @@ class CloneAndVmotionWorkflow:
 
 def main() -> None:
     """Entry point for the CLI-driven clone and vMotion workflow orchestration."""
-    global GUEST_ROOT_PWD, GUEST_ADMIN_PWD, VCSA_PWD_SOURCE, VCSA_PWD_DEST, workflow_had_warnings
+    global \
+        GUEST_ROOT_PWD, \
+        GUEST_ADMIN_PWD, \
+        VCSA_PWD_SOURCE, \
+        VCSA_PWD_DEST, \
+        workflow_had_warnings
 
     cli_args = _parse_cli_arguments()
     if getattr(cli_args, "enable_standard_config_edits", False):
