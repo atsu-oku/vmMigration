@@ -1,0 +1,11 @@
+[
+  { "id": "preflight", "handler": "_preflight_check" },
+  { "id": "collect-source", "handler": "_collect_source_vm_details" },
+  { "id": "confirm-plan", "handler": "_confirm_clone_plan" },
+  { "id": "clone-source", "handler": "_perform_source_clone_operations" },
+  { "id": "register-destination", "handler": "_register_destination_vm" },
+  { "id": "recreate-nics", "handler": "_recreate_destination_nics" },
+  { "id": "configure-network", "handler": "_configure_destination_network" },
+  { "id": "storage-vmotion", "handler": "_perform_storage_vmotion" },
+  { "id": "finalize", "handler": "_finalize_success" }
+]

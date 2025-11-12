@@ -135,6 +135,28 @@ class NmcliConfigResult:
     use_nmcli_connection: bool
 
 
+@dataclass
+class NmcliConfigParams:
+    """Input parameters required to configure a NIC via nmcli."""
+
+    guest_command_executor: Callable[..., Tuple[int, str, str]]
+    device_name: str
+    con_name: str
+    nmcli_supported: bool
+    new_mac_lower: str
+    original_mac_lower: str
+    expected_gateway_value: Optional[str]
+    new_dns_servers: List[str]
+    should_configure_routes: bool
+    routes_for_nic: List[Tuple[int, Dict[str, Any]]]
+    new_ip: Optional[str]
+    prefix: Optional[int]
+    expected_dns_servers: List[str]
+    expected_dns_overall: List[str]
+    guest_iface_names: Set[str]
+    guest_iface_names_compact: Set[str]
+
+
 COMMAND_EXECUTION_LOG: List[CommandLogEntry] = []
 COMMAND_DESCRIPTION_OVERRIDES: Dict[str, str] = {}
 
@@ -434,11 +456,11 @@ def _tracking_print(*args, **kwargs) -> None:
     message = sep.join(str(arg) for arg in args)
     normalized = message.lstrip()
     if normalized.startswith("[OK]"):
-        log_success(normalized[len("[OK]") :].strip())
+        log_success(normalized[len("[OK]"):].strip())
     elif normalized.startswith("[WARN]"):
-        log_failure(normalized[len("[WARN]") :].strip())
+        log_failure(normalized[len("[WARN]"):].strip())
     elif normalized.startswith("[ERROR]"):
-        log_failure(normalized[len("[ERROR]") :].strip())
+        log_failure(normalized[len("[ERROR]"):].strip())
     _ORIGINAL_PRINT(*args, **kwargs)
 
 
@@ -1548,26 +1570,25 @@ def _configure_nmcli_connection(
     )
 
 
-def _configure_nic_with_nmcli(
-    *,
-    guest_command_executor,
-    device_name: str,
-    con_name: str,
-    nmcli_supported: bool,
-    new_mac_lower: str,
-    original_mac_lower: str,
-    expected_gateway_value: Optional[str],
-    new_dns_servers: List[str],
-    should_configure_routes: bool,
-    routes_for_nic: List[Tuple[int, Dict[str, Any]]],
-    new_ip: Optional[str],
-    prefix: Optional[int],
-    expected_dns_servers: List[str],
-    expected_dns_overall: List[str],
-    guest_iface_names: Set[str],
-    guest_iface_names_compact: Set[str],
-) -> NmcliConfigResult:
+def _configure_nic_with_nmcli(params: NmcliConfigParams) -> NmcliConfigResult:
     """Apply guest NIC settings using nmcli when available, otherwise fall back."""
+    guest_command_executor = params.guest_command_executor
+    device_name = params.device_name
+    con_name = params.con_name
+    nmcli_supported = params.nmcli_supported
+    new_mac_lower = params.new_mac_lower
+    original_mac_lower = params.original_mac_lower
+    expected_gateway_value = params.expected_gateway_value
+    new_dns_servers = params.new_dns_servers
+    should_configure_routes = params.should_configure_routes
+    routes_for_nic = params.routes_for_nic
+    new_ip = params.new_ip
+    prefix = params.prefix
+    expected_dns_servers = params.expected_dns_servers
+    expected_dns_overall = params.expected_dns_overall
+    guest_iface_names = params.guest_iface_names
+    guest_iface_names_compact = params.guest_iface_names_compact
+
     expected_dns_servers_local = list(expected_dns_servers)
     expected_dns_overall_local = list(expected_dns_overall)
     legacy_verification_command: Optional[str] = None
@@ -4278,19 +4299,7 @@ class CloneAndVmotionWorkflow:
         raise NotImplementedError
 
 
-WORKFLOW_PHASES_SCHEMA_JSON = """
-[
-  {"id": "preflight", "handler": "_preflight_check"},
-  {"id": "collect-source", "handler": "_collect_source_vm_details"},
-  {"id": "confirm-plan", "handler": "_confirm_clone_plan"},
-  {"id": "clone-source", "handler": "_perform_source_clone_operations"},
-  {"id": "register-destination", "handler": "_register_destination_vm"},
-  {"id": "recreate-nics", "handler": "_recreate_destination_nics"},
-  {"id": "configure-network", "handler": "_configure_destination_network"},
-  {"id": "storage-vmotion", "handler": "_perform_storage_vmotion"},
-  {"id": "finalize", "handler": "_finalize_success"}
-]
-"""
+WORKFLOW_PHASES_PATH = SCHEMA_DIR / "workflow_phases.json"
 
 
 def _validate_phase_schema(phases: List[Dict[str, str]]) -> None:
@@ -4306,7 +4315,9 @@ def _validate_phase_schema(phases: List[Dict[str, str]]) -> None:
             raise ValueError(f"Workflow phase entries must be strings: {phase}")
 
 
-WORKFLOW_PHASES_SCHEMA: List[Dict[str, str]] = json.loads(WORKFLOW_PHASES_SCHEMA_JSON)
+WORKFLOW_PHASES_SCHEMA: List[Dict[str, str]] = json.loads(
+    WORKFLOW_PHASES_PATH.read_text(encoding="utf-8")
+)
 _validate_phase_schema(WORKFLOW_PHASES_SCHEMA)
 
 
@@ -4398,6 +4409,7 @@ def _execute_workflow(target_vm_name: str, ssl_context: ssl.SSLContext) -> None:
 
 
 def main() -> None:
+    """CLI entrypoint to orchestrate the staged-to-production migration workflow."""
     cli_args = _parse_cli_arguments()
     provided_source_vm_name = _apply_cli_configuration(cli_args)
     _prompt_vcenter_passwords()
