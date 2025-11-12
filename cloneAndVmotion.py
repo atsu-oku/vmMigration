@@ -22,11 +22,13 @@ import posixpath
 from pathlib import Path
 from typing import (
     Any,
+    Callable,
     Dict,
     Iterable,
     List,
     Mapping,
     Optional,
+    Sequence,
     Set,
     Tuple,
     Type,
@@ -161,11 +163,214 @@ def _extract_key_value(tokens: List[str], key: str) -> Optional[str]:
     return None
 
 
+def _normalize_token(value: Optional[str]) -> Optional[str]:
+    """Strip surrounding quotes and whitespace from a token."""
+    if value is None:
+        return None
+    return value.strip().strip("'\"")
+
+
+def _describe_command_tool_lookup(
+    tokens: List[str],
+    base_name: str,
+) -> Optional[str]:
+    if base_name == "command" and len(tokens) >= 3 and tokens[1] == "-v":
+        tool = _normalize_token(tokens[2])
+        return f"{tool} コマンドの存在を確認"
+    return None
+
+
+def _describe_firewall_cmd(tokens: List[str], first_line: str, base_name: str) -> Optional[str]:
+    if base_name != "firewall-cmd":
+        return None
+    zone = _normalize_token(_extract_option_value(tokens, "--zone"))
+    if "--list-sources" in tokens:
+        return f"firewalldゾーン {zone or 'default'} の許可送信アドレスを取得"
+    if "--list-interfaces" in tokens:
+        return f"firewalldゾーン {zone or 'default'} のインターフェース一覧を取得"
+    if "--add-rich-rule" in tokens:
+        return f"firewalldゾーン {zone or 'default'} にリッチルールを追加"
+    if "--remove-rich-rule" in tokens:
+        return f"firewalldゾーン {zone or 'default'} からリッチルールを削除"
+    if "--reload" in tokens:
+        return "firewalld 設定をリロード"
+    if "--get-zones" in tokens:
+        return "firewalld のゾーン一覧を取得"
+    if "--state" in tokens:
+        return "firewalld の稼働状態を確認"
+    return f"firewalld コマンドを実行 ({first_line})"
+
+
+def _describe_nmcli(tokens: List[str], first_line: str, base_name: str) -> Optional[str]:
+    if base_name != "nmcli" or len(tokens) < 2:
+        return None
+    subcommand = tokens[1]
+    if subcommand == "connection":
+        action = tokens[2] if len(tokens) > 2 else ""
+        target = _normalize_token(tokens[3]) if len(tokens) > 3 else None
+        if action == "modify" and target:
+            address = _normalize_token(_extract_key_value(tokens, "ipv4.addresses"))
+            gateway = _normalize_token(_extract_key_value(tokens, "ipv4.gateway"))
+            method = _normalize_token(_extract_key_value(tokens, "ipv4.method"))
+            if address:
+                return f"接続 {target} に IP アドレス {address} を設定"
+            if gateway:
+                return f"接続 {target} にデフォルトゲートウェイ {gateway} を設定"
+            if method:
+                return f"接続 {target} の IPv4 方法を {method} に変更"
+            return f"接続 {target} の設定を変更"
+        if action == "up" and target:
+            return f"接続 {target} を有効化"
+        if action == "down" and target:
+            return f"接続 {target} を無効化"
+    if subcommand == "device" and len(tokens) > 2:
+        action = tokens[2]
+        device = _normalize_token(tokens[3]) if len(tokens) > 3 else None
+        if action == "status":
+            return "nmcli でデバイスの状態を確認"
+        if action == "show" and device:
+            return f"デバイス {device} の詳細を取得"
+    return f"nmcli コマンドを実行 ({first_line})"
+
+
+def _describe_systemctl(tokens: List[str], first_line: str, base_name: str) -> Optional[str]:
+    if base_name != "systemctl" or len(tokens) < 2:
+        return None
+    action = tokens[1]
+    service = None
+    for token in tokens[2:]:
+        if not token.startswith("-"):
+            service = _normalize_token(token)
+            break
+    if action in {"is-active", "status"}:
+        return f"systemd サービス {service or '(指定なし)'} の状態を確認"
+    if action in {"restart", "start", "stop", "reload"}:
+        verb = {
+            "restart": "再起動",
+            "start": "起動",
+            "stop": "停止",
+            "reload": "リロード",
+        }[action]
+        return f"systemd サービス {service or '(指定なし)'} を{verb}"
+    if action in {"enable", "disable"}:
+        verb = "有効化" if action == "enable" else "無効化"
+        return f"systemd サービス {service or '(指定なし)'} を{verb}"
+    return f"systemctl {action} を実行 ({first_line})"
+
+
+def _describe_service(tokens: List[str], base_name: str) -> Optional[str]:
+    if base_name != "service" or len(tokens) < 3:
+        return None
+    target = _normalize_token(tokens[1])
+    action = tokens[2]
+    action_map = {
+        "restart": "再起動",
+        "start": "起動",
+        "stop": "停止",
+        "status": "状態を確認",
+        "reload": "リロード",
+    }
+    description = action_map.get(action, f"{action} を実行")
+    return f"サービス {target} を{description}"
+
+
+def _describe_ip(tokens: List[str], first_line: str, base_name: str) -> Optional[str]:
+    if base_name != "ip" or len(tokens) < 2:
+        return None
+    sub = tokens[1]
+    if sub == "link" and len(tokens) >= 4:
+        action = tokens[2]
+        iface = _normalize_token(tokens[3])
+        if action == "set" and iface:
+            if "down" in tokens:
+                return f"インターフェース {iface} をダウン"
+            if "up" in tokens:
+                return f"インターフェース {iface} をアップ"
+            if "name" in tokens:
+                new_name = _normalize_token(_extract_option_value(tokens, "name"))
+                if new_name:
+                    return f"インターフェース {iface} を {new_name} にリネーム"
+            return f"インターフェース {iface} の状態を変更"
+    if sub == "addr":
+        if "show" in tokens or len(tokens) == 2:
+            return "IP アドレス情報を取得"
+        if "add" in tokens:
+            address = _normalize_token(_extract_option_value(tokens, "add"))
+            dev = _normalize_token(_extract_option_value(tokens, "dev"))
+            if address and dev:
+                return f"インターフェース {dev} に IP アドレス {address} を追加"
+    if sub == "route":
+        if "add" in tokens:
+            return "ルートを追加"
+        if "show" in tokens:
+            return "ルーティングテーブルを表示"
+    return f"ip {sub} コマンドを実行 ({first_line})"
+
+
+def _describe_guard_command(tokens: List[str]) -> Optional[str]:
+    if not tokens or tokens[0] != "[" or "||" not in tokens:
+        return None
+    try:
+        guard_index = tokens.index("||")
+        src = (
+            _normalize_token(tokens[guard_index + 2])
+            if len(tokens) > guard_index + 2
+            else None
+        )
+        dest = (
+            _normalize_token(tokens[guard_index + 3])
+            if len(tokens) > guard_index + 3
+            else None
+        )
+        if tokens[1] == "-f" and dest and src:
+            return f"バックアップ未存在なら {src} を {dest} にコピー"
+    except (ValueError, IndexError):
+        return "条件付きのコマンドを実行"
+    return "条件付きのコマンドを実行"
+
+
+def _describe_simple_command(
+    tokens: List[str],
+    first_line: str,
+    base_name: str,
+) -> Optional[str]:
+    if base_name == "cat" and len(tokens) >= 2:
+        return f"{_normalize_token(tokens[1])} の内容を表示"
+    if base_name == "cp" and len(tokens) >= 3:
+        return f"{_normalize_token(tokens[1])} を {_normalize_token(tokens[2])} にコピー"
+    if base_name == "mv" and len(tokens) >= 3:
+        return f"{_normalize_token(tokens[1])} を {_normalize_token(tokens[2])} に移動"
+    if base_name == "rm":
+        target = _normalize_token(tokens[-1]) if len(tokens) > 1 else ""
+        return f"{target} を削除"
+    if base_name == "mkdir":
+        target = _normalize_token(tokens[-1]) if len(tokens) > 1 else ""
+        return f"ディレクトリ {target} を作成"
+    if base_name == "ls":
+        target = _normalize_token(tokens[1]) if len(tokens) > 1 else "."
+        return f"{target} の内容を一覧表示"
+    if base_name == "grep":
+        pattern = _normalize_token(tokens[1]) if len(tokens) > 1 else ""
+        return f"パターン {pattern} を検索"
+    if base_name == "curl":
+        url = _normalize_token(tokens[-1]) if tokens else ""
+        return f"URL {url} へ HTTP リクエスト"
+    if base_name == "echo":
+        return f"テキストを出力: {first_line[5:].strip()}"
+    if base_name == "touch" and len(tokens) >= 2:
+        return f"{_normalize_token(tokens[1])} を作成またはタイムスタンプ更新"
+    if base_name == "chmod" and len(tokens) >= 3:
+        return f"{_normalize_token(tokens[2])} のパーミッションを {tokens[1]} に変更"
+    if base_name == "chown" and len(tokens) >= 3:
+        return f"{_normalize_token(tokens[2])} の所有者を {tokens[1]} に変更"
+    return None
+
+
 def _describe_command(command: str) -> str:
     """Generate a brief Japanese description of what the command attempts to do."""
     stripped = (command or "").strip()
     if not stripped:
-        return "空のコマンドを実行"
+        return "Empty command; nothing to describe."
     multi_line = "\n" in stripped
     first_line = stripped.splitlines()[0].strip()
     try:
@@ -175,191 +380,25 @@ def _describe_command(command: str) -> str:
     base = tokens[0] if tokens else ""
     base_name = os.path.basename(base) if base else ""
 
-    def _normalize(value: Optional[str]) -> Optional[str]:
-        if value is None:
-            return None
-        return value.strip().strip("'\"")
-
-    if base_name == "command" and len(tokens) >= 3 and tokens[1] == "-v":
-        tool = _normalize(tokens[2])
-        return f"{tool} コマンドの存在を確認"
-
-    if base_name == "firewall-cmd":
-        zone = _normalize(_extract_option_value(tokens, "--zone"))
-        if "--list-sources" in tokens:
-            return f"firewalldゾーン {zone or 'default'} の許可元アドレスを取得"
-        if "--list-interfaces" in tokens:
-            return f"firewalldゾーン {zone or 'default'} のインターフェース一覧を取得"
-        if "--add-rich-rule" in tokens:
-            return f"firewalldゾーン {zone or 'default'} にリッチルールを追加"
-        if "--remove-rich-rule" in tokens:
-            return f"firewalldゾーン {zone or 'default'} からリッチルールを削除"
-        if "--reload" in tokens:
-            return "firewalld 設定をリロード"
-        if "--get-zones" in tokens:
-            return "firewalld のゾーン一覧を取得"
-        if "--state" in tokens:
-            return "firewalld の稼働状態を確認"
-        return f"firewalld コマンドを実行 ({first_line})"
-
-    if base_name == "nmcli" and len(tokens) >= 2:
-        if tokens[1] == "connection":
-            action = tokens[2] if len(tokens) > 2 else ""
-            target = _normalize(tokens[3]) if len(tokens) > 3 else None
-            if action == "modify" and target:
-                address = _normalize(_extract_key_value(tokens, "ipv4.addresses"))
-                gateway = _normalize(_extract_key_value(tokens, "ipv4.gateway"))
-                method = _normalize(_extract_key_value(tokens, "ipv4.method"))
-                if address:
-                    return f"接続 {target} に IP アドレス {address} を設定"
-                if gateway:
-                    return f"接続 {target} にデフォルトゲートウェイ {gateway} を設定"
-                if method:
-                    return f"接続 {target} の IPv4 方法を {method} に変更"
-                return f"接続 {target} の設定を変更"
-            if action == "up" and target:
-                return f"接続 {target} を有効化"
-            if action == "down" and target:
-                return f"接続 {target} を無効化"
-        if tokens[1] == "device" and len(tokens) > 2:
-            action = tokens[2]
-            device = _normalize(tokens[3]) if len(tokens) > 3 else None
-            if action == "status":
-                return "nmcli でデバイスの状態を確認"
-            if action == "show" and device:
-                return f"デバイス {device} の詳細を取得"
-        return f"nmcli コマンドを実行 ({first_line})"
-
-    if base_name == "systemctl" and len(tokens) >= 2:
-        action = tokens[1]
-        service = None
-        for token in tokens[2:]:
-            if not token.startswith("-"):
-                service = _normalize(token)
-                break
-        if action in {"is-active", "status"}:
-            return f"systemd サービス {service or '(指定なし)'} の状態を確認"
-        if action in {"restart", "start", "stop", "reload"}:
-            verb = {
-                "restart": "再起動",
-                "start": "起動",
-                "stop": "停止",
-                "reload": "リロード",
-            }[action]
-            return f"systemd サービス {service or '(指定なし)'} を{verb}"
-        if action in {"enable", "disable"}:
-            verb = "有効化" if action == "enable" else "無効化"
-            return f"systemd サービス {service or '(指定なし)'} を{verb}"
-        return f"systemctl {action} を実行 ({first_line})"
-
-    if base_name == "service" and len(tokens) >= 3:
-        target = _normalize(tokens[1])
-        action = tokens[2]
-        action_map = {
-            "restart": "再起動",
-            "start": "起動",
-            "stop": "停止",
-            "status": "状態を確認",
-            "reload": "リロード",
-        }
-        description = action_map.get(action, f"{action} を実行")
-        return f"サービス {target} を{description}"
-
-    if base_name == "ip" and len(tokens) >= 2:
-        sub = tokens[1]
-        if sub == "link" and len(tokens) >= 4:
-            action = tokens[2]
-            iface = _normalize(tokens[3])
-            if action == "set" and iface:
-                if "down" in tokens:
-                    return f"インターフェース {iface} をダウン"
-                if "up" in tokens:
-                    return f"インターフェース {iface} をアップ"
-                if "name" in tokens:
-                    new_name = _normalize(_extract_option_value(tokens, "name"))
-                    if new_name:
-                        return f"インターフェース {iface} を {new_name} にリネーム"
-                return f"インターフェース {iface} の状態を変更"
-        if sub == "addr":
-            if "show" in tokens or len(tokens) == 2:
-                return "IP アドレス情報を取得"
-            if "add" in tokens:
-                address = _normalize(_extract_option_value(tokens, "add"))
-                dev = _normalize(_extract_option_value(tokens, "dev"))
-                if address and dev:
-                    return f"インターフェース {dev} に IP アドレス {address} を追加"
-        if sub == "route":
-            if "add" in tokens:
-                return "ルートを追加"
-            if "show" in tokens:
-                return "ルーティングテーブルを表示"
-        return f"ip {sub} コマンドを実行 ({first_line})"
-
-    if tokens and tokens[0] == "[" and "||" in tokens:
-        try:
-            guard_index = tokens.index("||")
-            src = (
-                _normalize(tokens[guard_index + 2])
-                if len(tokens) > guard_index + 2
-                else None
-            )
-            dest = (
-                _normalize(tokens[guard_index + 3])
-                if len(tokens) > guard_index + 3
-                else None
-            )
-            if tokens[1] == "-f" and dest and src:
-                return f"バックアップが無ければ {src} を {dest} にコピー"
-        except (ValueError, IndexError):
-            pass
-        return "条件付きのコマンドを実行"
-
-    if base_name == "cat" and len(tokens) >= 2:
-        return f"{_normalize(tokens[1])} の内容を表示"
-
-    if base_name == "cp" and len(tokens) >= 3:
-        return f"{_normalize(tokens[1])} を {_normalize(tokens[2])} にコピー"
-
-    if base_name == "mv" and len(tokens) >= 3:
-        return f"{_normalize(tokens[1])} を {_normalize(tokens[2])} に移動"
-
-    if base_name == "rm":
-        target = _normalize(tokens[-1]) if len(tokens) > 1 else ""
-        return f"{target} を削除"
-
-    if base_name == "mkdir":
-        target = _normalize(tokens[-1]) if len(tokens) > 1 else ""
-        return f"ディレクトリ {target} を作成"
-
-    if base_name == "ls":
-        target = _normalize(tokens[1]) if len(tokens) > 1 else "."
-        return f"{target} の内容を一覧表示"
-
-    if base_name == "grep":
-        pattern = _normalize(tokens[1]) if len(tokens) > 1 else ""
-        return f"パターン {pattern} を検索"
-
-    if base_name == "curl":
-        url = _normalize(tokens[-1]) if tokens else ""
-        return f"URL {url} へ HTTP リクエスト"
-
-    if base_name == "echo":
-        return f"テキストを出力: {first_line[5:].strip()}"
-
-    if base_name == "touch" and len(tokens) >= 2:
-        return f"{_normalize(tokens[1])} を作成またはタイムスタンプ更新"
-
-    if base_name == "chmod" and len(tokens) >= 3:
-        return f"{_normalize(tokens[2])} のパーミッションを {tokens[1]} に変更"
-
-    if base_name == "chown" and len(tokens) >= 3:
-        return f"{_normalize(tokens[2])} の所有者を {tokens[1]} に変更"
+    handlers: List[Callable[[List[str], str, str], Optional[str]]] = [
+        lambda t, fl, bn: _describe_command_tool_lookup(t, bn),
+        _describe_firewall_cmd,
+        _describe_nmcli,
+        _describe_systemctl,
+        lambda t, fl, bn: _describe_service(t, bn),
+        _describe_ip,
+        lambda t, fl, bn: _describe_guard_command(t),
+        _describe_simple_command,
+    ]
+    for handler in handlers:
+        description = handler(tokens, first_line, base_name)
+        if description:
+            return description
 
     if multi_line:
-        return f"複数行シェルスクリプトを実行 (先頭: {first_line})"
+        return f"Multi-line shell script (first line: {first_line})"
 
-    return f"コマンドを実行: {first_line}"
-
+    return f"Execute command: {first_line}"
 
 def register_command_execution(command: str) -> None:
     """Record the raw command and its human-readable description."""
@@ -1153,6 +1192,373 @@ def _attempt_rest_guest_update(
         return False, False, True, None, []
 
 
+def _build_alias_targets(device_name: str, con_name: str) -> Tuple[str, Set[str], Set[str]]:
+    device_name_normalized = device_name.lower()
+    alias_targets = {
+        value for value in (device_name_normalized, con_name.lower()) if value
+    }
+    alias_targets_compact = {
+        value.replace("-", "").replace("_", "").replace(" ", "")
+        for value in alias_targets
+    }
+    return device_name_normalized, alias_targets, alias_targets_compact
+
+
+def _build_mac_targets(new_mac_lower: str, original_mac_lower: str) -> Set[str]:
+    mac_targets: Set[str] = set()
+    for value in (new_mac_lower, original_mac_lower):
+        if not value:
+            continue
+        normalized = value.replace("-", ":")
+        mac_targets.add(normalized)
+        mac_targets.add(normalized.replace(":", ""))
+        mac_targets.add(normalized.replace(":", "-"))
+    return mac_targets
+
+
+def _connection_matches_alias(
+    device_norm: str,
+    name_norm: str,
+    device_compact: str,
+    name_compact: str,
+    alias_targets: Set[str],
+    alias_targets_compact: Set[str],
+) -> bool:
+    if not alias_targets:
+        return False
+    if device_norm in alias_targets or name_norm in alias_targets:
+        return True
+    if device_compact and any(
+        target in device_compact for target in alias_targets_compact
+    ):
+        return True
+    if name_compact and any(
+        target in name_compact for target in alias_targets_compact
+    ):
+        return True
+    return False
+
+
+def _connection_is_orphan(
+    name_norm: str,
+    name_compact: str,
+    alias_targets: Set[str],
+    alias_targets_compact: Set[str],
+    guest_iface_names: Set[str],
+    guest_iface_names_compact: Set[str],
+) -> bool:
+    if name_norm and LEGACY_INTERFACE_PATTERN.match(name_norm):
+        if (
+            guest_iface_names
+            and name_norm not in guest_iface_names
+            and name_compact not in guest_iface_names_compact
+        ):
+            return True
+    if (
+        alias_targets
+        and name_compact
+        and any(target in name_compact for target in alias_targets_compact)
+    ):
+        return True
+    return False
+
+
+def _connection_matches_mac(
+    uuid: str,
+    mac_targets: Set[str],
+    get_connection_details: Callable[[str], Tuple[int, str]],
+) -> bool:
+    if not mac_targets:
+        return False
+    detail_exit, detail_stdout = get_connection_details(uuid)
+    if detail_exit != 0 or not detail_stdout:
+        return False
+    detail_lower = detail_stdout.lower()
+    return any(target and target in detail_lower for target in mac_targets)
+
+
+def _fetch_existing_nmcli_connections(
+    guest_command_executor,
+) -> Tuple[
+    List[Dict[str, str]],
+    Dict[str, str],
+    Sequence[str],
+    Callable[[str], Tuple[int, str]],
+]:
+    nmcli_fields: Sequence[str] = NMCLI_FIELDS_WITH_TYPE
+    nmcli_list_cmd = f"nmcli -t -f {','.join(nmcli_fields)} connection show"
+    try:
+        _, nmcli_output, _ = guest_command_executor(nmcli_list_cmd)
+    except RuntimeError:
+        nmcli_fields = NMCLI_FIELDS_NO_TYPE
+        nmcli_list_cmd = f"nmcli -t -f {','.join(nmcli_fields)} connection show"
+        _, nmcli_output, _ = guest_command_executor(nmcli_list_cmd)
+    parsed_connections = parse_nmcli_connection_output(nmcli_output, nmcli_fields)
+    existing_connections: List[Dict[str, str]] = []
+    uuid_to_device: Dict[str, str] = {}
+    for entry in parsed_connections:
+        normalized_entry: Dict[str, str] = {}
+        for nmcli_field in nmcli_fields:
+            normalized_entry[nmcli_field.lower()] = entry.get(nmcli_field, "")
+        existing_connections.append(normalized_entry)
+        uuid_value = (normalized_entry.get("uuid") or "").strip()
+        if uuid_value:
+            uuid_to_device[uuid_value] = (
+                (normalized_entry.get("device") or "").strip().lower()
+            )
+    connection_detail_cache: Dict[str, Tuple[int, str]] = {}
+    get_connection_details = make_nmcli_detail_fetcher(
+        connection_detail_cache, guest_command_executor
+    )
+    return existing_connections, uuid_to_device, nmcli_fields, get_connection_details
+
+
+def _determine_stale_nmcli_connections(
+    existing_connections: List[Dict[str, str]],
+    *,
+    alias_targets: Set[str],
+    alias_targets_compact: Set[str],
+    mac_targets: Set[str],
+    target_device_lower: str,
+    guest_iface_names: Set[str],
+    guest_iface_names_compact: Set[str],
+    get_connection_details: Callable[[str], Tuple[int, str]],
+) -> Set[str]:
+    stale_connection_uuids: Set[str] = set()
+    for conn in existing_connections:
+        uuid = (conn.get("uuid") or "").strip()
+        if not uuid:
+            continue
+        device_norm = (conn.get("device") or "").strip().lower()
+        if device_norm and device_norm != target_device_lower:
+            continue
+        name_norm = (conn.get("name") or "").strip().lower()
+        type_norm = (conn.get("type") or "").strip().lower()
+        name_compact = compact_interface_name(name_norm)
+        device_compact = compact_interface_name(device_norm)
+        alias_match = _connection_matches_alias(
+            device_norm,
+            name_norm,
+            device_compact,
+            name_compact,
+            alias_targets,
+            alias_targets_compact,
+        )
+        orphaned_interface = _connection_is_orphan(
+            name_norm,
+            name_compact,
+            alias_targets,
+            alias_targets_compact,
+            guest_iface_names,
+            guest_iface_names_compact,
+        )
+        mac_match = False
+        if mac_targets and not (alias_match or orphaned_interface):
+            mac_match = _connection_matches_mac(
+                uuid, mac_targets, get_connection_details
+            )
+        if type_norm and type_norm not in ("802-3-ethernet", "ethernet"):
+            if not mac_match:
+                continue
+        if device_norm and device_norm not in guest_iface_names:
+            stale_connection_uuids.add(uuid)
+            continue
+        if alias_match or orphaned_interface or mac_match:
+            stale_connection_uuids.add(uuid)
+    return stale_connection_uuids
+
+
+def _remove_stale_nmcli_connections(
+    guest_command_executor,
+    stale_connection_uuids: Set[str],
+    uuid_to_device: Dict[str, str],
+    target_device_lower: str,
+) -> None:
+    if not stale_connection_uuids:
+        return
+    print(
+        f"   -> Removing stale nmcli connections ({len(stale_connection_uuids)} entries)."
+    )
+    for uuid in sorted(stale_connection_uuids):
+        mapped_device = uuid_to_device.get(uuid, "")
+        if mapped_device and mapped_device != target_device_lower:
+            continue
+        guest_command_executor(f"nmcli connection delete uuid {uuid}")
+
+
+def _configure_nmcli_ipv4_settings(
+    guest_command_executor,
+    *,
+    con_name: str,
+    new_ip: Optional[str],
+    prefix: Optional[int],
+    expected_gateway_value: Optional[str],
+) -> None:
+    if new_ip and prefix is not None:
+        guest_command_executor(
+            f"nmcli connection modify '{con_name}' ipv4.method manual "
+            f"ipv4.addresses '{new_ip}/{prefix}'"
+        )
+    else:
+        guest_command_executor(
+            f"nmcli connection modify '{con_name}' ipv4.method manual "
+            "ipv4.addresses ''"
+        )
+    if expected_gateway_value:
+        guest_command_executor(
+            f"nmcli connection modify '{con_name}' "
+            f"ipv4.gateway '{expected_gateway_value}'"
+        )
+        guest_command_executor(
+            f"nmcli connection modify '{con_name}' ipv4.never-default no",
+            check_exit_code=False,
+        )
+    else:
+        guest_command_executor(
+            f"nmcli connection modify '{con_name}' ipv4.gateway ''",
+            check_exit_code=False,
+        )
+        guest_command_executor(
+            f"nmcli connection modify '{con_name}' ipv4.never-default yes",
+            check_exit_code=False,
+        )
+
+
+def _configure_nmcli_ipv6_settings(guest_command_executor, *, con_name: str) -> None:
+    guest_command_executor(
+        f"nmcli connection modify '{con_name}' ipv6.method ignore",
+        check_exit_code=False,
+    )
+    guest_command_executor(
+        f"nmcli connection modify '{con_name}' ipv6.never-default yes",
+        check_exit_code=False,
+    )
+    guest_command_executor(
+        f"nmcli connection modify '{con_name}' ipv6.addresses ''",
+        check_exit_code=False,
+    )
+    guest_command_executor(
+        f"nmcli connection modify '{con_name}' ipv6.routes ''",
+        check_exit_code=False,
+    )
+    guest_command_executor(
+        f"nmcli connection modify '{con_name}' ipv6.dns ''",
+        check_exit_code=False,
+    )
+
+
+def _configure_nmcli_dns_settings(
+    guest_command_executor,
+    *,
+    con_name: str,
+    new_dns_servers: List[str],
+    expected_dns_servers_local: List[str],
+    expected_dns_overall_local: List[str],
+) -> Tuple[List[str], List[str]]:
+    local_expected_dns_servers = list(expected_dns_servers_local)
+    local_expected_dns_overall = list(expected_dns_overall_local)
+    if new_dns_servers:
+        deduped_dns = dedupe_preserving_order(new_dns_servers)
+        dns_str = " ".join(deduped_dns)
+        guest_command_executor(
+            f"nmcli connection modify '{con_name}' ipv4.dns '{dns_str}'"
+        )
+        local_expected_dns_servers = deduped_dns[:]
+        if not local_expected_dns_overall:
+            local_expected_dns_overall = dedupe_preserving_order(deduped_dns)
+    else:
+        guest_command_executor(
+            f"nmcli connection modify '{con_name}' ipv4.dns ''",
+            check_exit_code=False,
+        )
+    return local_expected_dns_servers, local_expected_dns_overall
+
+
+def _configure_nmcli_routes(
+    guest_command_executor,
+    *,
+    con_name: str,
+    should_configure_routes: bool,
+    routes_for_nic: List[Tuple[int, Dict[str, Any]]],
+) -> Tuple[List[int], List[str]]:
+    selected_route_indices: List[int] = []
+    selected_route_lines: List[str] = []
+    if not should_configure_routes:
+        return selected_route_indices, selected_route_lines
+    guest_command_executor(
+        f"nmcli connection modify '{con_name}' ipv4.routes ''",
+        check_exit_code=False,
+    )
+    for route_idx, route_info in routes_for_nic:
+        gateway = route_info.get("gateway")
+        prefix_value = route_info.get("prefix")
+        network_base = route_info.get("network")
+        if not gateway or prefix_value is None or not network_base:
+            continue
+        network_cidr = f"{network_base}/{prefix_value}"
+        guest_command_executor(
+            (
+                f"nmcli connection modify '{con_name}' "
+                f"+ipv4.routes '{network_cidr} {gateway}'"
+            ),
+            check_exit_code=False,
+        )
+        selected_route_indices.append(route_idx)
+        selected_route_lines.append(f"{network_cidr} via {gateway}")
+        print(f"      - Added: {network_cidr} via {gateway}")
+    return selected_route_indices, selected_route_lines
+
+
+def _configure_nmcli_connection(
+    guest_command_executor,
+    *,
+    device_name: str,
+    con_name: str,
+    new_ip: Optional[str],
+    prefix: Optional[int],
+    expected_gateway_value: Optional[str],
+    new_dns_servers: List[str],
+    should_configure_routes: bool,
+    routes_for_nic: List[Tuple[int, Dict[str, Any]]],
+    expected_dns_servers_local: List[str],
+    expected_dns_overall_local: List[str],
+) -> Tuple[List[int], List[str], List[str], List[str]]:
+    guest_command_executor(
+        f"ip addr flush dev {device_name}", check_exit_code=False
+    )
+    guest_command_executor(
+        f"nmcli connection add type ethernet con-name '{con_name}' "
+        f"ifname '{device_name}' autoconnect no"
+    )
+    _configure_nmcli_ipv4_settings(
+        guest_command_executor,
+        con_name=con_name,
+        new_ip=new_ip,
+        prefix=prefix,
+        expected_gateway_value=expected_gateway_value,
+    )
+    _configure_nmcli_ipv6_settings(guest_command_executor, con_name=con_name)
+    local_expected_dns_servers, local_expected_dns_overall = _configure_nmcli_dns_settings(
+        guest_command_executor,
+        con_name=con_name,
+        new_dns_servers=new_dns_servers,
+        expected_dns_servers_local=expected_dns_servers_local,
+        expected_dns_overall_local=expected_dns_overall_local,
+    )
+    selected_route_indices, selected_route_lines = _configure_nmcli_routes(
+        guest_command_executor,
+        con_name=con_name,
+        should_configure_routes=should_configure_routes,
+        routes_for_nic=routes_for_nic,
+    )
+    return (
+        selected_route_indices,
+        selected_route_lines,
+        local_expected_dns_servers,
+        local_expected_dns_overall,
+    )
+
+
 def _configure_nic_with_nmcli(
     *,
     guest_command_executor,
@@ -1178,210 +1584,46 @@ def _configure_nic_with_nmcli(
     legacy_verification_command: Optional[str] = None
 
     def _run_nmcli_configuration() -> Tuple[List[int], List[str], List[str], List[str]]:
-        selected_route_indices: List[int] = []
-        selected_route_lines: List[str] = []
-        local_expected_dns_servers = list(expected_dns_servers_local)
-        local_expected_dns_overall = list(expected_dns_overall_local)
-        device_name_normalized = device_name.lower()
-        mac_normalized = new_mac_lower.replace("-", ":") if new_mac_lower else ""
-        old_mac_normalized = original_mac_lower.replace("-", ":")
-        nmcli_fields = NMCLI_FIELDS_WITH_TYPE
-        nmcli_list_cmd = f"nmcli -t -f {','.join(nmcli_fields)} connection show"
-        try:
-            _, nmcli_output, _ = guest_command_executor(nmcli_list_cmd)
-        except RuntimeError:
-            nmcli_fields = NMCLI_FIELDS_NO_TYPE
-            nmcli_list_cmd = f"nmcli -t -f {','.join(nmcli_fields)} connection show"
-            _, nmcli_output, _ = guest_command_executor(nmcli_list_cmd)
-        parsed_connections = parse_nmcli_connection_output(nmcli_output, nmcli_fields)
-        existing_connections = []
-        uuid_to_device: Dict[str, str] = {}
-        for entry in parsed_connections:
-            normalized_entry: Dict[str, str] = {}
-            for nmcli_field in nmcli_fields:
-                normalized_entry[nmcli_field.lower()] = entry.get(nmcli_field, "")
-            existing_connections.append(normalized_entry)
-            uuid_value = (normalized_entry.get("uuid") or "").strip()
-            if uuid_value:
-                uuid_to_device[uuid_value] = (
-                    (normalized_entry.get("device") or "").strip().lower()
-                )
-        alias_targets = {
-            value for value in (device_name_normalized, con_name.lower()) if value
-        }
-        alias_targets_compact = {
-            value.replace("-", "").replace("_", "").replace(" ", "")
-            for value in alias_targets
-        }
-        mac_targets = set()
-        for value in (mac_normalized, old_mac_normalized):
-            if value:
-                mac_targets.add(value)
-                mac_targets.add(value.replace(":", ""))
-                mac_targets.add(value.replace(":", "-"))
-        stale_connection_uuids = set()
-        connection_detail_cache: Dict[str, Tuple[int, str]] = {}
-        get_connection_details = make_nmcli_detail_fetcher(
-            connection_detail_cache, guest_command_executor
+        (
+            existing_connections,
+            uuid_to_device,
+            _,
+            get_connection_details,
+        ) = _fetch_existing_nmcli_connections(guest_command_executor)
+        (
+            device_name_lower,
+            alias_targets,
+            alias_targets_compact,
+        ) = _build_alias_targets(device_name, con_name)
+        mac_targets = _build_mac_targets(new_mac_lower, original_mac_lower)
+        stale_connection_uuids = _determine_stale_nmcli_connections(
+            existing_connections,
+            alias_targets=alias_targets,
+            alias_targets_compact=alias_targets_compact,
+            mac_targets=mac_targets,
+            target_device_lower=device_name_lower,
+            guest_iface_names=guest_iface_names,
+            guest_iface_names_compact=guest_iface_names_compact,
+            get_connection_details=get_connection_details,
         )
-        target_device_lower = device_name.lower()
-        for conn in existing_connections:
-            uuid = (conn.get("uuid") or "").strip()
-            if not uuid:
-                continue
-            name_norm = (conn.get("name") or "").strip().lower()
-            device_norm = (conn.get("device") or "").strip().lower()
-            if device_norm and device_norm != target_device_lower:
-                continue
-            type_norm = (conn.get("type") or "").strip().lower()
-            name_compact = compact_interface_name(name_norm)
-            device_compact = compact_interface_name(device_norm)
-            alias_match = False
-            if alias_targets:
-                if device_norm in alias_targets or name_norm in alias_targets:
-                    alias_match = True
-                elif device_compact and any(
-                    target in device_compact for target in alias_targets_compact
-                ):
-                    alias_match = True
-                elif name_compact and any(
-                    target in name_compact for target in alias_targets_compact
-                ):
-                    alias_match = True
-            orphaned_interface = False
-            if not device_norm:
-                if name_norm and LEGACY_INTERFACE_PATTERN.match(name_norm):
-                    if (
-                        guest_iface_names
-                        and name_norm not in guest_iface_names
-                        and name_compact not in guest_iface_names_compact
-                    ):
-                        orphaned_interface = True
-                elif (
-                    alias_targets
-                    and name_compact
-                    and any(target in name_compact for target in alias_targets_compact)
-                ):
-                    orphaned_interface = True
-            mac_match = False
-            if mac_targets and not (alias_match or orphaned_interface):
-                detail_exit, detail_stdout = get_connection_details(uuid)
-                if detail_exit == 0 and detail_stdout:
-                    detail_lower = detail_stdout.lower()
-                    for target_mac in mac_targets:
-                        if target_mac and target_mac in detail_lower:
-                            mac_match = True
-                            break
-            if type_norm and type_norm not in ("802-3-ethernet", "ethernet"):
-                if not mac_match:
-                    continue
-            if alias_match or orphaned_interface or mac_match:
-                stale_connection_uuids.add(uuid)
-        if stale_connection_uuids:
-            print(
-                f"   -> Removing stale nmcli connections ({len(stale_connection_uuids)} entries)."
-            )
-            for uuid in sorted(stale_connection_uuids):
-                mapped_device = uuid_to_device.get(uuid, "")
-                if mapped_device and mapped_device != target_device_lower:
-                    continue
-                guest_command_executor(f"nmcli connection delete uuid {uuid}")
-        guest_command_executor(
-            f"ip addr flush dev {device_name}", check_exit_code=False
+        _remove_stale_nmcli_connections(
+            guest_command_executor,
+            stale_connection_uuids,
+            uuid_to_device,
+            device_name_lower,
         )
-        guest_command_executor(
-            f"nmcli connection add type ethernet con-name '{con_name}' "
-            f"ifname '{device_name}' autoconnect no"
-        )
-        if new_ip and prefix is not None:
-            guest_command_executor(
-                f"nmcli connection modify '{con_name}' ipv4.method manual "
-                f"ipv4.addresses '{new_ip}/{prefix}'"
-            )
-        else:
-            guest_command_executor(
-                f"nmcli connection modify '{con_name}' ipv4.method manual "
-                "ipv4.addresses ''"
-            )
-        guest_command_executor(
-            f"nmcli connection modify '{con_name}' ipv6.method ignore",
-            check_exit_code=False,
-        )
-        guest_command_executor(
-            f"nmcli connection modify '{con_name}' ipv6.never-default yes",
-            check_exit_code=False,
-        )
-        guest_command_executor(
-            f"nmcli connection modify '{con_name}' ipv6.addresses ''",
-            check_exit_code=False,
-        )
-        guest_command_executor(
-            f"nmcli connection modify '{con_name}' ipv6.routes ''",
-            check_exit_code=False,
-        )
-        guest_command_executor(
-            f"nmcli connection modify '{con_name}' ipv6.dns ''",
-            check_exit_code=False,
-        )
-        if expected_gateway_value:
-            guest_command_executor(
-                f"nmcli connection modify '{con_name}' "
-                f"ipv4.gateway '{expected_gateway_value}'"
-            )
-            guest_command_executor(
-                f"nmcli connection modify '{con_name}' ipv4.never-default no",
-                check_exit_code=False,
-            )
-        else:
-            guest_command_executor(
-                f"nmcli connection modify '{con_name}' ipv4.gateway ''",
-                check_exit_code=False,
-            )
-            guest_command_executor(
-                f"nmcli connection modify '{con_name}' ipv4.never-default yes",
-                check_exit_code=False,
-            )
-        if new_dns_servers:
-            deduped_dns = dedupe_preserving_order(new_dns_servers)
-            dns_str = " ".join(deduped_dns)
-            guest_command_executor(
-                f"nmcli connection modify '{con_name}' ipv4.dns '{dns_str}'"
-            )
-            local_expected_dns_servers = deduped_dns[:]
-            if not local_expected_dns_overall:
-                local_expected_dns_overall = dedupe_preserving_order(deduped_dns)
-        else:
-            guest_command_executor(
-                f"nmcli connection modify '{con_name}' ipv4.dns ''",
-                check_exit_code=False,
-            )
-        if should_configure_routes:
-            guest_command_executor(
-                f"nmcli connection modify '{con_name}' ipv4.routes ''",
-                check_exit_code=False,
-            )
-            for route_idx, route_info in routes_for_nic:
-                gateway = route_info.get("gateway")
-                prefix_value = route_info.get("prefix")
-                network_base = route_info.get("network")
-                if not gateway or prefix_value is None or not network_base:
-                    continue
-                network_cidr = f"{network_base}/{prefix_value}"
-                guest_command_executor(
-                    (
-                        f"nmcli connection modify '{con_name}' "
-                        f"+ipv4.routes '{network_cidr} {gateway}'"
-                    ),
-                    check_exit_code=False,
-                )
-                selected_route_indices.append(route_idx)
-                selected_route_lines.append(f"{network_cidr} via {gateway}")
-                print(f"      - Added: {network_cidr} via {gateway}")
-        return (
-            selected_route_indices,
-            selected_route_lines,
-            local_expected_dns_servers,
-            local_expected_dns_overall,
+        return _configure_nmcli_connection(
+            guest_command_executor,
+            device_name=device_name,
+            con_name=con_name,
+            new_ip=new_ip,
+            prefix=prefix,
+            expected_gateway_value=expected_gateway_value,
+            new_dns_servers=new_dns_servers,
+            should_configure_routes=should_configure_routes,
+            routes_for_nic=routes_for_nic,
+            expected_dns_servers_local=expected_dns_servers_local,
+            expected_dns_overall_local=expected_dns_overall_local,
         )
 
     if not nmcli_supported:
@@ -3071,7 +3313,9 @@ def collect_source_vm_metadata(
                 source_inventory = collect_interface_inventory(
                     source_guest_command_executor
                 )
-            except Exception as inventory_error:  # pylint: disable=broad-exception-caught
+            except (
+                Exception
+            ) as inventory_error:  # pylint: disable=broad-exception-caught
                 LOGGER.debug(
                     "Unable to collect source interface inventory: %s",
                     inventory_error,
@@ -3188,7 +3432,9 @@ def collect_source_vm_metadata(
                         zone_plan = FirewalldZonePlan.from_raw(
                             raw_zone, FIREWALLD_ZONE_VALIDATOR
                         )
-                    except Exception as zone_error:  # pylint: disable=broad-exception-caught
+                    except (
+                        Exception
+                    ) as zone_error:  # pylint: disable=broad-exception-caught
                         LOGGER.debug(
                             "Skipping firewalld zone '%s' due to validation error: %s",
                             zone_name,
@@ -3897,7 +4143,9 @@ class CloneAndVmotionWorkflow:
                 portgroup_connection.switchUuid = (
                     dest_network.config.distributedVirtualSwitch.uuid
                 )
-                device_instance.backing = vim.vm.device.VirtualEthernetCard.DistributedVirtualPortBackingInfo()
+                device_instance.backing = (
+                    vim.vm.device.VirtualEthernetCard.DistributedVirtualPortBackingInfo()
+                )
                 device_instance.backing.port = portgroup_connection
             elif isinstance(dest_network, vim.Network):
                 backing = vim.vm.device.VirtualEthernetCard.NetworkBackingInfo()
@@ -4049,12 +4297,7 @@ class CloneAndVmotionWorkflow:
 
 def main() -> None:
     """Entry point for the CLI-driven clone and vMotion workflow orchestration."""
-    global \
-        GUEST_ROOT_PWD, \
-        GUEST_ADMIN_PWD, \
-        VCSA_PWD_SOURCE, \
-        VCSA_PWD_DEST, \
-        workflow_had_warnings
+    global GUEST_ROOT_PWD, GUEST_ADMIN_PWD, VCSA_PWD_SOURCE, VCSA_PWD_DEST, workflow_had_warnings
 
     cli_args = _parse_cli_arguments()
     if getattr(cli_args, "enable_standard_config_edits", False):
@@ -4417,7 +4660,9 @@ def main() -> None:
                     portgroup_connection.switchUuid = (
                         dest_network.config.distributedVirtualSwitch.uuid
                     )
-                    nic_spec.device.backing = vim.vm.device.VirtualEthernetCard.DistributedVirtualPortBackingInfo()
+                    nic_spec.device.backing = (
+                        vim.vm.device.VirtualEthernetCard.DistributedVirtualPortBackingInfo()
+                    )
                     nic_spec.device.backing.port = portgroup_connection
                 elif isinstance(dest_network, vim.Network):
                     nic_spec.device.backing = (
@@ -4701,10 +4946,7 @@ def main() -> None:
 
             def guest_command_executor(command, check_exit_code=True):
                 """Execute a guest command, reloading the VM handle if it becomes invalid."""
-                nonlocal \
-                    migrated_vm, \
-                    migrated_vm_for_rollback, \
-                    migrated_vm_name_for_rollback
+                nonlocal migrated_vm, migrated_vm_for_rollback, migrated_vm_name_for_rollback
                 try:
                     return execute_command_in_guest(
                         guest_operations_manager,
