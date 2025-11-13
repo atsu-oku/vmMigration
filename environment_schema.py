@@ -25,7 +25,11 @@ class EnvironmentConfig:
 
     def select_datastore(self, *, use_final: bool = False) -> str:
         """Return the appropriate datastore identifier."""
-        return self.final_datastore if use_final and self.final_datastore else self.primary_datastore
+        return (
+            self.final_datastore
+            if use_final and self.final_datastore
+            else self.primary_datastore
+        )
 
 
 def _validate_record(record: Dict[str, str]) -> EnvironmentConfig:
@@ -43,7 +47,9 @@ def _validate_record(record: Dict[str, str]) -> EnvironmentConfig:
         raise ValueError(f"Environment definition missing keys: {sorted(missing)}")
     unknown = set(record.keys()) - required_keys
     if unknown:
-        raise ValueError(f"Environment definition contains unknown keys: {sorted(unknown)}")
+        raise ValueError(
+            f"Environment definition contains unknown keys: {sorted(unknown)}"
+        )
     return EnvironmentConfig(
         id=str(record["id"]),
         description=str(record["description"]),
@@ -60,7 +66,9 @@ def load_environment_definitions(schema_dir: Path) -> Dict[str, EnvironmentConfi
     schema_path = schema_dir / ENVIRONMENTS_FILENAME
     raw_data = json.loads(schema_path.read_text(encoding="utf-8"))
     if not isinstance(raw_data, Iterable):
-        raise ValueError("Environment schema must be an array of environment definitions.")
+        raise ValueError(
+            "Environment schema must be an array of environment definitions."
+        )
     environments: Dict[str, EnvironmentConfig] = {}
     for record in raw_data:
         if not isinstance(record, dict):
