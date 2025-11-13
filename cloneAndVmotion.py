@@ -4,7 +4,6 @@
 from __future__ import annotations
 import argparse
 import builtins
-import json
 import os
 import ssl
 import sys
@@ -40,6 +39,7 @@ from typing import (
 
 from pyVim.connect import SmartConnect, Disconnect
 from pyVmomi import vim, vmodl  # type: ignore[import]
+from environment_schema import EnvironmentConfig, load_environment_definitions
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -159,6 +159,23 @@ class NmcliConfigParams:
 
 COMMAND_EXECUTION_LOG: List[CommandLogEntry] = []
 COMMAND_DESCRIPTION_OVERRIDES: Dict[str, str] = {}
+
+SCHEMA_DIR = PROJECT_ROOT / "schemas"
+ENVIRONMENT_DEFINITIONS: Dict[str, EnvironmentConfig] = load_environment_definitions(
+    SCHEMA_DIR
+)
+ENVIRONMENT_ID = _get_env_override("VSPHERE_ENVIRONMENT_ID", "legacy-prd")
+try:
+    CURRENT_ENVIRONMENT: EnvironmentConfig = ENVIRONMENT_DEFINITIONS[ENVIRONMENT_ID]
+except KeyError as exc:
+    available = ", ".join(sorted(ENVIRONMENT_DEFINITIONS))
+    raise RuntimeError(
+        f"Unknown environment id '{ENVIRONMENT_ID}'. Available environments: {available}"
+    ) from exc
+
+TARGET_DATASTORE_NAME = CURRENT_ENVIRONMENT.primary_datastore
+TARGET_CLUSTER_NAME = CURRENT_ENVIRONMENT.cluster
+PROXY_URL = CURRENT_ENVIRONMENT.proxy_url
 
 
 def remember_command_description(command: str, description: str) -> None:
@@ -778,7 +795,7 @@ def _guest_path_protected(path: str) -> bool:
     return _normalize_guest_path(path) in _PROTECTED_GUEST_PATH_LOOKUP
 
 
-SSH_OVERRIDE_SOURCE_IP = SSH_ALLOWED_SOURCE_IP
+SSH_OVERRIDE_SOURCE_IP = CURRENT_ENVIRONMENT.ssh_allowed_source_ip
 SSH_OVERRIDE_RICH_RULE = f'rule family="ipv4" source address="{SSH_OVERRIDE_SOURCE_IP}" service name="ssh" accept'
 
 
@@ -2368,6 +2385,213 @@ def _sync_hosts_file_to_prd(guest_executor, timestamp: str) -> bool:
     return True
 
 
+def _discover_firewalld_zones(
+    guest_executor, source_zones: Optional[List[FirewalldZonePlanType]]
+) -> Tuple[Set[str], bool]:
+    zone_names: Set[str] = {
+        plan.name.strip()
+        for plan in (source_zones or [])
+        if getattr(plan, "name", None)
+    }
+    exit_code, zones_output, _ = guest_executor(
+        "firewall-cmd --get-zones", check_exit_code=False
+    )
+    if exit_code == 0 and zones_output:
+        for token in zones_output.split():
+            token_clean = token.strip()
+            if token_clean:
+                zone_names.add(token_clean)
+    if zone_names:
+        return zone_names, True
+    exit_code, dir_listing, dir_err = guest_executor(
+        "ls /etc/firewalld/zones", check_exit_code=False
+    )
+    if exit_code == 0 and dir_listing:
+        for line in dir_listing.splitlines():
+            candidate = line.strip()
+            if candidate.endswith(".xml"):
+                zone_names.add(candidate[:-4])
+        return zone_names, True
+    detail = (dir_err or dir_listing or "").strip() or exit_code
+    print(f"   [WARN] Unable to determine firewalld zones: {detail}")
+    return set(), False
+
+
+def _fetch_zone_interfaces(
+    guest_executor,
+    zone: str,
+    plan: Optional[FirewalldZonePlanType],
+) -> List[str]:
+    interfaces_exit, interfaces_stdout, interfaces_err = guest_executor(
+        f"firewall-cmd --permanent --zone={shlex.quote(zone)} --list-interfaces",
+        check_exit_code=False,
+    )
+    if interfaces_exit == 0:
+        zone_interfaces = [
+            entry.strip()
+            for entry in (interfaces_stdout or "").split()
+            if entry.strip()
+        ]
+    else:
+        zone_interfaces = [
+            entry.strip()
+            for entry in (plan.interfaces if plan else [])
+            if entry and entry.strip()
+        ]
+        if interfaces_err:
+            LOGGER.debug(
+                "Failed to list firewalld interfaces for zone '%s': %s",
+                zone,
+                interfaces_err.strip(),
+            )
+    return [iface for iface in zone_interfaces if iface]
+
+
+def _interfaces_require_override(
+    guest_executor,
+    zone_interfaces: Iterable[str],
+    interface_cache: Dict[str, bool],
+) -> bool:
+    for interface in zone_interfaces:
+        if _interface_has_odd_third_octet(
+            guest_executor, interface, interface_cache
+        ):
+            return True
+    return False
+
+
+def _fetch_rich_rules(
+    guest_executor, zone: str
+) -> Tuple[List[str], bool]:
+    rich_exit, rich_stdout, rich_err = guest_executor(
+        f"firewall-cmd --permanent --zone={shlex.quote(zone)} --list-rich-rules",
+        check_exit_code=False,
+    )
+    if rich_exit != 0:
+        detail = (rich_err or "").strip() or rich_exit
+        print(f"   [WARN] Unable to list rich rules for zone '{zone}': {detail}")
+        return [], False
+    return [
+        rule.strip() for rule in (rich_stdout or "").splitlines() if rule.strip()
+    ], True
+
+
+def _zone_service_allows_ssh(guest_executor, zone: str) -> Tuple[bool, bool]:
+    services_exit, services_stdout, services_err = guest_executor(
+        f"firewall-cmd --permanent --zone={shlex.quote(zone)} --list-services",
+        check_exit_code=False,
+    )
+    if services_exit != 0:
+        if services_err:
+            LOGGER.debug(
+                "Failed to list firewalld services for zone '%s': %s",
+                zone,
+                services_err.strip(),
+            )
+        return False, True
+    services = {
+        entry.strip()
+        for entry in (services_stdout or "").split()
+        if entry.strip()
+    }
+    return "ssh" in services, True
+
+
+def _has_conflicting_ssh_rules(current_rules: Iterable[str]) -> bool:
+    return any(
+        'service name="ssh"' in rule
+        and f'source address="{SSH_OVERRIDE_SOURCE_IP}"' not in rule
+        for rule in current_rules
+    )
+
+
+def _ensure_zone_backup(
+    guest_executor, zone_file_path: str, backup_path_value: str
+) -> bool:
+    exists_exit, _, _ = guest_executor(
+        f"test -f {shlex.quote(zone_file_path)}",
+        check_exit_code=False,
+    )
+    if exists_exit != 0:
+        return True
+    backup_cmd = (
+        f"[ -f {shlex.quote(backup_path_value)} ] || "
+        f"cp {shlex.quote(zone_file_path)} {shlex.quote(backup_path_value)}"
+    )
+    backup_exit, _, backup_err = guest_executor(
+        backup_cmd, check_exit_code=False
+    )
+    if backup_exit != 0:
+        detail = (backup_err or "").strip() or backup_exit
+        print(
+            f"   [WARN] Unable to back up firewalld zone file '{zone_file_path}': {detail}"
+        )
+        return False
+    return True
+
+
+def _add_ssh_rich_rule(guest_executor, zone: str, rule_value: str) -> bool:
+    add_exit, _, add_err = guest_executor(
+        f"firewall-cmd --permanent --zone={shlex.quote(zone)} "
+        f"--add-rich-rule={shlex.quote(rule_value)}",
+        check_exit_code=False,
+    )
+    if add_exit != 0:
+        detail = (add_err or "").strip() or add_exit
+        print(f"   [WARN] Failed to add SSH rich rule to zone '{zone}': {detail}")
+        return False
+    print(
+        f"   -> Added SSH rich rule for {SSH_OVERRIDE_SOURCE_IP} to zone '{zone}'."
+    )
+    return True
+
+
+def _process_zone_for_ssh_override(
+    guest_executor,
+    zone: str,
+    plan: Optional[FirewalldZonePlanType],
+    timestamp: str,
+    interface_cache: Dict[str, bool],
+) -> Tuple[bool, bool]:
+    zone_interfaces = _fetch_zone_interfaces(guest_executor, zone, plan)
+    if not zone_interfaces:
+        return True, False
+    if not _interfaces_require_override(
+        guest_executor, zone_interfaces, interface_cache
+    ):
+        return True, False
+
+    current_rules, rules_success = _fetch_rich_rules(guest_executor, zone)
+    if not rules_success:
+        return False, False
+
+    service_allows_ssh, _ = _zone_service_allows_ssh(guest_executor, zone)
+    if service_allows_ssh:
+        return True, False
+
+    if SSH_OVERRIDE_RICH_RULE in current_rules:
+        print(
+            f"   -> Zone '{zone}' already allows SSH from {SSH_OVERRIDE_SOURCE_IP}."
+        )
+        return True, False
+
+    if _has_conflicting_ssh_rules(current_rules):
+        print(
+            f"   -> Zone '{zone}' has existing SSH rich rules; skipping to avoid altering configuration."
+        )
+        return True, False
+
+    zone_file = f"/etc/firewalld/zones/{zone}.xml"
+    backup_path = f"{zone_file}-{timestamp}.bak"
+    if not _ensure_zone_backup(guest_executor, zone_file, backup_path):
+        return False, False
+
+    if not _add_ssh_rich_rule(guest_executor, zone, SSH_OVERRIDE_RICH_RULE):
+        return False, False
+
+    return True, True
+
+
 def _sync_firewalld_configuration_to_prd(
     guest_executor,
     timestamp: str,
@@ -2384,32 +2608,11 @@ def _sync_firewalld_configuration_to_prd(
         print("   -> firewalld inactive; skipping firewalld configuration sync.")
         return True
 
-    zone_names: Set[str] = {
-        plan.name.strip()
-        for plan in (source_zones or [])
-        if getattr(plan, "name", None)
-    }
-    exit_code, zones_output, _ = guest_executor(
-        "firewall-cmd --get-zones", check_exit_code=False
+    zone_names, discovery_success = _discover_firewalld_zones(
+        guest_executor, source_zones
     )
-    if exit_code == 0 and zones_output:
-        for token in zones_output.split():
-            token_clean = token.strip()
-            if token_clean:
-                zone_names.add(token_clean)
-    if not zone_names:
-        exit_code, dir_listing, dir_err = guest_executor(
-            "ls /etc/firewalld/zones", check_exit_code=False
-        )
-        if exit_code == 0 and dir_listing:
-            for line in dir_listing.splitlines():
-                candidate = line.strip()
-                if candidate.endswith(".xml"):
-                    zone_names.add(candidate[:-4])
-        else:
-            detail = (dir_err or dir_listing or "").strip() or exit_code
-            print(f"   [WARN] Unable to determine firewalld zones: {detail}")
-            return False
+    if not discovery_success:
+        return False
     if not zone_names:
         print("   -> No firewalld zones detected; skipping SSH override.")
         return True
@@ -2421,150 +2624,20 @@ def _sync_firewalld_configuration_to_prd(
     interface_cache: Dict[str, bool] = {}
     zones_updated: List[str] = []
     overall_success = True
-    rule_value = SSH_OVERRIDE_RICH_RULE
 
     for zone in sorted(zone_names):
         plan = plan_lookup.get(zone)
-        interfaces_exit, interfaces_stdout, interfaces_err = guest_executor(
-            f"firewall-cmd --permanent --zone={shlex.quote(zone)} --list-interfaces",
-            check_exit_code=False,
+        zone_success, updated = _process_zone_for_ssh_override(
+            guest_executor,
+            zone,
+            plan,
+            timestamp,
+            interface_cache,
         )
-        if interfaces_exit == 0:
-            zone_interfaces = [
-                entry.strip()
-                for entry in (interfaces_stdout or "").split()
-                if entry.strip()
-            ]
-        else:
-            zone_interfaces = [
-                entry.strip()
-                for entry in (plan.interfaces if plan else [])
-                if entry and entry.strip()
-            ]
-            if interfaces_err:
-                LOGGER.debug(
-                    "Failed to list firewalld interfaces for zone '%s': %s",
-                    zone,
-                    interfaces_err.strip(),
-                )
-        zone_interfaces = [iface for iface in zone_interfaces if iface]
-        if not zone_interfaces:
-            continue
-
-        requires_override = False
-        for interface in zone_interfaces:
-            if _interface_has_odd_third_octet(
-                guest_executor, interface, interface_cache
-            ):
-                requires_override = True
-                break
-        if not requires_override:
-            continue
-
-        rich_exit, rich_stdout, rich_err = guest_executor(
-            f"firewall-cmd --permanent --zone={shlex.quote(zone)} --list-rich-rules",
-            check_exit_code=False,
-        )
-        if rich_exit != 0:
-            detail = (rich_err or "").strip() or rich_exit
-            print(f"   [WARN] Unable to list rich rules for zone '{zone}': {detail}")
+        if not zone_success:
             overall_success = False
-            continue
-        current_rules = [
-            rule.strip() for rule in (rich_stdout or "").splitlines() if rule.strip()
-        ]
-        services_exit, services_stdout, services_err = guest_executor(
-            f"firewall-cmd --permanent --zone={shlex.quote(zone)} --list-services",
-            check_exit_code=False,
-        )
-        if services_exit == 0:
-            services = {
-                entry.strip()
-                for entry in (services_stdout or "").split()
-                if entry.strip()
-            }
-            if "ssh" in services:
-                print(
-                    f"   -> Zone '{zone}' already exposes SSH service broadly; skipping updates to preserve configuration."
-                )
-                continue
-        else:
-            if services_err:
-                LOGGER.debug(
-                    "Failed to list firewalld services for zone '%s': %s",
-                    zone,
-                    services_err.strip(),
-                )
-        if rule_value in current_rules:
-            print(
-                f"   -> Zone '{zone}' already allows SSH from {SSH_OVERRIDE_SOURCE_IP}."
-            )
-            continue
-        conflicting_rules = [
-            rule
-            for rule in current_rules
-            if 'service name="ssh"' in rule
-            and f'source address="{SSH_OVERRIDE_SOURCE_IP}"' not in rule
-        ]
-        if conflicting_rules:
-            print(
-                f"   -> Zone '{zone}' has existing SSH rich rules; skipping to avoid altering configuration."
-            )
-            continue
-
-        zone_file = f"/etc/firewalld/zones/{zone}.xml"
-        backup_path = f"{zone_file}-{timestamp}.bak"
-        backup_created = False
-
-        def _ensure_zone_backup(
-            zone_file_path: str = zone_file,
-            backup_path_value: str = backup_path,
-        ) -> bool:
-            nonlocal backup_created, overall_success
-            if backup_created:
-                return True
-            exists_exit, _, _ = guest_executor(
-                f"test -f {shlex.quote(zone_file_path)}",
-                check_exit_code=False,
-            )
-            if exists_exit != 0:
-                backup_created = True
-                return True
-            backup_cmd = (
-                f"[ -f {shlex.quote(backup_path_value)} ] || "
-                f"cp {shlex.quote(zone_file_path)} {shlex.quote(backup_path_value)}"
-            )
-            backup_exit, _, backup_err = guest_executor(
-                backup_cmd, check_exit_code=False
-            )
-            if backup_exit != 0:
-                detail = (backup_err or "").strip() or backup_exit
-                print(
-                    f"   [WARN] Unable to back up firewalld zone file '{zone_file_path}': {detail}"
-                )
-                overall_success = False
-                return False
-            backup_created = True
-            return True
-
-        if not _ensure_zone_backup():
-            continue
-
-        add_exit, _, add_err = guest_executor(
-            f"firewall-cmd --permanent --zone={shlex.quote(zone)} "
-            f"--add-rich-rule={shlex.quote(rule_value)}",
-            check_exit_code=False,
-        )
-        if add_exit != 0:
-            detail = (add_err or "").strip() or add_exit
-            print(f"   [WARN] Failed to add SSH rich rule to zone '{zone}': {detail}")
-            overall_success = False
-            continue
-
-        zones_updated.append(zone)
-        print(
-            f"   -> Added SSH rich rule for {SSH_OVERRIDE_SOURCE_IP} to zone '{zone}'."
-        )
+        if updated:
+            zones_updated.append(zone)
 
     if zones_updated:
         reload_exit, _, reload_err = guest_executor(
@@ -2936,7 +3009,10 @@ def _sync_prd_system_configuration(
 
 def _ensure_http_proxy_configuration(guest_executor, timestamp: str) -> bool:
     """Ensure /etc/profile exports http/https proxy variables when they are missing."""
-    proxy_url = "http://172.16.162.6:3128"
+    proxy_url = PROXY_URL
+    if not proxy_url:
+        print("   -> Proxy configuration disabled for this environment.")
+        return True
     profile_path = "/etc/profile"
     if _guest_path_protected(profile_path):
         print(
@@ -4299,26 +4375,7 @@ class CloneAndVmotionWorkflow:
         raise NotImplementedError
 
 
-WORKFLOW_PHASES_PATH = SCHEMA_DIR / "workflow_phases.json"
-
-
-def _validate_phase_schema(phases: List[Dict[str, str]]) -> None:
-    """Validate the workflow phase schema against a minimal JSON schema."""
-    for phase in phases:
-        if not isinstance(phase, dict):
-            raise ValueError("Each workflow phase must be a JSON object.")
-        if set(phase.keys()) - {"id", "handler"}:
-            raise ValueError(f"Unexpected keys in workflow phase: {phase}")
-        if "id" not in phase or "handler" not in phase:
-            raise ValueError(f"Missing required keys in workflow phase: {phase}")
-        if not isinstance(phase["id"], str) or not isinstance(phase["handler"], str):
-            raise ValueError(f"Workflow phase entries must be strings: {phase}")
-
-
-WORKFLOW_PHASES_SCHEMA: List[Dict[str, str]] = json.loads(
-    WORKFLOW_PHASES_PATH.read_text(encoding="utf-8")
-)
-_validate_phase_schema(WORKFLOW_PHASES_SCHEMA)
+WORKFLOW_PHASES_SCHEMA: List[Dict[str, str]] = load_workflow_phase_schema(SCHEMA_DIR)
 
 
 def _apply_cli_configuration(cli_args: argparse.Namespace) -> str:

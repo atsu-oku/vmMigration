@@ -1,0 +1,29 @@
+[
+  {
+    "id": "legacy-prd",
+    "description": "現行 PRD 環境",
+    "cluster": "PRD-Cluster",
+    "primary_datastore": "PMAX-COM-VOL1",
+    "final_datastore": "PMAX-PRD-VOL1",
+    "proxy_url": "http://172.16.162.6:3128",
+    "ssh_allowed_source_ip": "172.16.164.7"
+  },
+  {
+    "id": "new-stg",
+    "description": "新基盤 STG 環境",
+    "cluster": "NEW-STG-CLUSTER",
+    "primary_datastore": "NEW-STG-DATASTORE",
+    "final_datastore": "NEW-STG-DATASTORE",
+    "proxy_url": "http://172.16.200.6:3128",
+    "ssh_allowed_source_ip": "172.16.200.7"
+  },
+  {
+    "id": "new-prd",
+    "description": "新基盤 PRD 環境",
+    "cluster": "NEW-PRD-CLUSTER",
+    "primary_datastore": "NEW-PRD-STAGING-DS",
+    "final_datastore": "NEW-PRD-FINAL-DS",
+    "proxy_url": "http://172.16.210.6:3128",
+    "ssh_allowed_source_ip": "172.16.210.7"
+  }
+]
