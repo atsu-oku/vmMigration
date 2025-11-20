@@ -154,6 +154,27 @@ def _is_link_local_address(address: Optional[str]) -> bool:
         return False
 
 
+def _convert_stg_ipv4_to_prd(ip_value: Optional[str]) -> Optional[str]:
+    """Convert STG IPv4 addresses into their PRD counterparts when applicable."""
+    if not ip_value:
+        return None
+    try:
+        return calculate_ip_stg_to_prd(str(ip_value)) or str(ip_value)
+    except ValueError:
+        return str(ip_value)
+
+
+def _convert_dns_entries(entries: Iterable[str]) -> List[str]:
+    """Convert DNS servers from STG to PRD space while preserving order."""
+    converted: List[str] = []
+    for entry in entries:
+        if not entry:
+            continue
+        converted_entry = _convert_stg_ipv4_to_prd(entry) or entry
+        converted.append(converted_entry)
+    return dedupe_preserving_order(converted)
+
+
 SUCCESS_EVENTS: List[str] = []
 FAILURE_EVENTS: List[str] = []
 
@@ -218,6 +239,7 @@ except KeyError as exc:
     ) from exc
 
 TARGET_DATASTORE_NAME = CURRENT_ENVIRONMENT.primary_datastore
+TARGET_DATASTORE_NAME_FINAL = CURRENT_ENVIRONMENT.final_datastore
 TARGET_CLUSTER_NAME = CURRENT_ENVIRONMENT.cluster
 PROXY_URL = CURRENT_ENVIRONMENT.proxy_url
 
@@ -743,11 +765,13 @@ try:
         compact_interface_name,
         collect_interface_inventory,
         configure_interface_without_nmcli,
+        determine_prd_static_routes,
         derive_fallback_gateway,
         derive_gateway_from_octet_rule,
         find_gateway_owner_index,
         infer_gateway_from_routes,
         make_nmcli_detail_fetcher,
+        mask_to_prefix,
         parse_nmcli_connection_output,
         prefix_to_subnet_mask,
         select_default_gateway_route,
@@ -756,6 +780,7 @@ try:
         extract_dns_servers_from_state,
         extract_routes_from_sdk_payload,
         transform_text_to_prd,
+        verify_destination_network_with_sdk,
     )
 except ModuleNotFoundError as import_error:
     try:
@@ -769,11 +794,13 @@ except ModuleNotFoundError as import_error:
     compact_interface_name = network_utils.compact_interface_name
     collect_interface_inventory = network_utils.collect_interface_inventory
     configure_interface_without_nmcli = network_utils.configure_interface_without_nmcli
+    determine_prd_static_routes = network_utils.determine_prd_static_routes
     derive_fallback_gateway = network_utils.derive_fallback_gateway
     derive_gateway_from_octet_rule = network_utils.derive_gateway_from_octet_rule
     find_gateway_owner_index = network_utils.find_gateway_owner_index
     infer_gateway_from_routes = network_utils.infer_gateway_from_routes
     make_nmcli_detail_fetcher = network_utils.make_nmcli_detail_fetcher
+    mask_to_prefix = network_utils.mask_to_prefix
     parse_nmcli_connection_output = network_utils.parse_nmcli_connection_output
     prefix_to_subnet_mask = network_utils.prefix_to_subnet_mask
     select_default_gateway_route = network_utils.select_default_gateway_route
@@ -782,6 +809,7 @@ except ModuleNotFoundError as import_error:
     extract_dns_servers_from_state = network_utils.extract_dns_servers_from_state
     extract_routes_from_sdk_payload = network_utils.extract_routes_from_sdk_payload
     transform_text_to_prd = network_utils.transform_text_to_prd
+    verify_destination_network_with_sdk = network_utils.verify_destination_network_with_sdk
 
 
 # ------------------------------------------------
@@ -963,14 +991,6 @@ if VCSA_HOST_DEST != "vcsa01p.ipet.local":
         ENV_DEST_HOST_VAR,
         VCSA_HOST_DEST,
     )
-
-# --- Migration Resources ---
-# Datastore used to stage the clone
-TARGET_DATASTORE_NAME = "PMAX-COM-VOL1"
-# Final datastore after migration
-TARGET_DATASTORE_NAME_FINAL = "PMAX-PRD-VOL1"
-# Destination cluster for compute resources
-TARGET_CLUSTER_NAME = "PRD-Cluster"
 
 # --- Guest OS Credentials ---
 GUEST_ROOT_USER = "root"
@@ -1844,6 +1864,24 @@ def wait_for_vm_availability(content, name, retries=30, delay_seconds=2):
             return vm
         time.sleep(max(1, delay_seconds))
     raise RuntimeError(f"Destination vCenter did not contain VM '{name}' (timed out).")
+
+
+def _wait_for_guest_tools(vm, *, timeout_seconds: float = 600.0, poll_interval: float = 5.0) -> bool:
+    """Poll until VMware Tools reports 'guestToolsRunning', returning True when ready."""
+    deadline = time.time() + max(1.0, timeout_seconds)
+    while time.time() < deadline:
+        tools_status = getattr(getattr(vm, "guest", None), "toolsRunningStatus", None)
+        if tools_status == "guestToolsRunning":
+            return True
+        time.sleep(max(0.5, poll_interval))
+        try:
+            if hasattr(vm, "UpdateViewData"):
+                vm.UpdateViewData()  # type: ignore[attr-defined]
+            else:
+                vm.Reload()
+        except Exception:  # pylint: disable=broad-exception-caught
+            LOGGER.debug("Guest tools poll refresh failed; continuing to wait.", exc_info=True)
+    return False
 
 
 def _collect_interface_lookup(
@@ -3189,6 +3227,7 @@ class WorkflowState:
     original_nic_info: List[NicPlanType] = field(default_factory=list)
     original_dns_servers: List[str] = field(default_factory=list)
     original_default_gateway: Optional[str] = None
+    prd_default_gateway: Optional[str] = None
     original_default_gateway_source: Optional[str] = None
     default_gateway_owner_idx: Optional[int] = None
     original_static_routes: List[Dict[str, Any]] = field(default_factory=list)
@@ -4399,19 +4438,332 @@ class CloneAndVmotionWorkflow:
 
     def _configure_destination_network(self) -> None:
         """Configure guest networking on the destination VM after registration."""
-        raise NotImplementedError
+        print("\n--- [Phase 5/7] Destination Guest: Configure Network ---")
+        state = self.state
+        if not state.original_nic_info:
+            print("   - Skipping network configuration because no NIC information is available.")
+            return
+
+        self._ensure_dest_session_alive(refresh_content=True, refresh_vm=True)
+        migrated_vm = state.migrated_vm
+        if not migrated_vm or not self.content_dest:
+            raise RuntimeError("Destination VM context is missing; NIC configuration cannot continue.")
+
+        runtime = getattr(migrated_vm, "runtime", None)
+        power_state = getattr(runtime, "powerState", None)
+        if power_state != "poweredOn":
+            print("   -> Powering on destination VM to configure guest networking...")
+            task = migrated_vm.PowerOn()
+            wait_for_task_completion(
+                task,
+                "Destination VM power-on task",
+                poll_interval=5.0,
+                timeout=900.0,
+                progress_label="Guest power-on progress",
+            )
+            print("   [OK] Destination VM powered on.")
+        print("   -> Waiting for VMware Tools inside the destination guest...")
+        if not _wait_for_guest_tools(migrated_vm):
+            raise TimeoutError(
+                "VMware Tools did not report a running state within the expected time window."
+            )
+        print("   [OK] VMware Tools is responding; proceeding with guest configuration.")
+        guest_operations_manager = getattr(self.content_dest, "guestOperationsManager", None)
+        if guest_operations_manager is None:
+            raise RuntimeError("Guest operations manager unavailable on destination vCenter.")
+
+        reset_root_login_disabled()
+        sdk_client: Optional[VsphereGuestNetworkSDKType] = None
+        vm_moid = getattr(migrated_vm, "_moId", None)
+
+        try:
+            root_credentials = vim.vm.guest.NamePasswordAuthentication(
+                username=GUEST_ROOT_USER,
+                password=self.guest_root_pwd,
+            )
+            admin_credentials = None
+            if GUEST_ADMIN_USER and self.guest_admin_pwd:
+                admin_credentials = vim.vm.guest.NamePasswordAuthentication(
+                    username=GUEST_ADMIN_USER,
+                    password=self.guest_admin_pwd,
+                )
+
+            def guest_executor(command: str, check_exit_code: bool = True):
+                return execute_command_in_guest(
+                    guest_operations_manager,
+                    migrated_vm,
+                    root_credentials,
+                    admin_credentials,
+                    self.guest_admin_pwd,
+                    command,
+                    check_exit_code=check_exit_code,
+                )
+
+            nmcli_probe, _, _ = guest_executor("command -v nmcli", check_exit_code=False)
+            nmcli_supported = nmcli_probe == 0
+
+            for nic_plan in state.original_nic_info:
+                converted_ip = _convert_stg_ipv4_to_prd(
+                    nic_plan.get("prd_ip_address") or nic_plan.get("ip_address")
+                )
+                if converted_ip:
+                    nic_plan["prd_ip_address"] = converted_ip
+                    try:
+                        nic_plan["prd_ip_segment"] = int(converted_ip.split(".")[2])
+                    except (ValueError, IndexError):
+                        nic_plan["prd_ip_segment"] = None
+
+            prd_default_gateway = _convert_stg_ipv4_to_prd(state.original_default_gateway)
+            state.prd_default_gateway = prd_default_gateway
+            state.prd_static_routes = determine_prd_static_routes(
+                state.original_nic_info,
+                prd_default_gateway,
+                state.original_static_routes,
+            )
+
+            configured_route_indices: Set[int] = set()
+            gateway_nic_present = any(
+                nic.get("is_gateway_nic") for nic in state.original_nic_info
+            )
+            overall_dns_targets = _convert_dns_entries(state.original_dns_servers)
+            if REQUESTS_AVAILABLE and vm_moid:
+                try:
+                    sdk_client = VsphereGuestNetworkSDK(
+                        host=VCSA_HOST_DEST,
+                        username=VCSA_USER,
+                        password=self.vcsa_pwd_dest,
+                        verify_ssl=False,
+                    )
+                except Exception as sdk_error:  # pylint: disable=broad-exception-caught
+                    LOGGER.debug(
+                        "Unable to initialize guest networking SDK verification: %s",
+                        sdk_error,
+                        exc_info=True,
+                    )
+                    sdk_client = None
+
+            for nic_index, nic_plan in enumerate(state.original_nic_info, start=1):
+                print(f"\n  -> Configuring NIC {nic_index} ({nic_plan.get('network_name')})")
+                target_mac = nic_plan.get("new_mac_address") or nic_plan.get("mac_address")
+                interface_context = prepare_guest_interface(
+                    nic_index - 1, nic_plan, guest_executor, target_mac
+                )
+                device_name = interface_context.device_name
+                connection_name = nic_plan.get("original_ifname") or device_name
+                con_name = f"{connection_name}-prd"
+
+                new_ip = nic_plan.get("prd_ip_address") or _convert_stg_ipv4_to_prd(
+                    nic_plan.get("ip_address")
+                )
+                prefix = nic_plan.get("subnet_prefix")
+                if prefix is None:
+                    prefix = mask_to_prefix(cast(Optional[str], nic_plan.get("subnet_mask")))
+
+                expected_gateway_value = nic_plan.get("gateway")
+                if expected_gateway_value:
+                    expected_gateway_value = (
+                        _convert_stg_ipv4_to_prd(expected_gateway_value) or expected_gateway_value
+                    )
+                elif nic_plan.get("is_gateway_nic"):
+                    expected_gateway_value = prd_default_gateway
+
+                new_dns_servers = _convert_dns_entries(nic_plan.get("dns_servers", []))
+                if not new_dns_servers:
+                    new_dns_servers = overall_dns_targets[:] or _convert_dns_entries(
+                        state.original_dns_servers
+                    )
+
+                routes_for_nic = _collect_routes_for_nic(
+                    state.prd_static_routes,
+                    configured_route_indices,
+                    nic_index - 1,
+                )
+                should_configure_routes = _should_configure_routes_for_nic(
+                    prd_default_gateway,
+                    new_ip,
+                    prefix,
+                    routes_for_nic,
+                    gateway_nic_present,
+                    nic_index - 1,
+                )
+
+                params = NmcliConfigParams(
+                    guest_command_executor=guest_executor,
+                    device_name=device_name,
+                    con_name=con_name,
+                    nmcli_supported=nmcli_supported,
+                    new_mac_lower=interface_context.new_mac_lower,
+                    original_mac_lower=interface_context.original_mac_lower,
+                    expected_gateway_value=expected_gateway_value,
+                    new_dns_servers=new_dns_servers,
+                    should_configure_routes=should_configure_routes,
+                    routes_for_nic=routes_for_nic,
+                    new_ip=new_ip,
+                    prefix=prefix,
+                    expected_dns_servers=new_dns_servers or overall_dns_targets,
+                    expected_dns_overall=overall_dns_targets or new_dns_servers,
+                    guest_iface_names=interface_context.interface_names,
+                    guest_iface_names_compact=interface_context.interface_names_compact,
+                )
+
+                config_result = _configure_nic_with_nmcli(params)
+                configured_route_indices.update(config_result.route_indices)
+                if config_result.expected_dns_overall:
+                    overall_dns_targets = config_result.expected_dns_overall
+
+                if config_result.use_nmcli_connection and new_ip and prefix is not None:
+                    try:
+                        verify_nmcli_connection_settings(
+                            guest_executor,
+                            con_name,
+                            device_name,
+                            f"{new_ip}/{prefix}",
+                            expected_gateway_value,
+                            config_result.route_lines,
+                            config_result.expected_dns_servers or new_dns_servers,
+                        )
+                    except Exception as verify_error:  # pylint: disable=broad-exception-caught
+                        LOGGER.debug(
+                            "nmcli verification reported issues for %s: %s",
+                            con_name,
+                            verify_error,
+                            exc_info=True,
+                        )
+
+                if config_result.legacy_verification_command and not config_result.legacy_success:
+                    print(
+                        "   [WARN] Legacy network configuration could not be fully verified; "
+                        "please confirm connectivity manually."
+                    )
+                else:
+                    log_success(f"Configured destination NIC {nic_index} ({device_name}).")
+
+            if sdk_client and vm_moid:
+                verify_destination_network_with_sdk(
+                    sdk_client,
+                    vm_moid,
+                    state.original_nic_info,
+                    overall_dns_targets,
+                    state.prd_static_routes,
+                )
+
+            print("   -> Synchronising guest system configuration with PRD expectations...")
+            if _sync_prd_system_configuration(guest_executor, state.source_firewalld_zones):
+                log_success("Guest OS configuration synchronized with PRD mappings.")
+            else:
+                log_failure("Guest OS configuration sync reported warnings.")
+        finally:
+            if sdk_client:
+                try:
+                    sdk_client.close()
+                except Exception:  # pylint: disable=broad-exception-caught
+                    LOGGER.debug("Failed to close SDK client", exc_info=True)
+            reset_root_login_disabled()
 
     def _perform_storage_vmotion(self) -> None:
-        raise NotImplementedError
+        print("\n--- [Phase 6/7] Storage vMotion ---")
+        final_datastore_name = TARGET_DATASTORE_NAME_FINAL or TARGET_DATASTORE_NAME
+        if not final_datastore_name:
+            print("   - Skipping Storage vMotion because no final datastore is configured.")
+            return
+
+        self._ensure_dest_session_alive(refresh_content=True, refresh_vm=True)
+        state = self.state
+        migrated_vm = state.migrated_vm
+        if not migrated_vm or not self.content_dest:
+            raise RuntimeError("Destination VM is unavailable; cannot start Storage vMotion.")
+
+        if any(
+            getattr(ds, "name", "").strip() == final_datastore_name
+            for ds in getattr(migrated_vm, "datastore", []) or []
+        ):
+            print(f"   -> VM already resides on datastore '{final_datastore_name}'.")
+            return
+
+        datastore_view = self.content_dest.viewManager.CreateContainerView(
+            self.content_dest.rootFolder,
+            [vim.Datastore],
+            True,
+        )
+        try:
+            final_datastore = next(
+                (ds for ds in datastore_view.view if ds.name == final_datastore_name),
+                None,
+            )
+        finally:
+            datastore_view.Destroy()
+
+        if not final_datastore:
+            raise FileNotFoundError(
+                f"Final datastore '{final_datastore_name}' was not found on the destination vCenter."
+            )
+
+        print(f"   -> Initiating Storage vMotion to '{final_datastore_name}'...")
+        relocate_spec = vim.vm.RelocateSpec(datastore=final_datastore)
+        task = migrated_vm.RelocateVM_Task(spec=relocate_spec)
+        wait_for_task_completion(
+            task,
+            "Storage vMotion task",
+            poll_interval=5.0,
+            timeout=7200.0,
+            progress_label="Storage vMotion progress",
+        )
+        state.target_datastore = final_datastore
+        log_success(f"Storage vMotion to '{final_datastore_name}' completed.")
+        print("   [OK] Storage vMotion completed.")
 
     def _finalize_success(self) -> None:
-        raise NotImplementedError
+        print("\n--- [Phase 7/7] Finalize & Summary ---")
+        self._ensure_dest_session_alive(refresh_content=False, refresh_vm=False)
+        state = self.state
+        vm_name = state.clone_name or getattr(state.migrated_vm, "name", None) or "(unknown)"
+        print(f"   -> Migration workflow completed for VM '{vm_name}'.")
+        log_success("Migration workflow completed successfully.")
 
     def _handle_error(self, error: Exception) -> None:
-        raise NotImplementedError
+        print(f"\n[ERROR] {error}")
+        log_failure(str(error))
+        rollback_vm_name = (
+            self.state.migrated_vm_name_for_rollback
+            or self.state.clone_name
+        )
+        try:
+            self.si_dest, self.state.dest_keepalive_handle = _ensure_destination_session(
+                self.si_dest,
+                self.state.dest_keepalive_handle,
+                self.ctx,
+            )
+            if rollback_vm_name:
+                _delete_destination_vm(
+                    self.si_dest,
+                    rollback_vm_name,
+                    cause=error,
+                )
+        except Exception as rollback_error:  # pylint: disable=broad-exception-caught
+            LOGGER.error("Rollback failed: %s", rollback_error, exc_info=True)
+        raise
 
     def _cleanup(self) -> None:
-        raise NotImplementedError
+        state = self.state
+        if state.source_keepalive_handle:
+            _stop_keepalive_thread(state.source_keepalive_handle)
+            state.source_keepalive_handle = None
+        if state.dest_keepalive_handle:
+            _stop_keepalive_thread(state.dest_keepalive_handle)
+            state.dest_keepalive_handle = None
+        if self.si_source is not None:
+            try:
+                Disconnect(self.si_source)
+            except Exception:  # pylint: disable=broad-exception-caught
+                LOGGER.debug("Error disconnecting source vCenter session", exc_info=True)
+            self.si_source = None
+        if self.si_dest is not None:
+            try:
+                Disconnect(self.si_dest)
+            except Exception:  # pylint: disable=broad-exception-caught
+                LOGGER.debug("Error disconnecting destination vCenter session", exc_info=True)
+            self.si_dest = None
+        _print_execution_summary()
 
 
 WORKFLOW_PHASES_SCHEMA: List[Dict[str, str]] = load_workflow_phase_schema(SCHEMA_DIR)
