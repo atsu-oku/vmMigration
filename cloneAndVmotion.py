@@ -20,6 +20,7 @@ from datetime import datetime
 import importlib.util
 import posixpath
 from pathlib import Path
+from types import ModuleType
 from typing import (
     Any,
     Callable,
@@ -39,16 +40,55 @@ from typing import (
 
 from pyVim.connect import SmartConnect, Disconnect
 from pyVmomi import vim, vmodl  # type: ignore[import]
-from environment_schema import EnvironmentConfig, load_environment_definitions
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
 
 
-T = TypeVar("T")
+def _load_environment_schema_module() -> ModuleType:
+    """Load environment_schema without relying on external PYTHONPATH tweaks."""
+    module_name = "environment_schema"
+    existing = sys.modules.get(module_name)
+    if existing is not None:
+        return existing
+    module_path = PROJECT_ROOT / f"{module_name}.py"
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(
+            f"Unable to locate '{module_name}.py' relative to {PROJECT_ROOT}"
+        )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_workflow_schema_module() -> ModuleType:
+    """Load workflow_schema using the same local-module loading strategy."""
+    module_name = "workflow_schema"
+    existing = sys.modules.get(module_name)
+    if existing is not None:
+        return existing
+    module_path = PROJECT_ROOT / f"{module_name}.py"
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Unable to locate '{module_name}.py' relative to {PROJECT_ROOT}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_environment_schema = _load_environment_schema_module()
+EnvironmentConfig = getattr(_environment_schema, "EnvironmentConfig")
+load_environment_definitions = getattr(
+    _environment_schema, "load_environment_definitions"
+)
+_workflow_schema = _load_workflow_schema_module()
+load_workflow_phase_schema = getattr(_workflow_schema, "load_workflow_phase_schema")
+
 
 if TYPE_CHECKING:
+    from environment_schema import EnvironmentConfig as EnvironmentConfigType
     import nic_schema as nic_schema_types
     import firewalld_schema as firewalld_schema_types
     import vsphere_sdk_network as vsphere_sdk_network_types
@@ -58,10 +98,13 @@ if TYPE_CHECKING:
     RouteConfigType = vsphere_sdk_network_types.RouteConfig
     VsphereGuestNetworkSDKType = vsphere_sdk_network_types.VsphereGuestNetworkSDK
 else:
+    EnvironmentConfigType = Any
     NicPlanType = Any
     FirewalldZonePlanType = Any
     RouteConfigType = Any
     VsphereGuestNetworkSDKType = Any
+
+T = TypeVar("T")
 
 LINK_LOCAL_PREFIX = ipaddress.ip_network("169.254.0.0/16")
 
@@ -93,9 +136,10 @@ def _is_link_local_network(network_value: str, prefix: int) -> bool:
             network_value if "/" in network_value else f"{network_value}/{prefix}"
         )
         candidate = ipaddress.ip_network(network_spec, strict=False)
-        return isinstance(candidate, ipaddress.IPv4Network) and candidate.subnet_of(
-            LINK_LOCAL_PREFIX
-        )
+        if isinstance(candidate, ipaddress.IPv4Network):
+            ipv4_candidate = cast(ipaddress.IPv4Network, candidate)
+            return ipv4_candidate.subnet_of(LINK_LOCAL_PREFIX)
+        return False
     except ValueError:
         return False
 
@@ -161,12 +205,12 @@ COMMAND_EXECUTION_LOG: List[CommandLogEntry] = []
 COMMAND_DESCRIPTION_OVERRIDES: Dict[str, str] = {}
 
 SCHEMA_DIR = PROJECT_ROOT / "schemas"
-ENVIRONMENT_DEFINITIONS: Dict[str, EnvironmentConfig] = load_environment_definitions(
+ENVIRONMENT_DEFINITIONS: Dict[str, EnvironmentConfigType] = load_environment_definitions(
     SCHEMA_DIR
 )
 ENVIRONMENT_ID = _get_env_override("VSPHERE_ENVIRONMENT_ID", "legacy-prd")
 try:
-    CURRENT_ENVIRONMENT: EnvironmentConfig = ENVIRONMENT_DEFINITIONS[ENVIRONMENT_ID]
+    CURRENT_ENVIRONMENT: EnvironmentConfigType = ENVIRONMENT_DEFINITIONS[ENVIRONMENT_ID]
 except KeyError as exc:
     available = ", ".join(sorted(ENVIRONMENT_DEFINITIONS))
     raise RuntimeError(
@@ -220,7 +264,9 @@ def _describe_command_tool_lookup(
     return None
 
 
-def _describe_firewall_cmd(tokens: List[str], first_line: str, base_name: str) -> Optional[str]:
+def _describe_firewall_cmd(
+    tokens: List[str], first_line: str, base_name: str
+) -> Optional[str]:
     if base_name != "firewall-cmd":
         return None
     zone = _normalize_token(_extract_option_value(tokens, "--zone"))
@@ -241,7 +287,9 @@ def _describe_firewall_cmd(tokens: List[str], first_line: str, base_name: str) -
     return f"firewalld コマンドを実行 ({first_line})"
 
 
-def _describe_nmcli(tokens: List[str], first_line: str, base_name: str) -> Optional[str]:
+def _describe_nmcli(
+    tokens: List[str], first_line: str, base_name: str
+) -> Optional[str]:
     if base_name != "nmcli" or len(tokens) < 2:
         return None
     subcommand = tokens[1]
@@ -273,7 +321,9 @@ def _describe_nmcli(tokens: List[str], first_line: str, base_name: str) -> Optio
     return f"nmcli コマンドを実行 ({first_line})"
 
 
-def _describe_systemctl(tokens: List[str], first_line: str, base_name: str) -> Optional[str]:
+def _describe_systemctl(
+    tokens: List[str], first_line: str, base_name: str
+) -> Optional[str]:
     if base_name != "systemctl" or len(tokens) < 2:
         return None
     action = tokens[1]
@@ -377,7 +427,9 @@ def _describe_simple_command(
     if base_name == "cat" and len(tokens) >= 2:
         return f"{_normalize_token(tokens[1])} の内容を表示"
     if base_name == "cp" and len(tokens) >= 3:
-        return f"{_normalize_token(tokens[1])} を {_normalize_token(tokens[2])} にコピー"
+        return (
+            f"{_normalize_token(tokens[1])} を {_normalize_token(tokens[2])} にコピー"
+        )
     if base_name == "mv" and len(tokens) >= 3:
         return f"{_normalize_token(tokens[1])} を {_normalize_token(tokens[2])} に移動"
     if base_name == "rm":
@@ -440,6 +492,7 @@ def _describe_command(command: str) -> str:
 
     return f"Execute command: {first_line}"
 
+
 def register_command_execution(command: str) -> None:
     """Record the raw command and its human-readable description."""
     description = COMMAND_DESCRIPTION_OVERRIDES.pop(command, None)
@@ -473,11 +526,11 @@ def _tracking_print(*args, **kwargs) -> None:
     message = sep.join(str(arg) for arg in args)
     normalized = message.lstrip()
     if normalized.startswith("[OK]"):
-        log_success(normalized[len("[OK]"):].strip())
+        log_success(normalized[len("[OK]") :].strip())
     elif normalized.startswith("[WARN]"):
-        log_failure(normalized[len("[WARN]"):].strip())
+        log_failure(normalized[len("[WARN]") :].strip())
     elif normalized.startswith("[ERROR]"):
-        log_failure(normalized[len("[ERROR]"):].strip())
+        log_failure(normalized[len("[ERROR]") :].strip())
     _ORIGINAL_PRINT(*args, **kwargs)
 
 
@@ -685,7 +738,6 @@ try:
     from network_utils import (  # type: ignore[import]
         NMCLI_FIELDS_NO_TYPE,
         NMCLI_FIELDS_WITH_TYPE,
-        SSH_ALLOWED_SOURCE_IP,
         LEGACY_INTERFACE_PATTERN,
         calculate_ip_stg_to_prd,
         compact_interface_name,
@@ -712,7 +764,6 @@ except ModuleNotFoundError as import_error:
         raise import_error from load_error
     NMCLI_FIELDS_NO_TYPE = network_utils.NMCLI_FIELDS_NO_TYPE
     NMCLI_FIELDS_WITH_TYPE = network_utils.NMCLI_FIELDS_WITH_TYPE
-    SSH_ALLOWED_SOURCE_IP = network_utils.SSH_ALLOWED_SOURCE_IP
     LEGACY_INTERFACE_PATTERN = network_utils.LEGACY_INTERFACE_PATTERN
     calculate_ip_stg_to_prd = network_utils.calculate_ip_stg_to_prd
     compact_interface_name = network_utils.compact_interface_name
@@ -1220,7 +1271,9 @@ def _attempt_rest_guest_update(
         return False, False, True, None, []
 
 
-def _build_alias_targets(device_name: str, con_name: str) -> Tuple[str, Set[str], Set[str]]:
+def _build_alias_targets(
+    device_name: str, con_name: str
+) -> Tuple[str, Set[str], Set[str]]:
     device_name_normalized = device_name.lower()
     alias_targets = {
         value for value in (device_name_normalized, con_name.lower()) if value
@@ -1260,9 +1313,7 @@ def _connection_matches_alias(
         target in device_compact for target in alias_targets_compact
     ):
         return True
-    if name_compact and any(
-        target in name_compact for target in alias_targets_compact
-    ):
+    if name_compact and any(target in name_compact for target in alias_targets_compact):
         return True
     return False
 
@@ -1551,9 +1602,7 @@ def _configure_nmcli_connection(
     expected_dns_servers_local: List[str],
     expected_dns_overall_local: List[str],
 ) -> Tuple[List[int], List[str], List[str], List[str]]:
-    guest_command_executor(
-        f"ip addr flush dev {device_name}", check_exit_code=False
-    )
+    guest_command_executor(f"ip addr flush dev {device_name}", check_exit_code=False)
     guest_command_executor(
         f"nmcli connection add type ethernet con-name '{con_name}' "
         f"ifname '{device_name}' autoconnect no"
@@ -1566,12 +1615,14 @@ def _configure_nmcli_connection(
         expected_gateway_value=expected_gateway_value,
     )
     _configure_nmcli_ipv6_settings(guest_command_executor, con_name=con_name)
-    local_expected_dns_servers, local_expected_dns_overall = _configure_nmcli_dns_settings(
-        guest_command_executor,
-        con_name=con_name,
-        new_dns_servers=new_dns_servers,
-        expected_dns_servers_local=expected_dns_servers_local,
-        expected_dns_overall_local=expected_dns_overall_local,
+    local_expected_dns_servers, local_expected_dns_overall = (
+        _configure_nmcli_dns_settings(
+            guest_command_executor,
+            con_name=con_name,
+            new_dns_servers=new_dns_servers,
+            expected_dns_servers_local=expected_dns_servers_local,
+            expected_dns_overall_local=expected_dns_overall_local,
+        )
     )
     selected_route_indices, selected_route_lines = _configure_nmcli_routes(
         guest_command_executor,
@@ -2453,16 +2504,12 @@ def _interfaces_require_override(
     interface_cache: Dict[str, bool],
 ) -> bool:
     for interface in zone_interfaces:
-        if _interface_has_odd_third_octet(
-            guest_executor, interface, interface_cache
-        ):
+        if _interface_has_odd_third_octet(guest_executor, interface, interface_cache):
             return True
     return False
 
 
-def _fetch_rich_rules(
-    guest_executor, zone: str
-) -> Tuple[List[str], bool]:
+def _fetch_rich_rules(guest_executor, zone: str) -> Tuple[List[str], bool]:
     rich_exit, rich_stdout, rich_err = guest_executor(
         f"firewall-cmd --permanent --zone={shlex.quote(zone)} --list-rich-rules",
         check_exit_code=False,
@@ -2490,9 +2537,7 @@ def _zone_service_allows_ssh(guest_executor, zone: str) -> Tuple[bool, bool]:
             )
         return False, True
     services = {
-        entry.strip()
-        for entry in (services_stdout or "").split()
-        if entry.strip()
+        entry.strip() for entry in (services_stdout or "").split() if entry.strip()
     }
     return "ssh" in services, True
 
@@ -2518,9 +2563,7 @@ def _ensure_zone_backup(
         f"[ -f {shlex.quote(backup_path_value)} ] || "
         f"cp {shlex.quote(zone_file_path)} {shlex.quote(backup_path_value)}"
     )
-    backup_exit, _, backup_err = guest_executor(
-        backup_cmd, check_exit_code=False
-    )
+    backup_exit, _, backup_err = guest_executor(backup_cmd, check_exit_code=False)
     if backup_exit != 0:
         detail = (backup_err or "").strip() or backup_exit
         print(
@@ -2540,9 +2583,7 @@ def _add_ssh_rich_rule(guest_executor, zone: str, rule_value: str) -> bool:
         detail = (add_err or "").strip() or add_exit
         print(f"   [WARN] Failed to add SSH rich rule to zone '{zone}': {detail}")
         return False
-    print(
-        f"   -> Added SSH rich rule for {SSH_OVERRIDE_SOURCE_IP} to zone '{zone}'."
-    )
+    print(f"   -> Added SSH rich rule for {SSH_OVERRIDE_SOURCE_IP} to zone '{zone}'.")
     return True
 
 
@@ -2570,9 +2611,7 @@ def _process_zone_for_ssh_override(
         return True, False
 
     if SSH_OVERRIDE_RICH_RULE in current_rules:
-        print(
-            f"   -> Zone '{zone}' already allows SSH from {SSH_OVERRIDE_SOURCE_IP}."
-        )
+        print(f"   -> Zone '{zone}' already allows SSH from {SSH_OVERRIDE_SOURCE_IP}.")
         return True, False
 
     if _has_conflicting_ssh_rules(current_rules):
@@ -4475,6 +4514,7 @@ def main() -> None:
     target_vm_name = _resolve_target_vm_name(provided_source_vm_name)
     _prompt_guest_credentials()
     _execute_workflow(target_vm_name, ssl_context)
+
 
 if __name__ == "__main__":
     main()
