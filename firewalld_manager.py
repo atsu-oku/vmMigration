@@ -3,18 +3,74 @@
 
 from __future__ import annotations
 
+import importlib.util
 import ipaddress
+import sys
+from pathlib import Path
 from typing import Callable, Iterable, List
 
-from command_builders import (
-    build_firewall_add_port,
-    build_firewall_list_ports,
-    build_firewall_list_sources,
-    build_firewall_reload,
-    build_firewall_remove_port,
-)
-from config_comparer import diff_firewalld_ports, diff_firewalld_sources
-from firewalld_parser import FirewalldZone, resolve_service_ports
+PROJECT_ROOT = Path(__file__).resolve().parent
+
+
+def _load_local_module(module_name: str, filename: str):
+    """Load a sibling module without depending on PYTHONPATH."""
+    existing = sys.modules.get(module_name)
+    if existing is not None:
+        return existing
+    module_path = PROJECT_ROOT / filename
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Unable to locate '{filename}' relative to {PROJECT_ROOT}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+try:
+    from command_builders import (  # type: ignore[import]
+        build_firewall_add_port,
+        build_firewall_list_ports,
+        build_firewall_list_sources,
+        build_firewall_reload,
+        build_firewall_remove_port,
+    )
+except ModuleNotFoundError as import_error:
+    try:
+        command_builders = _load_local_module("command_builders", "command_builders.py")
+    except Exception as load_error:  # pylint: disable=broad-exception-caught
+        raise import_error from load_error
+    build_firewall_add_port = command_builders.build_firewall_add_port
+    build_firewall_list_ports = command_builders.build_firewall_list_ports
+    build_firewall_list_sources = command_builders.build_firewall_list_sources
+    build_firewall_reload = command_builders.build_firewall_reload
+    build_firewall_remove_port = command_builders.build_firewall_remove_port
+
+try:
+    from config_comparer import (  # type: ignore[import]
+        diff_firewalld_ports,
+        diff_firewalld_sources,
+    )
+except ModuleNotFoundError as import_error:
+    try:
+        config_comparer = _load_local_module("config_comparer", "config_comparer.py")
+    except Exception as load_error:  # pylint: disable=broad-exception-caught
+        raise import_error from load_error
+    diff_firewalld_ports = config_comparer.diff_firewalld_ports
+    diff_firewalld_sources = config_comparer.diff_firewalld_sources
+
+try:
+    from firewalld_parser import (  # type: ignore[import]
+        FirewalldZone,
+        resolve_service_ports,
+    )
+except ModuleNotFoundError as import_error:
+    try:
+        firewalld_parser = _load_local_module("firewalld_parser", "firewalld_parser.py")
+    except Exception as load_error:  # pylint: disable=broad-exception-caught
+        raise import_error from load_error
+    FirewalldZone = firewalld_parser.FirewalldZone
+    resolve_service_ports = firewalld_parser.resolve_service_ports
 
 LINK_LOCAL_PREFIX = ipaddress.ip_network("169.254.0.0/16")
 

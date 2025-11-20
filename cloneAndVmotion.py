@@ -20,13 +20,16 @@ from datetime import datetime
 import importlib.util
 import posixpath
 from pathlib import Path
+from types import ModuleType
 from typing import (
     Any,
+    Callable,
     Dict,
     Iterable,
     List,
     Mapping,
     Optional,
+    Sequence,
     Set,
     Tuple,
     Type,
@@ -39,13 +42,53 @@ from pyVim.connect import SmartConnect, Disconnect
 from pyVmomi import vim, vmodl  # type: ignore[import]
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
 
 
-T = TypeVar("T")
+def _load_environment_schema_module() -> ModuleType:
+    """Load environment_schema without relying on external PYTHONPATH tweaks."""
+    module_name = "environment_schema"
+    existing = sys.modules.get(module_name)
+    if existing is not None:
+        return existing
+    module_path = PROJECT_ROOT / f"{module_name}.py"
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(
+            f"Unable to locate '{module_name}.py' relative to {PROJECT_ROOT}"
+        )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_workflow_schema_module() -> ModuleType:
+    """Load workflow_schema using the same local-module loading strategy."""
+    module_name = "workflow_schema"
+    existing = sys.modules.get(module_name)
+    if existing is not None:
+        return existing
+    module_path = PROJECT_ROOT / f"{module_name}.py"
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Unable to locate '{module_name}.py' relative to {PROJECT_ROOT}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_environment_schema = _load_environment_schema_module()
+EnvironmentConfig = getattr(_environment_schema, "EnvironmentConfig")
+load_environment_definitions = getattr(
+    _environment_schema, "load_environment_definitions"
+)
+_workflow_schema = _load_workflow_schema_module()
+load_workflow_phase_schema = getattr(_workflow_schema, "load_workflow_phase_schema")
+
 
 if TYPE_CHECKING:
+    from environment_schema import EnvironmentConfig as EnvironmentConfigType
     import nic_schema as nic_schema_types
     import firewalld_schema as firewalld_schema_types
     import vsphere_sdk_network as vsphere_sdk_network_types
@@ -55,10 +98,13 @@ if TYPE_CHECKING:
     RouteConfigType = vsphere_sdk_network_types.RouteConfig
     VsphereGuestNetworkSDKType = vsphere_sdk_network_types.VsphereGuestNetworkSDK
 else:
+    EnvironmentConfigType = Any
     NicPlanType = Any
     FirewalldZonePlanType = Any
     RouteConfigType = Any
     VsphereGuestNetworkSDKType = Any
+
+T = TypeVar("T")
 
 LINK_LOCAL_PREFIX = ipaddress.ip_network("169.254.0.0/16")
 
@@ -90,9 +136,10 @@ def _is_link_local_network(network_value: str, prefix: int) -> bool:
             network_value if "/" in network_value else f"{network_value}/{prefix}"
         )
         candidate = ipaddress.ip_network(network_spec, strict=False)
-        return isinstance(candidate, ipaddress.IPv4Network) and candidate.subnet_of(
-            LINK_LOCAL_PREFIX
-        )
+        if isinstance(candidate, ipaddress.IPv4Network):
+            ipv4_candidate = cast(ipaddress.IPv4Network, candidate)
+            return ipv4_candidate.subnet_of(LINK_LOCAL_PREFIX)
+        return False
     except ValueError:
         return False
 
@@ -105,6 +152,27 @@ def _is_link_local_address(address: Optional[str]) -> bool:
         return ipaddress.ip_address(address) in LINK_LOCAL_PREFIX
     except ValueError:
         return False
+
+
+def _convert_stg_ipv4_to_prd(ip_value: Optional[str]) -> Optional[str]:
+    """Convert STG IPv4 addresses into their PRD counterparts when applicable."""
+    if not ip_value:
+        return None
+    try:
+        return calculate_ip_stg_to_prd(str(ip_value)) or str(ip_value)
+    except ValueError:
+        return str(ip_value)
+
+
+def _convert_dns_entries(entries: Iterable[str]) -> List[str]:
+    """Convert DNS servers from STG to PRD space while preserving order."""
+    converted: List[str] = []
+    for entry in entries:
+        if not entry:
+            continue
+        converted_entry = _convert_stg_ipv4_to_prd(entry) or entry
+        converted.append(converted_entry)
+    return dedupe_preserving_order(converted)
 
 
 SUCCESS_EVENTS: List[str] = []
@@ -132,8 +200,48 @@ class NmcliConfigResult:
     use_nmcli_connection: bool
 
 
+@dataclass
+class NmcliConfigParams:
+    """Input parameters required to configure a NIC via nmcli."""
+
+    guest_command_executor: Callable[..., Tuple[int, str, str]]
+    device_name: str
+    con_name: str
+    nmcli_supported: bool
+    new_mac_lower: str
+    original_mac_lower: str
+    expected_gateway_value: Optional[str]
+    new_dns_servers: List[str]
+    should_configure_routes: bool
+    routes_for_nic: List[Tuple[int, Dict[str, Any]]]
+    new_ip: Optional[str]
+    prefix: Optional[int]
+    expected_dns_servers: List[str]
+    expected_dns_overall: List[str]
+    guest_iface_names: Set[str]
+    guest_iface_names_compact: Set[str]
+
+
 COMMAND_EXECUTION_LOG: List[CommandLogEntry] = []
 COMMAND_DESCRIPTION_OVERRIDES: Dict[str, str] = {}
+
+SCHEMA_DIR = PROJECT_ROOT / "schemas"
+ENVIRONMENT_DEFINITIONS: Dict[str, EnvironmentConfigType] = load_environment_definitions(
+    SCHEMA_DIR
+)
+ENVIRONMENT_ID = _get_env_override("VSPHERE_ENVIRONMENT_ID", "legacy-prd")
+try:
+    CURRENT_ENVIRONMENT: EnvironmentConfigType = ENVIRONMENT_DEFINITIONS[ENVIRONMENT_ID]
+except KeyError as exc:
+    available = ", ".join(sorted(ENVIRONMENT_DEFINITIONS))
+    raise RuntimeError(
+        f"Unknown environment id '{ENVIRONMENT_ID}'. Available environments: {available}"
+    ) from exc
+
+TARGET_DATASTORE_NAME = CURRENT_ENVIRONMENT.primary_datastore
+TARGET_DATASTORE_NAME_FINAL = CURRENT_ENVIRONMENT.final_datastore
+TARGET_CLUSTER_NAME = CURRENT_ENVIRONMENT.cluster
+PROXY_URL = CURRENT_ENVIRONMENT.proxy_url
 
 
 def remember_command_description(command: str, description: str) -> None:
@@ -161,11 +269,222 @@ def _extract_key_value(tokens: List[str], key: str) -> Optional[str]:
     return None
 
 
+def _normalize_token(value: Optional[str]) -> Optional[str]:
+    """Strip surrounding quotes and whitespace from a token."""
+    if value is None:
+        return None
+    return value.strip().strip("'\"")
+
+
+def _describe_command_tool_lookup(
+    tokens: List[str],
+    base_name: str,
+) -> Optional[str]:
+    if base_name == "command" and len(tokens) >= 3 and tokens[1] == "-v":
+        tool = _normalize_token(tokens[2])
+        return f"{tool} コマンドの存在を確認"
+    return None
+
+
+def _describe_firewall_cmd(
+    tokens: List[str], first_line: str, base_name: str
+) -> Optional[str]:
+    if base_name != "firewall-cmd":
+        return None
+    zone = _normalize_token(_extract_option_value(tokens, "--zone"))
+    if "--list-sources" in tokens:
+        return f"firewalldゾーン {zone or 'default'} の許可送信アドレスを取得"
+    if "--list-interfaces" in tokens:
+        return f"firewalldゾーン {zone or 'default'} のインターフェース一覧を取得"
+    if "--add-rich-rule" in tokens:
+        return f"firewalldゾーン {zone or 'default'} にリッチルールを追加"
+    if "--remove-rich-rule" in tokens:
+        return f"firewalldゾーン {zone or 'default'} からリッチルールを削除"
+    if "--reload" in tokens:
+        return "firewalld 設定をリロード"
+    if "--get-zones" in tokens:
+        return "firewalld のゾーン一覧を取得"
+    if "--state" in tokens:
+        return "firewalld の稼働状態を確認"
+    return f"firewalld コマンドを実行 ({first_line})"
+
+
+def _describe_nmcli(
+    tokens: List[str], first_line: str, base_name: str
+) -> Optional[str]:
+    if base_name != "nmcli" or len(tokens) < 2:
+        return None
+    subcommand = tokens[1]
+    if subcommand == "connection":
+        action = tokens[2] if len(tokens) > 2 else ""
+        target = _normalize_token(tokens[3]) if len(tokens) > 3 else None
+        if action == "modify" and target:
+            address = _normalize_token(_extract_key_value(tokens, "ipv4.addresses"))
+            gateway = _normalize_token(_extract_key_value(tokens, "ipv4.gateway"))
+            method = _normalize_token(_extract_key_value(tokens, "ipv4.method"))
+            if address:
+                return f"接続 {target} に IP アドレス {address} を設定"
+            if gateway:
+                return f"接続 {target} にデフォルトゲートウェイ {gateway} を設定"
+            if method:
+                return f"接続 {target} の IPv4 方法を {method} に変更"
+            return f"接続 {target} の設定を変更"
+        if action == "up" and target:
+            return f"接続 {target} を有効化"
+        if action == "down" and target:
+            return f"接続 {target} を無効化"
+    if subcommand == "device" and len(tokens) > 2:
+        action = tokens[2]
+        device = _normalize_token(tokens[3]) if len(tokens) > 3 else None
+        if action == "status":
+            return "nmcli でデバイスの状態を確認"
+        if action == "show" and device:
+            return f"デバイス {device} の詳細を取得"
+    return f"nmcli コマンドを実行 ({first_line})"
+
+
+def _describe_systemctl(
+    tokens: List[str], first_line: str, base_name: str
+) -> Optional[str]:
+    if base_name != "systemctl" or len(tokens) < 2:
+        return None
+    action = tokens[1]
+    service = None
+    for token in tokens[2:]:
+        if not token.startswith("-"):
+            service = _normalize_token(token)
+            break
+    if action in {"is-active", "status"}:
+        return f"systemd サービス {service or '(指定なし)'} の状態を確認"
+    if action in {"restart", "start", "stop", "reload"}:
+        verb = {
+            "restart": "再起動",
+            "start": "起動",
+            "stop": "停止",
+            "reload": "リロード",
+        }[action]
+        return f"systemd サービス {service or '(指定なし)'} を{verb}"
+    if action in {"enable", "disable"}:
+        verb = "有効化" if action == "enable" else "無効化"
+        return f"systemd サービス {service or '(指定なし)'} を{verb}"
+    return f"systemctl {action} を実行 ({first_line})"
+
+
+def _describe_service(tokens: List[str], base_name: str) -> Optional[str]:
+    if base_name != "service" or len(tokens) < 3:
+        return None
+    target = _normalize_token(tokens[1])
+    action = tokens[2]
+    action_map = {
+        "restart": "再起動",
+        "start": "起動",
+        "stop": "停止",
+        "status": "状態を確認",
+        "reload": "リロード",
+    }
+    description = action_map.get(action, f"{action} を実行")
+    return f"サービス {target} を{description}"
+
+
+def _describe_ip(tokens: List[str], first_line: str, base_name: str) -> Optional[str]:
+    if base_name != "ip" or len(tokens) < 2:
+        return None
+    sub = tokens[1]
+    if sub == "link" and len(tokens) >= 4:
+        action = tokens[2]
+        iface = _normalize_token(tokens[3])
+        if action == "set" and iface:
+            if "down" in tokens:
+                return f"インターフェース {iface} をダウン"
+            if "up" in tokens:
+                return f"インターフェース {iface} をアップ"
+            if "name" in tokens:
+                new_name = _normalize_token(_extract_option_value(tokens, "name"))
+                if new_name:
+                    return f"インターフェース {iface} を {new_name} にリネーム"
+            return f"インターフェース {iface} の状態を変更"
+    if sub == "addr":
+        if "show" in tokens or len(tokens) == 2:
+            return "IP アドレス情報を取得"
+        if "add" in tokens:
+            address = _normalize_token(_extract_option_value(tokens, "add"))
+            dev = _normalize_token(_extract_option_value(tokens, "dev"))
+            if address and dev:
+                return f"インターフェース {dev} に IP アドレス {address} を追加"
+    if sub == "route":
+        if "add" in tokens:
+            return "ルートを追加"
+        if "show" in tokens:
+            return "ルーティングテーブルを表示"
+    return f"ip {sub} コマンドを実行 ({first_line})"
+
+
+def _describe_guard_command(tokens: List[str]) -> Optional[str]:
+    if not tokens or tokens[0] != "[" or "||" not in tokens:
+        return None
+    try:
+        guard_index = tokens.index("||")
+        src = (
+            _normalize_token(tokens[guard_index + 2])
+            if len(tokens) > guard_index + 2
+            else None
+        )
+        dest = (
+            _normalize_token(tokens[guard_index + 3])
+            if len(tokens) > guard_index + 3
+            else None
+        )
+        if tokens[1] == "-f" and dest and src:
+            return f"バックアップ未存在なら {src} を {dest} にコピー"
+    except (ValueError, IndexError):
+        return "条件付きのコマンドを実行"
+    return "条件付きのコマンドを実行"
+
+
+def _describe_simple_command(
+    tokens: List[str],
+    first_line: str,
+    base_name: str,
+) -> Optional[str]:
+    if base_name == "cat" and len(tokens) >= 2:
+        return f"{_normalize_token(tokens[1])} の内容を表示"
+    if base_name == "cp" and len(tokens) >= 3:
+        return (
+            f"{_normalize_token(tokens[1])} を {_normalize_token(tokens[2])} にコピー"
+        )
+    if base_name == "mv" and len(tokens) >= 3:
+        return f"{_normalize_token(tokens[1])} を {_normalize_token(tokens[2])} に移動"
+    if base_name == "rm":
+        target = _normalize_token(tokens[-1]) if len(tokens) > 1 else ""
+        return f"{target} を削除"
+    if base_name == "mkdir":
+        target = _normalize_token(tokens[-1]) if len(tokens) > 1 else ""
+        return f"ディレクトリ {target} を作成"
+    if base_name == "ls":
+        target = _normalize_token(tokens[1]) if len(tokens) > 1 else "."
+        return f"{target} の内容を一覧表示"
+    if base_name == "grep":
+        pattern = _normalize_token(tokens[1]) if len(tokens) > 1 else ""
+        return f"パターン {pattern} を検索"
+    if base_name == "curl":
+        url = _normalize_token(tokens[-1]) if tokens else ""
+        return f"URL {url} へ HTTP リクエスト"
+    if base_name == "echo":
+        return f"テキストを出力: {first_line[5:].strip()}"
+    if base_name == "touch" and len(tokens) >= 2:
+        return f"{_normalize_token(tokens[1])} を作成またはタイムスタンプ更新"
+    if base_name == "chmod" and len(tokens) >= 3:
+        return f"{_normalize_token(tokens[2])} のパーミッションを {tokens[1]} に変更"
+    if base_name == "chown" and len(tokens) >= 3:
+        return f"{_normalize_token(tokens[2])} の所有者を {tokens[1]} に変更"
+    return None
+
+
 def _describe_command(command: str) -> str:
     """Generate a brief Japanese description of what the command attempts to do."""
     stripped = (command or "").strip()
     if not stripped:
-        return "空のコマンドを実行"
+        return "Empty command; nothing to describe."
     multi_line = "\n" in stripped
     first_line = stripped.splitlines()[0].strip()
     try:
@@ -175,190 +494,25 @@ def _describe_command(command: str) -> str:
     base = tokens[0] if tokens else ""
     base_name = os.path.basename(base) if base else ""
 
-    def _normalize(value: Optional[str]) -> Optional[str]:
-        if value is None:
-            return None
-        return value.strip().strip("'\"")
-
-    if base_name == "command" and len(tokens) >= 3 and tokens[1] == "-v":
-        tool = _normalize(tokens[2])
-        return f"{tool} コマンドの存在を確認"
-
-    if base_name == "firewall-cmd":
-        zone = _normalize(_extract_option_value(tokens, "--zone"))
-        if "--list-sources" in tokens:
-            return f"firewalldゾーン {zone or 'default'} の許可元アドレスを取得"
-        if "--list-interfaces" in tokens:
-            return f"firewalldゾーン {zone or 'default'} のインターフェース一覧を取得"
-        if "--add-rich-rule" in tokens:
-            return f"firewalldゾーン {zone or 'default'} にリッチルールを追加"
-        if "--remove-rich-rule" in tokens:
-            return f"firewalldゾーン {zone or 'default'} からリッチルールを削除"
-        if "--reload" in tokens:
-            return "firewalld 設定をリロード"
-        if "--get-zones" in tokens:
-            return "firewalld のゾーン一覧を取得"
-        if "--state" in tokens:
-            return "firewalld の稼働状態を確認"
-        return f"firewalld コマンドを実行 ({first_line})"
-
-    if base_name == "nmcli" and len(tokens) >= 2:
-        if tokens[1] == "connection":
-            action = tokens[2] if len(tokens) > 2 else ""
-            target = _normalize(tokens[3]) if len(tokens) > 3 else None
-            if action == "modify" and target:
-                address = _normalize(_extract_key_value(tokens, "ipv4.addresses"))
-                gateway = _normalize(_extract_key_value(tokens, "ipv4.gateway"))
-                method = _normalize(_extract_key_value(tokens, "ipv4.method"))
-                if address:
-                    return f"接続 {target} に IP アドレス {address} を設定"
-                if gateway:
-                    return f"接続 {target} にデフォルトゲートウェイ {gateway} を設定"
-                if method:
-                    return f"接続 {target} の IPv4 方法を {method} に変更"
-                return f"接続 {target} の設定を変更"
-            if action == "up" and target:
-                return f"接続 {target} を有効化"
-            if action == "down" and target:
-                return f"接続 {target} を無効化"
-        if tokens[1] == "device" and len(tokens) > 2:
-            action = tokens[2]
-            device = _normalize(tokens[3]) if len(tokens) > 3 else None
-            if action == "status":
-                return "nmcli でデバイスの状態を確認"
-            if action == "show" and device:
-                return f"デバイス {device} の詳細を取得"
-        return f"nmcli コマンドを実行 ({first_line})"
-
-    if base_name == "systemctl" and len(tokens) >= 2:
-        action = tokens[1]
-        service = None
-        for token in tokens[2:]:
-            if not token.startswith("-"):
-                service = _normalize(token)
-                break
-        if action in {"is-active", "status"}:
-            return f"systemd サービス {service or '(指定なし)'} の状態を確認"
-        if action in {"restart", "start", "stop", "reload"}:
-            verb = {
-                "restart": "再起動",
-                "start": "起動",
-                "stop": "停止",
-                "reload": "リロード",
-            }[action]
-            return f"systemd サービス {service or '(指定なし)'} を{verb}"
-        if action in {"enable", "disable"}:
-            verb = "有効化" if action == "enable" else "無効化"
-            return f"systemd サービス {service or '(指定なし)'} を{verb}"
-        return f"systemctl {action} を実行 ({first_line})"
-
-    if base_name == "service" and len(tokens) >= 3:
-        target = _normalize(tokens[1])
-        action = tokens[2]
-        action_map = {
-            "restart": "再起動",
-            "start": "起動",
-            "stop": "停止",
-            "status": "状態を確認",
-            "reload": "リロード",
-        }
-        description = action_map.get(action, f"{action} を実行")
-        return f"サービス {target} を{description}"
-
-    if base_name == "ip" and len(tokens) >= 2:
-        sub = tokens[1]
-        if sub == "link" and len(tokens) >= 4:
-            action = tokens[2]
-            iface = _normalize(tokens[3])
-            if action == "set" and iface:
-                if "down" in tokens:
-                    return f"インターフェース {iface} をダウン"
-                if "up" in tokens:
-                    return f"インターフェース {iface} をアップ"
-                if "name" in tokens:
-                    new_name = _normalize(_extract_option_value(tokens, "name"))
-                    if new_name:
-                        return f"インターフェース {iface} を {new_name} にリネーム"
-                return f"インターフェース {iface} の状態を変更"
-        if sub == "addr":
-            if "show" in tokens or len(tokens) == 2:
-                return "IP アドレス情報を取得"
-            if "add" in tokens:
-                address = _normalize(_extract_option_value(tokens, "add"))
-                dev = _normalize(_extract_option_value(tokens, "dev"))
-                if address and dev:
-                    return f"インターフェース {dev} に IP アドレス {address} を追加"
-        if sub == "route":
-            if "add" in tokens:
-                return "ルートを追加"
-            if "show" in tokens:
-                return "ルーティングテーブルを表示"
-        return f"ip {sub} コマンドを実行 ({first_line})"
-
-    if tokens and tokens[0] == "[" and "||" in tokens:
-        try:
-            guard_index = tokens.index("||")
-            src = (
-                _normalize(tokens[guard_index + 2])
-                if len(tokens) > guard_index + 2
-                else None
-            )
-            dest = (
-                _normalize(tokens[guard_index + 3])
-                if len(tokens) > guard_index + 3
-                else None
-            )
-            if tokens[1] == "-f" and dest and src:
-                return f"バックアップが無ければ {src} を {dest} にコピー"
-        except (ValueError, IndexError):
-            pass
-        return "条件付きのコマンドを実行"
-
-    if base_name == "cat" and len(tokens) >= 2:
-        return f"{_normalize(tokens[1])} の内容を表示"
-
-    if base_name == "cp" and len(tokens) >= 3:
-        return f"{_normalize(tokens[1])} を {_normalize(tokens[2])} にコピー"
-
-    if base_name == "mv" and len(tokens) >= 3:
-        return f"{_normalize(tokens[1])} を {_normalize(tokens[2])} に移動"
-
-    if base_name == "rm":
-        target = _normalize(tokens[-1]) if len(tokens) > 1 else ""
-        return f"{target} を削除"
-
-    if base_name == "mkdir":
-        target = _normalize(tokens[-1]) if len(tokens) > 1 else ""
-        return f"ディレクトリ {target} を作成"
-
-    if base_name == "ls":
-        target = _normalize(tokens[1]) if len(tokens) > 1 else "."
-        return f"{target} の内容を一覧表示"
-
-    if base_name == "grep":
-        pattern = _normalize(tokens[1]) if len(tokens) > 1 else ""
-        return f"パターン {pattern} を検索"
-
-    if base_name == "curl":
-        url = _normalize(tokens[-1]) if tokens else ""
-        return f"URL {url} へ HTTP リクエスト"
-
-    if base_name == "echo":
-        return f"テキストを出力: {first_line[5:].strip()}"
-
-    if base_name == "touch" and len(tokens) >= 2:
-        return f"{_normalize(tokens[1])} を作成またはタイムスタンプ更新"
-
-    if base_name == "chmod" and len(tokens) >= 3:
-        return f"{_normalize(tokens[2])} のパーミッションを {tokens[1]} に変更"
-
-    if base_name == "chown" and len(tokens) >= 3:
-        return f"{_normalize(tokens[2])} の所有者を {tokens[1]} に変更"
+    handlers: List[Callable[[List[str], str, str], Optional[str]]] = [
+        lambda t, fl, bn: _describe_command_tool_lookup(t, bn),
+        _describe_firewall_cmd,
+        _describe_nmcli,
+        _describe_systemctl,
+        lambda t, fl, bn: _describe_service(t, bn),
+        _describe_ip,
+        lambda t, fl, bn: _describe_guard_command(t),
+        _describe_simple_command,
+    ]
+    for handler in handlers:
+        description = handler(tokens, first_line, base_name)
+        if description:
+            return description
 
     if multi_line:
-        return f"複数行シェルスクリプトを実行 (先頭: {first_line})"
+        return f"Multi-line shell script (first line: {first_line})"
 
-    return f"コマンドを実行: {first_line}"
+    return f"Execute command: {first_line}"
 
 
 def register_command_execution(command: str) -> None:
@@ -606,7 +760,6 @@ try:
     from network_utils import (  # type: ignore[import]
         NMCLI_FIELDS_NO_TYPE,
         NMCLI_FIELDS_WITH_TYPE,
-        SSH_ALLOWED_SOURCE_IP,
         LEGACY_INTERFACE_PATTERN,
         calculate_ip_stg_to_prd,
         compact_interface_name,
@@ -615,8 +768,6 @@ try:
         determine_prd_static_routes,
         derive_fallback_gateway,
         derive_gateway_from_octet_rule,
-        ensure_connection_activation,
-        ensure_firewall_allows_ssh,
         find_gateway_owner_index,
         infer_gateway_from_routes,
         make_nmcli_detail_fetcher,
@@ -624,13 +775,12 @@ try:
         parse_nmcli_connection_output,
         prefix_to_subnet_mask,
         select_default_gateway_route,
-        verify_destination_network_with_sdk,
-        verify_nmcli_connection_settings,
         extract_mac_from_sdk_interface,
         extract_ipv4_from_sdk_interface,
         extract_dns_servers_from_state,
         extract_routes_from_sdk_payload,
         transform_text_to_prd,
+        verify_destination_network_with_sdk,
     )
 except ModuleNotFoundError as import_error:
     try:
@@ -639,7 +789,6 @@ except ModuleNotFoundError as import_error:
         raise import_error from load_error
     NMCLI_FIELDS_NO_TYPE = network_utils.NMCLI_FIELDS_NO_TYPE
     NMCLI_FIELDS_WITH_TYPE = network_utils.NMCLI_FIELDS_WITH_TYPE
-    SSH_ALLOWED_SOURCE_IP = network_utils.SSH_ALLOWED_SOURCE_IP
     LEGACY_INTERFACE_PATTERN = network_utils.LEGACY_INTERFACE_PATTERN
     calculate_ip_stg_to_prd = network_utils.calculate_ip_stg_to_prd
     compact_interface_name = network_utils.compact_interface_name
@@ -648,8 +797,6 @@ except ModuleNotFoundError as import_error:
     determine_prd_static_routes = network_utils.determine_prd_static_routes
     derive_fallback_gateway = network_utils.derive_fallback_gateway
     derive_gateway_from_octet_rule = network_utils.derive_gateway_from_octet_rule
-    ensure_connection_activation = network_utils.ensure_connection_activation
-    ensure_firewall_allows_ssh = network_utils.ensure_firewall_allows_ssh
     find_gateway_owner_index = network_utils.find_gateway_owner_index
     infer_gateway_from_routes = network_utils.infer_gateway_from_routes
     make_nmcli_detail_fetcher = network_utils.make_nmcli_detail_fetcher
@@ -657,15 +804,12 @@ except ModuleNotFoundError as import_error:
     parse_nmcli_connection_output = network_utils.parse_nmcli_connection_output
     prefix_to_subnet_mask = network_utils.prefix_to_subnet_mask
     select_default_gateway_route = network_utils.select_default_gateway_route
-    verify_destination_network_with_sdk = (
-        network_utils.verify_destination_network_with_sdk
-    )
-    verify_nmcli_connection_settings = network_utils.verify_nmcli_connection_settings
     extract_mac_from_sdk_interface = network_utils.extract_mac_from_sdk_interface
     extract_ipv4_from_sdk_interface = network_utils.extract_ipv4_from_sdk_interface
     extract_dns_servers_from_state = network_utils.extract_dns_servers_from_state
     extract_routes_from_sdk_payload = network_utils.extract_routes_from_sdk_payload
     transform_text_to_prd = network_utils.transform_text_to_prd
+    verify_destination_network_with_sdk = network_utils.verify_destination_network_with_sdk
 
 
 # ------------------------------------------------
@@ -680,6 +824,8 @@ LOGGER = logging.getLogger("cloneAndVmotion")
 LOGGER.setLevel(LOG_LEVEL)
 
 workflow_had_warnings = False
+VCSA_PWD_SOURCE: str = ""
+VCSA_PWD_DEST: str = ""
 
 
 DEFAULT_PROTECTED_GUEST_PATHS: Tuple[str, ...] = (
@@ -728,7 +874,7 @@ def _guest_path_protected(path: str) -> bool:
     return _normalize_guest_path(path) in _PROTECTED_GUEST_PATH_LOOKUP
 
 
-SSH_OVERRIDE_SOURCE_IP = SSH_ALLOWED_SOURCE_IP
+SSH_OVERRIDE_SOURCE_IP = CURRENT_ENVIRONMENT.ssh_allowed_source_ip
 SSH_OVERRIDE_RICH_RULE = f'rule family="ipv4" source address="{SSH_OVERRIDE_SOURCE_IP}" service name="ssh" accept'
 
 
@@ -845,14 +991,6 @@ if VCSA_HOST_DEST != "vcsa01p.ipet.local":
         ENV_DEST_HOST_VAR,
         VCSA_HOST_DEST,
     )
-
-# --- Migration Resources ---
-# Datastore used to stage the clone
-TARGET_DATASTORE_NAME = "PMAX-COM-VOL1"
-# Final datastore after migration
-TARGET_DATASTORE_NAME_FINAL = "PMAX-PRD-VOL1"
-# Destination cluster for compute resources
-TARGET_CLUSTER_NAME = "PRD-Cluster"
 
 # --- Guest OS Credentials ---
 GUEST_ROOT_USER = "root"
@@ -1153,235 +1291,437 @@ def _attempt_rest_guest_update(
         return False, False, True, None, []
 
 
-def _configure_nic_with_nmcli(
-    *,
+def _build_alias_targets(
+    device_name: str, con_name: str
+) -> Tuple[str, Set[str], Set[str]]:
+    device_name_normalized = device_name.lower()
+    alias_targets = {
+        value for value in (device_name_normalized, con_name.lower()) if value
+    }
+    alias_targets_compact = {
+        value.replace("-", "").replace("_", "").replace(" ", "")
+        for value in alias_targets
+    }
+    return device_name_normalized, alias_targets, alias_targets_compact
+
+
+def _build_mac_targets(new_mac_lower: str, original_mac_lower: str) -> Set[str]:
+    mac_targets: Set[str] = set()
+    for value in (new_mac_lower, original_mac_lower):
+        if not value:
+            continue
+        normalized = value.replace("-", ":")
+        mac_targets.add(normalized)
+        mac_targets.add(normalized.replace(":", ""))
+        mac_targets.add(normalized.replace(":", "-"))
+    return mac_targets
+
+
+def _connection_matches_alias(
+    device_norm: str,
+    name_norm: str,
+    device_compact: str,
+    name_compact: str,
+    alias_targets: Set[str],
+    alias_targets_compact: Set[str],
+) -> bool:
+    if not alias_targets:
+        return False
+    if device_norm in alias_targets or name_norm in alias_targets:
+        return True
+    if device_compact and any(
+        target in device_compact for target in alias_targets_compact
+    ):
+        return True
+    if name_compact and any(target in name_compact for target in alias_targets_compact):
+        return True
+    return False
+
+
+def _connection_is_orphan(
+    name_norm: str,
+    name_compact: str,
+    alias_targets: Set[str],
+    alias_targets_compact: Set[str],
+    guest_iface_names: Set[str],
+    guest_iface_names_compact: Set[str],
+) -> bool:
+    if name_norm and LEGACY_INTERFACE_PATTERN.match(name_norm):
+        if (
+            guest_iface_names
+            and name_norm not in guest_iface_names
+            and name_compact not in guest_iface_names_compact
+        ):
+            return True
+    if (
+        alias_targets
+        and name_compact
+        and any(target in name_compact for target in alias_targets_compact)
+    ):
+        return True
+    return False
+
+
+def _connection_matches_mac(
+    uuid: str,
+    mac_targets: Set[str],
+    get_connection_details: Callable[[str], Tuple[int, str]],
+) -> bool:
+    if not mac_targets:
+        return False
+    detail_exit, detail_stdout = get_connection_details(uuid)
+    if detail_exit != 0 or not detail_stdout:
+        return False
+    detail_lower = detail_stdout.lower()
+    return any(target and target in detail_lower for target in mac_targets)
+
+
+def _fetch_existing_nmcli_connections(
     guest_command_executor,
+) -> Tuple[
+    List[Dict[str, str]],
+    Dict[str, str],
+    Sequence[str],
+    Callable[[str], Tuple[int, str]],
+]:
+    nmcli_fields: Sequence[str] = NMCLI_FIELDS_WITH_TYPE
+    nmcli_list_cmd = f"nmcli -t -f {','.join(nmcli_fields)} connection show"
+    try:
+        _, nmcli_output, _ = guest_command_executor(nmcli_list_cmd)
+    except RuntimeError:
+        nmcli_fields = NMCLI_FIELDS_NO_TYPE
+        nmcli_list_cmd = f"nmcli -t -f {','.join(nmcli_fields)} connection show"
+        _, nmcli_output, _ = guest_command_executor(nmcli_list_cmd)
+    parsed_connections = parse_nmcli_connection_output(nmcli_output, nmcli_fields)
+    existing_connections: List[Dict[str, str]] = []
+    uuid_to_device: Dict[str, str] = {}
+    for entry in parsed_connections:
+        normalized_entry: Dict[str, str] = {}
+        for nmcli_field in nmcli_fields:
+            normalized_entry[nmcli_field.lower()] = entry.get(nmcli_field, "")
+        existing_connections.append(normalized_entry)
+        uuid_value = (normalized_entry.get("uuid") or "").strip()
+        if uuid_value:
+            uuid_to_device[uuid_value] = (
+                (normalized_entry.get("device") or "").strip().lower()
+            )
+    connection_detail_cache: Dict[str, Tuple[int, str]] = {}
+    get_connection_details = make_nmcli_detail_fetcher(
+        connection_detail_cache, guest_command_executor
+    )
+    return existing_connections, uuid_to_device, nmcli_fields, get_connection_details
+
+
+def _determine_stale_nmcli_connections(
+    existing_connections: List[Dict[str, str]],
+    *,
+    alias_targets: Set[str],
+    alias_targets_compact: Set[str],
+    mac_targets: Set[str],
+    target_device_lower: str,
+    guest_iface_names: Set[str],
+    guest_iface_names_compact: Set[str],
+    get_connection_details: Callable[[str], Tuple[int, str]],
+) -> Set[str]:
+    stale_connection_uuids: Set[str] = set()
+    for conn in existing_connections:
+        uuid = (conn.get("uuid") or "").strip()
+        if not uuid:
+            continue
+        device_norm = (conn.get("device") or "").strip().lower()
+        if device_norm and device_norm != target_device_lower:
+            continue
+        name_norm = (conn.get("name") or "").strip().lower()
+        type_norm = (conn.get("type") or "").strip().lower()
+        name_compact = compact_interface_name(name_norm)
+        device_compact = compact_interface_name(device_norm)
+        alias_match = _connection_matches_alias(
+            device_norm,
+            name_norm,
+            device_compact,
+            name_compact,
+            alias_targets,
+            alias_targets_compact,
+        )
+        orphaned_interface = _connection_is_orphan(
+            name_norm,
+            name_compact,
+            alias_targets,
+            alias_targets_compact,
+            guest_iface_names,
+            guest_iface_names_compact,
+        )
+        mac_match = False
+        if mac_targets and not (alias_match or orphaned_interface):
+            mac_match = _connection_matches_mac(
+                uuid, mac_targets, get_connection_details
+            )
+        if type_norm and type_norm not in ("802-3-ethernet", "ethernet"):
+            if not mac_match:
+                continue
+        if device_norm and device_norm not in guest_iface_names:
+            stale_connection_uuids.add(uuid)
+            continue
+        if alias_match or orphaned_interface or mac_match:
+            stale_connection_uuids.add(uuid)
+    return stale_connection_uuids
+
+
+def _remove_stale_nmcli_connections(
+    guest_command_executor,
+    stale_connection_uuids: Set[str],
+    uuid_to_device: Dict[str, str],
+    target_device_lower: str,
+) -> None:
+    if not stale_connection_uuids:
+        return
+    print(
+        f"   -> Removing stale nmcli connections ({len(stale_connection_uuids)} entries)."
+    )
+    for uuid in sorted(stale_connection_uuids):
+        mapped_device = uuid_to_device.get(uuid, "")
+        if mapped_device and mapped_device != target_device_lower:
+            continue
+        guest_command_executor(f"nmcli connection delete uuid {uuid}")
+
+
+def _configure_nmcli_ipv4_settings(
+    guest_command_executor,
+    *,
+    con_name: str,
+    new_ip: Optional[str],
+    prefix: Optional[int],
+    expected_gateway_value: Optional[str],
+) -> None:
+    if new_ip and prefix is not None:
+        guest_command_executor(
+            f"nmcli connection modify '{con_name}' ipv4.method manual "
+            f"ipv4.addresses '{new_ip}/{prefix}'"
+        )
+    else:
+        guest_command_executor(
+            f"nmcli connection modify '{con_name}' ipv4.method manual "
+            "ipv4.addresses ''"
+        )
+    if expected_gateway_value:
+        guest_command_executor(
+            f"nmcli connection modify '{con_name}' "
+            f"ipv4.gateway '{expected_gateway_value}'"
+        )
+        guest_command_executor(
+            f"nmcli connection modify '{con_name}' ipv4.never-default no",
+            check_exit_code=False,
+        )
+    else:
+        guest_command_executor(
+            f"nmcli connection modify '{con_name}' ipv4.gateway ''",
+            check_exit_code=False,
+        )
+        guest_command_executor(
+            f"nmcli connection modify '{con_name}' ipv4.never-default yes",
+            check_exit_code=False,
+        )
+
+
+def _configure_nmcli_ipv6_settings(guest_command_executor, *, con_name: str) -> None:
+    guest_command_executor(
+        f"nmcli connection modify '{con_name}' ipv6.method ignore",
+        check_exit_code=False,
+    )
+    guest_command_executor(
+        f"nmcli connection modify '{con_name}' ipv6.never-default yes",
+        check_exit_code=False,
+    )
+    guest_command_executor(
+        f"nmcli connection modify '{con_name}' ipv6.addresses ''",
+        check_exit_code=False,
+    )
+    guest_command_executor(
+        f"nmcli connection modify '{con_name}' ipv6.routes ''",
+        check_exit_code=False,
+    )
+    guest_command_executor(
+        f"nmcli connection modify '{con_name}' ipv6.dns ''",
+        check_exit_code=False,
+    )
+
+
+def _configure_nmcli_dns_settings(
+    guest_command_executor,
+    *,
+    con_name: str,
+    new_dns_servers: List[str],
+    expected_dns_servers_local: List[str],
+    expected_dns_overall_local: List[str],
+) -> Tuple[List[str], List[str]]:
+    local_expected_dns_servers = list(expected_dns_servers_local)
+    local_expected_dns_overall = list(expected_dns_overall_local)
+    if new_dns_servers:
+        deduped_dns = dedupe_preserving_order(new_dns_servers)
+        dns_str = " ".join(deduped_dns)
+        guest_command_executor(
+            f"nmcli connection modify '{con_name}' ipv4.dns '{dns_str}'"
+        )
+        local_expected_dns_servers = deduped_dns[:]
+        if not local_expected_dns_overall:
+            local_expected_dns_overall = dedupe_preserving_order(deduped_dns)
+    else:
+        guest_command_executor(
+            f"nmcli connection modify '{con_name}' ipv4.dns ''",
+            check_exit_code=False,
+        )
+    return local_expected_dns_servers, local_expected_dns_overall
+
+
+def _configure_nmcli_routes(
+    guest_command_executor,
+    *,
+    con_name: str,
+    should_configure_routes: bool,
+    routes_for_nic: List[Tuple[int, Dict[str, Any]]],
+) -> Tuple[List[int], List[str]]:
+    selected_route_indices: List[int] = []
+    selected_route_lines: List[str] = []
+    if not should_configure_routes:
+        return selected_route_indices, selected_route_lines
+    guest_command_executor(
+        f"nmcli connection modify '{con_name}' ipv4.routes ''",
+        check_exit_code=False,
+    )
+    for route_idx, route_info in routes_for_nic:
+        gateway = route_info.get("gateway")
+        prefix_value = route_info.get("prefix")
+        network_base = route_info.get("network")
+        if not gateway or prefix_value is None or not network_base:
+            continue
+        network_cidr = f"{network_base}/{prefix_value}"
+        guest_command_executor(
+            (
+                f"nmcli connection modify '{con_name}' "
+                f"+ipv4.routes '{network_cidr} {gateway}'"
+            ),
+            check_exit_code=False,
+        )
+        selected_route_indices.append(route_idx)
+        selected_route_lines.append(f"{network_cidr} via {gateway}")
+        print(f"      - Added: {network_cidr} via {gateway}")
+    return selected_route_indices, selected_route_lines
+
+
+def _configure_nmcli_connection(
+    guest_command_executor,
+    *,
     device_name: str,
     con_name: str,
-    nmcli_supported: bool,
-    new_mac_lower: str,
-    original_mac_lower: str,
+    new_ip: Optional[str],
+    prefix: Optional[int],
     expected_gateway_value: Optional[str],
     new_dns_servers: List[str],
     should_configure_routes: bool,
     routes_for_nic: List[Tuple[int, Dict[str, Any]]],
-    new_ip: Optional[str],
-    prefix: Optional[int],
-    expected_dns_servers: List[str],
-    expected_dns_overall: List[str],
-    guest_iface_names: Set[str],
-    guest_iface_names_compact: Set[str],
-) -> NmcliConfigResult:
+    expected_dns_servers_local: List[str],
+    expected_dns_overall_local: List[str],
+) -> Tuple[List[int], List[str], List[str], List[str]]:
+    guest_command_executor(f"ip addr flush dev {device_name}", check_exit_code=False)
+    guest_command_executor(
+        f"nmcli connection add type ethernet con-name '{con_name}' "
+        f"ifname '{device_name}' autoconnect no"
+    )
+    _configure_nmcli_ipv4_settings(
+        guest_command_executor,
+        con_name=con_name,
+        new_ip=new_ip,
+        prefix=prefix,
+        expected_gateway_value=expected_gateway_value,
+    )
+    _configure_nmcli_ipv6_settings(guest_command_executor, con_name=con_name)
+    local_expected_dns_servers, local_expected_dns_overall = (
+        _configure_nmcli_dns_settings(
+            guest_command_executor,
+            con_name=con_name,
+            new_dns_servers=new_dns_servers,
+            expected_dns_servers_local=expected_dns_servers_local,
+            expected_dns_overall_local=expected_dns_overall_local,
+        )
+    )
+    selected_route_indices, selected_route_lines = _configure_nmcli_routes(
+        guest_command_executor,
+        con_name=con_name,
+        should_configure_routes=should_configure_routes,
+        routes_for_nic=routes_for_nic,
+    )
+    return (
+        selected_route_indices,
+        selected_route_lines,
+        local_expected_dns_servers,
+        local_expected_dns_overall,
+    )
+
+
+def _configure_nic_with_nmcli(params: NmcliConfigParams) -> NmcliConfigResult:
     """Apply guest NIC settings using nmcli when available, otherwise fall back."""
+    guest_command_executor = params.guest_command_executor
+    device_name = params.device_name
+    con_name = params.con_name
+    nmcli_supported = params.nmcli_supported
+    new_mac_lower = params.new_mac_lower
+    original_mac_lower = params.original_mac_lower
+    expected_gateway_value = params.expected_gateway_value
+    new_dns_servers = params.new_dns_servers
+    should_configure_routes = params.should_configure_routes
+    routes_for_nic = params.routes_for_nic
+    new_ip = params.new_ip
+    prefix = params.prefix
+    expected_dns_servers = params.expected_dns_servers
+    expected_dns_overall = params.expected_dns_overall
+    guest_iface_names = params.guest_iface_names
+    guest_iface_names_compact = params.guest_iface_names_compact
+
     expected_dns_servers_local = list(expected_dns_servers)
     expected_dns_overall_local = list(expected_dns_overall)
     legacy_verification_command: Optional[str] = None
 
     def _run_nmcli_configuration() -> Tuple[List[int], List[str], List[str], List[str]]:
-        selected_route_indices: List[int] = []
-        selected_route_lines: List[str] = []
-        local_expected_dns_servers = list(expected_dns_servers_local)
-        local_expected_dns_overall = list(expected_dns_overall_local)
-        device_name_normalized = device_name.lower()
-        mac_normalized = new_mac_lower.replace("-", ":") if new_mac_lower else ""
-        old_mac_normalized = original_mac_lower.replace("-", ":")
-        nmcli_fields = NMCLI_FIELDS_WITH_TYPE
-        nmcli_list_cmd = f"nmcli -t -f {','.join(nmcli_fields)} connection show"
-        try:
-            _, nmcli_output, _ = guest_command_executor(nmcli_list_cmd)
-        except RuntimeError:
-            nmcli_fields = NMCLI_FIELDS_NO_TYPE
-            nmcli_list_cmd = f"nmcli -t -f {','.join(nmcli_fields)} connection show"
-            _, nmcli_output, _ = guest_command_executor(nmcli_list_cmd)
-        parsed_connections = parse_nmcli_connection_output(nmcli_output, nmcli_fields)
-        existing_connections = []
-        uuid_to_device: Dict[str, str] = {}
-        for entry in parsed_connections:
-            normalized_entry: Dict[str, str] = {}
-            for nmcli_field in nmcli_fields:
-                normalized_entry[nmcli_field.lower()] = entry.get(nmcli_field, "")
-            existing_connections.append(normalized_entry)
-            uuid_value = (normalized_entry.get("uuid") or "").strip()
-            if uuid_value:
-                uuid_to_device[uuid_value] = (
-                    (normalized_entry.get("device") or "").strip().lower()
-                )
-        alias_targets = {
-            value for value in (device_name_normalized, con_name.lower()) if value
-        }
-        alias_targets_compact = {
-            value.replace("-", "").replace("_", "").replace(" ", "")
-            for value in alias_targets
-        }
-        mac_targets = set()
-        for value in (mac_normalized, old_mac_normalized):
-            if value:
-                mac_targets.add(value)
-                mac_targets.add(value.replace(":", ""))
-                mac_targets.add(value.replace(":", "-"))
-        stale_connection_uuids = set()
-        connection_detail_cache: Dict[str, Tuple[int, str]] = {}
-        get_connection_details = make_nmcli_detail_fetcher(
-            connection_detail_cache, guest_command_executor
+        (
+            existing_connections,
+            uuid_to_device,
+            _,
+            get_connection_details,
+        ) = _fetch_existing_nmcli_connections(guest_command_executor)
+        (
+            device_name_lower,
+            alias_targets,
+            alias_targets_compact,
+        ) = _build_alias_targets(device_name, con_name)
+        mac_targets = _build_mac_targets(new_mac_lower, original_mac_lower)
+        stale_connection_uuids = _determine_stale_nmcli_connections(
+            existing_connections,
+            alias_targets=alias_targets,
+            alias_targets_compact=alias_targets_compact,
+            mac_targets=mac_targets,
+            target_device_lower=device_name_lower,
+            guest_iface_names=guest_iface_names,
+            guest_iface_names_compact=guest_iface_names_compact,
+            get_connection_details=get_connection_details,
         )
-        target_device_lower = device_name.lower()
-        for conn in existing_connections:
-            uuid = (conn.get("uuid") or "").strip()
-            if not uuid:
-                continue
-            name_norm = (conn.get("name") or "").strip().lower()
-            device_norm = (conn.get("device") or "").strip().lower()
-            if device_norm and device_norm != target_device_lower:
-                continue
-            type_norm = (conn.get("type") or "").strip().lower()
-            name_compact = compact_interface_name(name_norm)
-            device_compact = compact_interface_name(device_norm)
-            alias_match = False
-            if alias_targets:
-                if device_norm in alias_targets or name_norm in alias_targets:
-                    alias_match = True
-                elif device_compact and any(
-                    target in device_compact for target in alias_targets_compact
-                ):
-                    alias_match = True
-                elif name_compact and any(
-                    target in name_compact for target in alias_targets_compact
-                ):
-                    alias_match = True
-            orphaned_interface = False
-            if not device_norm:
-                if name_norm and LEGACY_INTERFACE_PATTERN.match(name_norm):
-                    if (
-                        guest_iface_names
-                        and name_norm not in guest_iface_names
-                        and name_compact not in guest_iface_names_compact
-                    ):
-                        orphaned_interface = True
-                elif (
-                    alias_targets
-                    and name_compact
-                    and any(target in name_compact for target in alias_targets_compact)
-                ):
-                    orphaned_interface = True
-            mac_match = False
-            if mac_targets and not (alias_match or orphaned_interface):
-                detail_exit, detail_stdout = get_connection_details(uuid)
-                if detail_exit == 0 and detail_stdout:
-                    detail_lower = detail_stdout.lower()
-                    for target_mac in mac_targets:
-                        if target_mac and target_mac in detail_lower:
-                            mac_match = True
-                            break
-            if type_norm and type_norm not in ("802-3-ethernet", "ethernet"):
-                if not mac_match:
-                    continue
-            if alias_match or orphaned_interface or mac_match:
-                stale_connection_uuids.add(uuid)
-        if stale_connection_uuids:
-            print(
-                f"   -> Removing stale nmcli connections ({len(stale_connection_uuids)} entries)."
-            )
-            for uuid in sorted(stale_connection_uuids):
-                mapped_device = uuid_to_device.get(uuid, "")
-                if mapped_device and mapped_device != target_device_lower:
-                    continue
-                guest_command_executor(f"nmcli connection delete uuid {uuid}")
-        guest_command_executor(
-            f"ip addr flush dev {device_name}", check_exit_code=False
+        _remove_stale_nmcli_connections(
+            guest_command_executor,
+            stale_connection_uuids,
+            uuid_to_device,
+            device_name_lower,
         )
-        guest_command_executor(
-            f"nmcli connection add type ethernet con-name '{con_name}' "
-            f"ifname '{device_name}' autoconnect no"
-        )
-        if new_ip and prefix is not None:
-            guest_command_executor(
-                f"nmcli connection modify '{con_name}' ipv4.method manual "
-                f"ipv4.addresses '{new_ip}/{prefix}'"
-            )
-        else:
-            guest_command_executor(
-                f"nmcli connection modify '{con_name}' ipv4.method manual "
-                "ipv4.addresses ''"
-            )
-        guest_command_executor(
-            f"nmcli connection modify '{con_name}' ipv6.method ignore",
-            check_exit_code=False,
-        )
-        guest_command_executor(
-            f"nmcli connection modify '{con_name}' ipv6.never-default yes",
-            check_exit_code=False,
-        )
-        guest_command_executor(
-            f"nmcli connection modify '{con_name}' ipv6.addresses ''",
-            check_exit_code=False,
-        )
-        guest_command_executor(
-            f"nmcli connection modify '{con_name}' ipv6.routes ''",
-            check_exit_code=False,
-        )
-        guest_command_executor(
-            f"nmcli connection modify '{con_name}' ipv6.dns ''",
-            check_exit_code=False,
-        )
-        if expected_gateway_value:
-            guest_command_executor(
-                f"nmcli connection modify '{con_name}' "
-                f"ipv4.gateway '{expected_gateway_value}'"
-            )
-            guest_command_executor(
-                f"nmcli connection modify '{con_name}' ipv4.never-default no",
-                check_exit_code=False,
-            )
-        else:
-            guest_command_executor(
-                f"nmcli connection modify '{con_name}' ipv4.gateway ''",
-                check_exit_code=False,
-            )
-            guest_command_executor(
-                f"nmcli connection modify '{con_name}' ipv4.never-default yes",
-                check_exit_code=False,
-            )
-        if new_dns_servers:
-            deduped_dns = dedupe_preserving_order(new_dns_servers)
-            dns_str = " ".join(deduped_dns)
-            guest_command_executor(
-                f"nmcli connection modify '{con_name}' ipv4.dns '{dns_str}'"
-            )
-            local_expected_dns_servers = deduped_dns[:]
-            if not local_expected_dns_overall:
-                local_expected_dns_overall = dedupe_preserving_order(deduped_dns)
-        else:
-            guest_command_executor(
-                f"nmcli connection modify '{con_name}' ipv4.dns ''",
-                check_exit_code=False,
-            )
-        if should_configure_routes:
-            guest_command_executor(
-                f"nmcli connection modify '{con_name}' ipv4.routes ''",
-                check_exit_code=False,
-            )
-            for route_idx, route_info in routes_for_nic:
-                gateway = route_info.get("gateway")
-                prefix_value = route_info.get("prefix")
-                network_base = route_info.get("network")
-                if not gateway or prefix_value is None or not network_base:
-                    continue
-                network_cidr = f"{network_base}/{prefix_value}"
-                guest_command_executor(
-                    (
-                        f"nmcli connection modify '{con_name}' "
-                        f"+ipv4.routes '{network_cidr} {gateway}'"
-                    ),
-                    check_exit_code=False,
-                )
-                selected_route_indices.append(route_idx)
-                selected_route_lines.append(f"{network_cidr} via {gateway}")
-                print(f"      - Added: {network_cidr} via {gateway}")
-        return (
-            selected_route_indices,
-            selected_route_lines,
-            local_expected_dns_servers,
-            local_expected_dns_overall,
+        return _configure_nmcli_connection(
+            guest_command_executor,
+            device_name=device_name,
+            con_name=con_name,
+            new_ip=new_ip,
+            prefix=prefix,
+            expected_gateway_value=expected_gateway_value,
+            new_dns_servers=new_dns_servers,
+            should_configure_routes=should_configure_routes,
+            routes_for_nic=routes_for_nic,
+            expected_dns_servers_local=expected_dns_servers_local,
+            expected_dns_overall_local=expected_dns_overall_local,
         )
 
     if not nmcli_supported:
@@ -1524,6 +1864,24 @@ def wait_for_vm_availability(content, name, retries=30, delay_seconds=2):
             return vm
         time.sleep(max(1, delay_seconds))
     raise RuntimeError(f"Destination vCenter did not contain VM '{name}' (timed out).")
+
+
+def _wait_for_guest_tools(vm, *, timeout_seconds: float = 600.0, poll_interval: float = 5.0) -> bool:
+    """Poll until VMware Tools reports 'guestToolsRunning', returning True when ready."""
+    deadline = time.time() + max(1.0, timeout_seconds)
+    while time.time() < deadline:
+        tools_status = getattr(getattr(vm, "guest", None), "toolsRunningStatus", None)
+        if tools_status == "guestToolsRunning":
+            return True
+        time.sleep(max(0.5, poll_interval))
+        try:
+            if hasattr(vm, "UpdateViewData"):
+                vm.UpdateViewData()  # type: ignore[attr-defined]
+            else:
+                vm.Reload()
+        except Exception:  # pylint: disable=broad-exception-caught
+            LOGGER.debug("Guest tools poll refresh failed; continuing to wait.", exc_info=True)
+    return False
 
 
 def _collect_interface_lookup(
@@ -2116,6 +2474,201 @@ def _sync_hosts_file_to_prd(guest_executor, timestamp: str) -> bool:
     return True
 
 
+def _discover_firewalld_zones(
+    guest_executor, source_zones: Optional[List[FirewalldZonePlanType]]
+) -> Tuple[Set[str], bool]:
+    zone_names: Set[str] = {
+        plan.name.strip()
+        for plan in (source_zones or [])
+        if getattr(plan, "name", None)
+    }
+    exit_code, zones_output, _ = guest_executor(
+        "firewall-cmd --get-zones", check_exit_code=False
+    )
+    if exit_code == 0 and zones_output:
+        for token in zones_output.split():
+            token_clean = token.strip()
+            if token_clean:
+                zone_names.add(token_clean)
+    if zone_names:
+        return zone_names, True
+    exit_code, dir_listing, dir_err = guest_executor(
+        "ls /etc/firewalld/zones", check_exit_code=False
+    )
+    if exit_code == 0 and dir_listing:
+        for line in dir_listing.splitlines():
+            candidate = line.strip()
+            if candidate.endswith(".xml"):
+                zone_names.add(candidate[:-4])
+        return zone_names, True
+    detail = (dir_err or dir_listing or "").strip() or exit_code
+    print(f"   [WARN] Unable to determine firewalld zones: {detail}")
+    return set(), False
+
+
+def _fetch_zone_interfaces(
+    guest_executor,
+    zone: str,
+    plan: Optional[FirewalldZonePlanType],
+) -> List[str]:
+    interfaces_exit, interfaces_stdout, interfaces_err = guest_executor(
+        f"firewall-cmd --permanent --zone={shlex.quote(zone)} --list-interfaces",
+        check_exit_code=False,
+    )
+    if interfaces_exit == 0:
+        zone_interfaces = [
+            entry.strip()
+            for entry in (interfaces_stdout or "").split()
+            if entry.strip()
+        ]
+    else:
+        zone_interfaces = [
+            entry.strip()
+            for entry in (plan.interfaces if plan else [])
+            if entry and entry.strip()
+        ]
+        if interfaces_err:
+            LOGGER.debug(
+                "Failed to list firewalld interfaces for zone '%s': %s",
+                zone,
+                interfaces_err.strip(),
+            )
+    return [iface for iface in zone_interfaces if iface]
+
+
+def _interfaces_require_override(
+    guest_executor,
+    zone_interfaces: Iterable[str],
+    interface_cache: Dict[str, bool],
+) -> bool:
+    for interface in zone_interfaces:
+        if _interface_has_odd_third_octet(guest_executor, interface, interface_cache):
+            return True
+    return False
+
+
+def _fetch_rich_rules(guest_executor, zone: str) -> Tuple[List[str], bool]:
+    rich_exit, rich_stdout, rich_err = guest_executor(
+        f"firewall-cmd --permanent --zone={shlex.quote(zone)} --list-rich-rules",
+        check_exit_code=False,
+    )
+    if rich_exit != 0:
+        detail = (rich_err or "").strip() or rich_exit
+        print(f"   [WARN] Unable to list rich rules for zone '{zone}': {detail}")
+        return [], False
+    return [
+        rule.strip() for rule in (rich_stdout or "").splitlines() if rule.strip()
+    ], True
+
+
+def _zone_service_allows_ssh(guest_executor, zone: str) -> Tuple[bool, bool]:
+    services_exit, services_stdout, services_err = guest_executor(
+        f"firewall-cmd --permanent --zone={shlex.quote(zone)} --list-services",
+        check_exit_code=False,
+    )
+    if services_exit != 0:
+        if services_err:
+            LOGGER.debug(
+                "Failed to list firewalld services for zone '%s': %s",
+                zone,
+                services_err.strip(),
+            )
+        return False, True
+    services = {
+        entry.strip() for entry in (services_stdout or "").split() if entry.strip()
+    }
+    return "ssh" in services, True
+
+
+def _has_conflicting_ssh_rules(current_rules: Iterable[str]) -> bool:
+    return any(
+        'service name="ssh"' in rule
+        and f'source address="{SSH_OVERRIDE_SOURCE_IP}"' not in rule
+        for rule in current_rules
+    )
+
+
+def _ensure_zone_backup(
+    guest_executor, zone_file_path: str, backup_path_value: str
+) -> bool:
+    exists_exit, _, _ = guest_executor(
+        f"test -f {shlex.quote(zone_file_path)}",
+        check_exit_code=False,
+    )
+    if exists_exit != 0:
+        return True
+    backup_cmd = (
+        f"[ -f {shlex.quote(backup_path_value)} ] || "
+        f"cp {shlex.quote(zone_file_path)} {shlex.quote(backup_path_value)}"
+    )
+    backup_exit, _, backup_err = guest_executor(backup_cmd, check_exit_code=False)
+    if backup_exit != 0:
+        detail = (backup_err or "").strip() or backup_exit
+        print(
+            f"   [WARN] Unable to back up firewalld zone file '{zone_file_path}': {detail}"
+        )
+        return False
+    return True
+
+
+def _add_ssh_rich_rule(guest_executor, zone: str, rule_value: str) -> bool:
+    add_exit, _, add_err = guest_executor(
+        f"firewall-cmd --permanent --zone={shlex.quote(zone)} "
+        f"--add-rich-rule={shlex.quote(rule_value)}",
+        check_exit_code=False,
+    )
+    if add_exit != 0:
+        detail = (add_err or "").strip() or add_exit
+        print(f"   [WARN] Failed to add SSH rich rule to zone '{zone}': {detail}")
+        return False
+    print(f"   -> Added SSH rich rule for {SSH_OVERRIDE_SOURCE_IP} to zone '{zone}'.")
+    return True
+
+
+def _process_zone_for_ssh_override(
+    guest_executor,
+    zone: str,
+    plan: Optional[FirewalldZonePlanType],
+    timestamp: str,
+    interface_cache: Dict[str, bool],
+) -> Tuple[bool, bool]:
+    zone_interfaces = _fetch_zone_interfaces(guest_executor, zone, plan)
+    if not zone_interfaces:
+        return True, False
+    if not _interfaces_require_override(
+        guest_executor, zone_interfaces, interface_cache
+    ):
+        return True, False
+
+    current_rules, rules_success = _fetch_rich_rules(guest_executor, zone)
+    if not rules_success:
+        return False, False
+
+    service_allows_ssh, _ = _zone_service_allows_ssh(guest_executor, zone)
+    if service_allows_ssh:
+        return True, False
+
+    if SSH_OVERRIDE_RICH_RULE in current_rules:
+        print(f"   -> Zone '{zone}' already allows SSH from {SSH_OVERRIDE_SOURCE_IP}.")
+        return True, False
+
+    if _has_conflicting_ssh_rules(current_rules):
+        print(
+            f"   -> Zone '{zone}' has existing SSH rich rules; skipping to avoid altering configuration."
+        )
+        return True, False
+
+    zone_file = f"/etc/firewalld/zones/{zone}.xml"
+    backup_path = f"{zone_file}-{timestamp}.bak"
+    if not _ensure_zone_backup(guest_executor, zone_file, backup_path):
+        return False, False
+
+    if not _add_ssh_rich_rule(guest_executor, zone, SSH_OVERRIDE_RICH_RULE):
+        return False, False
+
+    return True, True
+
+
 def _sync_firewalld_configuration_to_prd(
     guest_executor,
     timestamp: str,
@@ -2132,32 +2685,11 @@ def _sync_firewalld_configuration_to_prd(
         print("   -> firewalld inactive; skipping firewalld configuration sync.")
         return True
 
-    zone_names: Set[str] = {
-        plan.name.strip()
-        for plan in (source_zones or [])
-        if getattr(plan, "name", None)
-    }
-    exit_code, zones_output, _ = guest_executor(
-        "firewall-cmd --get-zones", check_exit_code=False
+    zone_names, discovery_success = _discover_firewalld_zones(
+        guest_executor, source_zones
     )
-    if exit_code == 0 and zones_output:
-        for token in zones_output.split():
-            token_clean = token.strip()
-            if token_clean:
-                zone_names.add(token_clean)
-    if not zone_names:
-        exit_code, dir_listing, dir_err = guest_executor(
-            "ls /etc/firewalld/zones", check_exit_code=False
-        )
-        if exit_code == 0 and dir_listing:
-            for line in dir_listing.splitlines():
-                candidate = line.strip()
-                if candidate.endswith(".xml"):
-                    zone_names.add(candidate[:-4])
-        else:
-            detail = (dir_err or dir_listing or "").strip() or exit_code
-            print(f"   [WARN] Unable to determine firewalld zones: {detail}")
-            return False
+    if not discovery_success:
+        return False
     if not zone_names:
         print("   -> No firewalld zones detected; skipping SSH override.")
         return True
@@ -2169,150 +2701,20 @@ def _sync_firewalld_configuration_to_prd(
     interface_cache: Dict[str, bool] = {}
     zones_updated: List[str] = []
     overall_success = True
-    rule_value = SSH_OVERRIDE_RICH_RULE
 
     for zone in sorted(zone_names):
         plan = plan_lookup.get(zone)
-        interfaces_exit, interfaces_stdout, interfaces_err = guest_executor(
-            f"firewall-cmd --permanent --zone={shlex.quote(zone)} --list-interfaces",
-            check_exit_code=False,
+        zone_success, updated = _process_zone_for_ssh_override(
+            guest_executor,
+            zone,
+            plan,
+            timestamp,
+            interface_cache,
         )
-        if interfaces_exit == 0:
-            zone_interfaces = [
-                entry.strip()
-                for entry in (interfaces_stdout or "").split()
-                if entry.strip()
-            ]
-        else:
-            zone_interfaces = [
-                entry.strip()
-                for entry in (plan.interfaces if plan else [])
-                if entry and entry.strip()
-            ]
-            if interfaces_err:
-                LOGGER.debug(
-                    "Failed to list firewalld interfaces for zone '%s': %s",
-                    zone,
-                    interfaces_err.strip(),
-                )
-        zone_interfaces = [iface for iface in zone_interfaces if iface]
-        if not zone_interfaces:
-            continue
-
-        requires_override = False
-        for interface in zone_interfaces:
-            if _interface_has_odd_third_octet(
-                guest_executor, interface, interface_cache
-            ):
-                requires_override = True
-                break
-        if not requires_override:
-            continue
-
-        rich_exit, rich_stdout, rich_err = guest_executor(
-            f"firewall-cmd --permanent --zone={shlex.quote(zone)} --list-rich-rules",
-            check_exit_code=False,
-        )
-        if rich_exit != 0:
-            detail = (rich_err or "").strip() or rich_exit
-            print(f"   [WARN] Unable to list rich rules for zone '{zone}': {detail}")
+        if not zone_success:
             overall_success = False
-            continue
-        current_rules = [
-            rule.strip() for rule in (rich_stdout or "").splitlines() if rule.strip()
-        ]
-        services_exit, services_stdout, services_err = guest_executor(
-            f"firewall-cmd --permanent --zone={shlex.quote(zone)} --list-services",
-            check_exit_code=False,
-        )
-        if services_exit == 0:
-            services = {
-                entry.strip()
-                for entry in (services_stdout or "").split()
-                if entry.strip()
-            }
-            if "ssh" in services:
-                print(
-                    f"   -> Zone '{zone}' already exposes SSH service broadly; skipping updates to preserve configuration."
-                )
-                continue
-        else:
-            if services_err:
-                LOGGER.debug(
-                    "Failed to list firewalld services for zone '%s': %s",
-                    zone,
-                    services_err.strip(),
-                )
-        if rule_value in current_rules:
-            print(
-                f"   -> Zone '{zone}' already allows SSH from {SSH_OVERRIDE_SOURCE_IP}."
-            )
-            continue
-        conflicting_rules = [
-            rule
-            for rule in current_rules
-            if 'service name="ssh"' in rule
-            and f'source address="{SSH_OVERRIDE_SOURCE_IP}"' not in rule
-        ]
-        if conflicting_rules:
-            print(
-                f"   -> Zone '{zone}' has existing SSH rich rules; skipping to avoid altering configuration."
-            )
-            continue
-
-        zone_file = f"/etc/firewalld/zones/{zone}.xml"
-        backup_path = f"{zone_file}-{timestamp}.bak"
-        backup_created = False
-
-        def _ensure_zone_backup(
-            zone_file_path: str = zone_file,
-            backup_path_value: str = backup_path,
-        ) -> bool:
-            nonlocal backup_created, overall_success
-            if backup_created:
-                return True
-            exists_exit, _, _ = guest_executor(
-                f"test -f {shlex.quote(zone_file_path)}",
-                check_exit_code=False,
-            )
-            if exists_exit != 0:
-                backup_created = True
-                return True
-            backup_cmd = (
-                f"[ -f {shlex.quote(backup_path_value)} ] || "
-                f"cp {shlex.quote(zone_file_path)} {shlex.quote(backup_path_value)}"
-            )
-            backup_exit, _, backup_err = guest_executor(
-                backup_cmd, check_exit_code=False
-            )
-            if backup_exit != 0:
-                detail = (backup_err or "").strip() or backup_exit
-                print(
-                    f"   [WARN] Unable to back up firewalld zone file '{zone_file_path}': {detail}"
-                )
-                overall_success = False
-                return False
-            backup_created = True
-            return True
-
-        if not _ensure_zone_backup():
-            continue
-
-        add_exit, _, add_err = guest_executor(
-            f"firewall-cmd --permanent --zone={shlex.quote(zone)} "
-            f"--add-rich-rule={shlex.quote(rule_value)}",
-            check_exit_code=False,
-        )
-        if add_exit != 0:
-            detail = (add_err or "").strip() or add_exit
-            print(f"   [WARN] Failed to add SSH rich rule to zone '{zone}': {detail}")
-            overall_success = False
-            continue
-
-        zones_updated.append(zone)
-        print(
-            f"   -> Added SSH rich rule for {SSH_OVERRIDE_SOURCE_IP} to zone '{zone}'."
-        )
+        if updated:
+            zones_updated.append(zone)
 
     if zones_updated:
         reload_exit, _, reload_err = guest_executor(
@@ -2684,7 +3086,10 @@ def _sync_prd_system_configuration(
 
 def _ensure_http_proxy_configuration(guest_executor, timestamp: str) -> bool:
     """Ensure /etc/profile exports http/https proxy variables when they are missing."""
-    proxy_url = "http://172.16.162.6:3128"
+    proxy_url = PROXY_URL
+    if not proxy_url:
+        print("   -> Proxy configuration disabled for this environment.")
+        return True
     profile_path = "/etc/profile"
     if _guest_path_protected(profile_path):
         print(
@@ -2822,6 +3227,7 @@ class WorkflowState:
     original_nic_info: List[NicPlanType] = field(default_factory=list)
     original_dns_servers: List[str] = field(default_factory=list)
     original_default_gateway: Optional[str] = None
+    prd_default_gateway: Optional[str] = None
     original_default_gateway_source: Optional[str] = None
     default_gateway_owner_idx: Optional[int] = None
     original_static_routes: List[Dict[str, Any]] = field(default_factory=list)
@@ -3071,7 +3477,9 @@ def collect_source_vm_metadata(
                 source_inventory = collect_interface_inventory(
                     source_guest_command_executor
                 )
-            except Exception as inventory_error:  # pylint: disable=broad-exception-caught
+            except (
+                Exception
+            ) as inventory_error:  # pylint: disable=broad-exception-caught
                 LOGGER.debug(
                     "Unable to collect source interface inventory: %s",
                     inventory_error,
@@ -3188,7 +3596,9 @@ def collect_source_vm_metadata(
                         zone_plan = FirewalldZonePlan.from_raw(
                             raw_zone, FIREWALLD_ZONE_VALIDATOR
                         )
-                    except Exception as zone_error:  # pylint: disable=broad-exception-caught
+                    except (
+                        Exception
+                    ) as zone_error:  # pylint: disable=broad-exception-caught
                         LOGGER.debug(
                             "Skipping firewalld zone '%s' due to validation error: %s",
                             zone_name,
@@ -3455,15 +3865,9 @@ class CloneAndVmotionWorkflow:
     def run(self) -> None:
         """Execute the full staged-to-production migration workflow."""
         try:
-            self._preflight_check()
-            self._collect_source_vm_details()
-            self._confirm_clone_plan()
-            self._perform_source_clone_operations()
-            self._register_destination_vm()
-            self._recreate_destination_nics()
-            self._configure_destination_network()
-            self._perform_storage_vmotion()
-            self._finalize_success()
+            for phase in WORKFLOW_PHASES_SCHEMA:
+                handler_name = phase["handler"]
+                getattr(self, handler_name)()
         except Exception as error:  # pylint: disable=broad-exception-caught
             self._handle_error(error)
         finally:
@@ -3897,7 +4301,9 @@ class CloneAndVmotionWorkflow:
                 portgroup_connection.switchUuid = (
                     dest_network.config.distributedVirtualSwitch.uuid
                 )
-                device_instance.backing = vim.vm.device.VirtualEthernetCard.DistributedVirtualPortBackingInfo()
+                device_instance.backing = (
+                    vim.vm.device.VirtualEthernetCard.DistributedVirtualPortBackingInfo()
+                )
                 device_instance.backing.port = portgroup_connection
             elif isinstance(dest_network, vim.Network):
                 backing = vim.vm.device.VirtualEthernetCard.NetworkBackingInfo()
@@ -4032,31 +4438,339 @@ class CloneAndVmotionWorkflow:
 
     def _configure_destination_network(self) -> None:
         """Configure guest networking on the destination VM after registration."""
-        raise NotImplementedError
+        print("\n--- [Phase 5/7] Destination Guest: Configure Network ---")
+        state = self.state
+        if not state.original_nic_info:
+            print("   - Skipping network configuration because no NIC information is available.")
+            return
+
+        self._ensure_dest_session_alive(refresh_content=True, refresh_vm=True)
+        migrated_vm = state.migrated_vm
+        if not migrated_vm or not self.content_dest:
+            raise RuntimeError("Destination VM context is missing; NIC configuration cannot continue.")
+
+        runtime = getattr(migrated_vm, "runtime", None)
+        power_state = getattr(runtime, "powerState", None)
+        if power_state != "poweredOn":
+            print("   -> Powering on destination VM to configure guest networking...")
+            task = migrated_vm.PowerOn()
+            wait_for_task_completion(
+                task,
+                "Destination VM power-on task",
+                poll_interval=5.0,
+                timeout=900.0,
+                progress_label="Guest power-on progress",
+            )
+            print("   [OK] Destination VM powered on.")
+        print("   -> Waiting for VMware Tools inside the destination guest...")
+        if not _wait_for_guest_tools(migrated_vm):
+            raise TimeoutError(
+                "VMware Tools did not report a running state within the expected time window."
+            )
+        print("   [OK] VMware Tools is responding; proceeding with guest configuration.")
+        guest_operations_manager = getattr(self.content_dest, "guestOperationsManager", None)
+        if guest_operations_manager is None:
+            raise RuntimeError("Guest operations manager unavailable on destination vCenter.")
+
+        reset_root_login_disabled()
+        sdk_client: Optional[VsphereGuestNetworkSDKType] = None
+        vm_moid = getattr(migrated_vm, "_moId", None)
+
+        try:
+            root_credentials = vim.vm.guest.NamePasswordAuthentication(
+                username=GUEST_ROOT_USER,
+                password=self.guest_root_pwd,
+            )
+            admin_credentials = None
+            if GUEST_ADMIN_USER and self.guest_admin_pwd:
+                admin_credentials = vim.vm.guest.NamePasswordAuthentication(
+                    username=GUEST_ADMIN_USER,
+                    password=self.guest_admin_pwd,
+                )
+
+            def guest_executor(command: str, check_exit_code: bool = True):
+                return execute_command_in_guest(
+                    guest_operations_manager,
+                    migrated_vm,
+                    root_credentials,
+                    admin_credentials,
+                    self.guest_admin_pwd,
+                    command,
+                    check_exit_code=check_exit_code,
+                )
+
+            nmcli_probe, _, _ = guest_executor("command -v nmcli", check_exit_code=False)
+            nmcli_supported = nmcli_probe == 0
+
+            for nic_plan in state.original_nic_info:
+                converted_ip = _convert_stg_ipv4_to_prd(
+                    nic_plan.get("prd_ip_address") or nic_plan.get("ip_address")
+                )
+                if converted_ip:
+                    nic_plan["prd_ip_address"] = converted_ip
+                    try:
+                        nic_plan["prd_ip_segment"] = int(converted_ip.split(".")[2])
+                    except (ValueError, IndexError):
+                        nic_plan["prd_ip_segment"] = None
+
+            prd_default_gateway = _convert_stg_ipv4_to_prd(state.original_default_gateway)
+            state.prd_default_gateway = prd_default_gateway
+            state.prd_static_routes = determine_prd_static_routes(
+                state.original_nic_info,
+                prd_default_gateway,
+                state.original_static_routes,
+            )
+
+            configured_route_indices: Set[int] = set()
+            gateway_nic_present = any(
+                nic.get("is_gateway_nic") for nic in state.original_nic_info
+            )
+            overall_dns_targets = _convert_dns_entries(state.original_dns_servers)
+            if REQUESTS_AVAILABLE and vm_moid:
+                try:
+                    sdk_client = VsphereGuestNetworkSDK(
+                        host=VCSA_HOST_DEST,
+                        username=VCSA_USER,
+                        password=self.vcsa_pwd_dest,
+                        verify_ssl=False,
+                    )
+                except Exception as sdk_error:  # pylint: disable=broad-exception-caught
+                    LOGGER.debug(
+                        "Unable to initialize guest networking SDK verification: %s",
+                        sdk_error,
+                        exc_info=True,
+                    )
+                    sdk_client = None
+
+            for nic_index, nic_plan in enumerate(state.original_nic_info, start=1):
+                print(f"\n  -> Configuring NIC {nic_index} ({nic_plan.get('network_name')})")
+                target_mac = nic_plan.get("new_mac_address") or nic_plan.get("mac_address")
+                interface_context = prepare_guest_interface(
+                    nic_index - 1, nic_plan, guest_executor, target_mac
+                )
+                device_name = interface_context.device_name
+                connection_name = nic_plan.get("original_ifname") or device_name
+                con_name = f"{connection_name}-prd"
+
+                new_ip = nic_plan.get("prd_ip_address") or _convert_stg_ipv4_to_prd(
+                    nic_plan.get("ip_address")
+                )
+                prefix = nic_plan.get("subnet_prefix")
+                if prefix is None:
+                    prefix = mask_to_prefix(cast(Optional[str], nic_plan.get("subnet_mask")))
+
+                expected_gateway_value = nic_plan.get("gateway")
+                if expected_gateway_value:
+                    expected_gateway_value = (
+                        _convert_stg_ipv4_to_prd(expected_gateway_value) or expected_gateway_value
+                    )
+                elif nic_plan.get("is_gateway_nic"):
+                    expected_gateway_value = prd_default_gateway
+
+                new_dns_servers = _convert_dns_entries(nic_plan.get("dns_servers", []))
+                if not new_dns_servers:
+                    new_dns_servers = overall_dns_targets[:] or _convert_dns_entries(
+                        state.original_dns_servers
+                    )
+
+                routes_for_nic = _collect_routes_for_nic(
+                    state.prd_static_routes,
+                    configured_route_indices,
+                    nic_index - 1,
+                )
+                should_configure_routes = _should_configure_routes_for_nic(
+                    prd_default_gateway,
+                    new_ip,
+                    prefix,
+                    routes_for_nic,
+                    gateway_nic_present,
+                    nic_index - 1,
+                )
+
+                params = NmcliConfigParams(
+                    guest_command_executor=guest_executor,
+                    device_name=device_name,
+                    con_name=con_name,
+                    nmcli_supported=nmcli_supported,
+                    new_mac_lower=interface_context.new_mac_lower,
+                    original_mac_lower=interface_context.original_mac_lower,
+                    expected_gateway_value=expected_gateway_value,
+                    new_dns_servers=new_dns_servers,
+                    should_configure_routes=should_configure_routes,
+                    routes_for_nic=routes_for_nic,
+                    new_ip=new_ip,
+                    prefix=prefix,
+                    expected_dns_servers=new_dns_servers or overall_dns_targets,
+                    expected_dns_overall=overall_dns_targets or new_dns_servers,
+                    guest_iface_names=interface_context.interface_names,
+                    guest_iface_names_compact=interface_context.interface_names_compact,
+                )
+
+                config_result = _configure_nic_with_nmcli(params)
+                configured_route_indices.update(config_result.route_indices)
+                if config_result.expected_dns_overall:
+                    overall_dns_targets = config_result.expected_dns_overall
+
+                if config_result.use_nmcli_connection and new_ip and prefix is not None:
+                    try:
+                        verify_nmcli_connection_settings(
+                            guest_executor,
+                            con_name,
+                            device_name,
+                            f"{new_ip}/{prefix}",
+                            expected_gateway_value,
+                            config_result.route_lines,
+                            config_result.expected_dns_servers or new_dns_servers,
+                        )
+                    except Exception as verify_error:  # pylint: disable=broad-exception-caught
+                        LOGGER.debug(
+                            "nmcli verification reported issues for %s: %s",
+                            con_name,
+                            verify_error,
+                            exc_info=True,
+                        )
+
+                if config_result.legacy_verification_command and not config_result.legacy_success:
+                    print(
+                        "   [WARN] Legacy network configuration could not be fully verified; "
+                        "please confirm connectivity manually."
+                    )
+                else:
+                    log_success(f"Configured destination NIC {nic_index} ({device_name}).")
+
+            if sdk_client and vm_moid:
+                verify_destination_network_with_sdk(
+                    sdk_client,
+                    vm_moid,
+                    state.original_nic_info,
+                    overall_dns_targets,
+                    state.prd_static_routes,
+                )
+
+            print("   -> Synchronising guest system configuration with PRD expectations...")
+            if _sync_prd_system_configuration(guest_executor, state.source_firewalld_zones):
+                log_success("Guest OS configuration synchronized with PRD mappings.")
+            else:
+                log_failure("Guest OS configuration sync reported warnings.")
+        finally:
+            if sdk_client:
+                try:
+                    sdk_client.close()
+                except Exception:  # pylint: disable=broad-exception-caught
+                    LOGGER.debug("Failed to close SDK client", exc_info=True)
+            reset_root_login_disabled()
 
     def _perform_storage_vmotion(self) -> None:
-        raise NotImplementedError
+        print("\n--- [Phase 6/7] Storage vMotion ---")
+        final_datastore_name = TARGET_DATASTORE_NAME_FINAL or TARGET_DATASTORE_NAME
+        if not final_datastore_name:
+            print("   - Skipping Storage vMotion because no final datastore is configured.")
+            return
+
+        self._ensure_dest_session_alive(refresh_content=True, refresh_vm=True)
+        state = self.state
+        migrated_vm = state.migrated_vm
+        if not migrated_vm or not self.content_dest:
+            raise RuntimeError("Destination VM is unavailable; cannot start Storage vMotion.")
+
+        if any(
+            getattr(ds, "name", "").strip() == final_datastore_name
+            for ds in getattr(migrated_vm, "datastore", []) or []
+        ):
+            print(f"   -> VM already resides on datastore '{final_datastore_name}'.")
+            return
+
+        datastore_view = self.content_dest.viewManager.CreateContainerView(
+            self.content_dest.rootFolder,
+            [vim.Datastore],
+            True,
+        )
+        try:
+            final_datastore = next(
+                (ds for ds in datastore_view.view if ds.name == final_datastore_name),
+                None,
+            )
+        finally:
+            datastore_view.Destroy()
+
+        if not final_datastore:
+            raise FileNotFoundError(
+                f"Final datastore '{final_datastore_name}' was not found on the destination vCenter."
+            )
+
+        print(f"   -> Initiating Storage vMotion to '{final_datastore_name}'...")
+        relocate_spec = vim.vm.RelocateSpec(datastore=final_datastore)
+        task = migrated_vm.RelocateVM_Task(spec=relocate_spec)
+        wait_for_task_completion(
+            task,
+            "Storage vMotion task",
+            poll_interval=5.0,
+            timeout=7200.0,
+            progress_label="Storage vMotion progress",
+        )
+        state.target_datastore = final_datastore
+        log_success(f"Storage vMotion to '{final_datastore_name}' completed.")
+        print("   [OK] Storage vMotion completed.")
 
     def _finalize_success(self) -> None:
-        raise NotImplementedError
+        print("\n--- [Phase 7/7] Finalize & Summary ---")
+        self._ensure_dest_session_alive(refresh_content=False, refresh_vm=False)
+        state = self.state
+        vm_name = state.clone_name or getattr(state.migrated_vm, "name", None) or "(unknown)"
+        print(f"   -> Migration workflow completed for VM '{vm_name}'.")
+        log_success("Migration workflow completed successfully.")
 
     def _handle_error(self, error: Exception) -> None:
-        raise NotImplementedError
+        print(f"\n[ERROR] {error}")
+        log_failure(str(error))
+        rollback_vm_name = (
+            self.state.migrated_vm_name_for_rollback
+            or self.state.clone_name
+        )
+        try:
+            self.si_dest, self.state.dest_keepalive_handle = _ensure_destination_session(
+                self.si_dest,
+                self.state.dest_keepalive_handle,
+                self.ctx,
+            )
+            if rollback_vm_name:
+                _delete_destination_vm(
+                    self.si_dest,
+                    rollback_vm_name,
+                    cause=error,
+                )
+        except Exception as rollback_error:  # pylint: disable=broad-exception-caught
+            LOGGER.error("Rollback failed: %s", rollback_error, exc_info=True)
+        raise
 
     def _cleanup(self) -> None:
-        raise NotImplementedError
+        state = self.state
+        if state.source_keepalive_handle:
+            _stop_keepalive_thread(state.source_keepalive_handle)
+            state.source_keepalive_handle = None
+        if state.dest_keepalive_handle:
+            _stop_keepalive_thread(state.dest_keepalive_handle)
+            state.dest_keepalive_handle = None
+        if self.si_source is not None:
+            try:
+                Disconnect(self.si_source)
+            except Exception:  # pylint: disable=broad-exception-caught
+                LOGGER.debug("Error disconnecting source vCenter session", exc_info=True)
+            self.si_source = None
+        if self.si_dest is not None:
+            try:
+                Disconnect(self.si_dest)
+            except Exception:  # pylint: disable=broad-exception-caught
+                LOGGER.debug("Error disconnecting destination vCenter session", exc_info=True)
+            self.si_dest = None
+        _print_execution_summary()
 
 
-def main() -> None:
-    """Entry point for the CLI-driven clone and vMotion workflow orchestration."""
-    global \
-        GUEST_ROOT_PWD, \
-        GUEST_ADMIN_PWD, \
-        VCSA_PWD_SOURCE, \
-        VCSA_PWD_DEST, \
-        workflow_had_warnings
+WORKFLOW_PHASES_SCHEMA: List[Dict[str, str]] = load_workflow_phase_schema(SCHEMA_DIR)
 
-    cli_args = _parse_cli_arguments()
+
+def _apply_cli_configuration(cli_args: argparse.Namespace) -> str:
+    """Handle CLI flags that adjust protected paths and return the provided VM name."""
     if getattr(cli_args, "enable_standard_config_edits", False):
         unregister_protected_guest_paths(DEFAULT_PROTECTED_GUEST_PATHS)
         print(
@@ -4069,11 +4783,12 @@ def main() -> None:
             print(
                 f"[INFO] Protecting guest file: {_normalize_guest_path(protected_path)}"
             )
-    provided_source_vm_name = (cli_args.source_vm_name or "").strip()
+    return (cli_args.source_vm_name or "").strip()
 
-    # ------------------------------------------------
-    # 1. Enter passwords
-    # ------------------------------------------------
+
+def _prompt_vcenter_passwords() -> None:
+    """Prompt for source/destination vCenter credentials and store them globally."""
+    global VCSA_PWD_SOURCE, VCSA_PWD_DEST  # pylint: disable=global-statement
     try:
         VCSA_PWD_SOURCE = getpass.getpass(
             f"Password for {VCSA_USER} on {VCSA_HOST_SOURCE}: "
@@ -4086,28 +4801,34 @@ def main() -> None:
         log_failure(f"Credential prompt interrupted: {error}")
         _print_execution_summary()
         sys.exit(1)
-    reset_root_login_disabled()
 
-    # ------------------------------------------------
-    # 2. Configure SSL context
-    # ------------------------------------------------
+
+def _create_ssl_context() -> ssl.SSLContext:
+    """Create an SSL context with hostname verification disabled for vCenter connections."""
     ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ssl_context.check_hostname = False
     ssl_context.verify_mode = ssl.CERT_NONE
+    return ssl_context
 
-    # ------------------------------------------------
-    # 3. Collect target VM name and guest credentials
-    # ------------------------------------------------
-    input_target_vm_name = provided_source_vm_name
-    if not input_target_vm_name:
-        input_target_vm_name = input("Enter the name of the VM to clone: ").strip()
-        if not input_target_vm_name:
+
+def _resolve_target_vm_name(provided_vm_name: str) -> str:
+    """Determine the VM to clone, prompting the user when necessary."""
+    target_vm_name = provided_vm_name
+    if not target_vm_name:
+        target_vm_name = input("Enter the name of the VM to clone: ").strip()
+        if not target_vm_name:
             print("No VM name provided. Aborting processing.")
             log_failure("No VM name provided.")
             _print_execution_summary()
             sys.exit(0)
     else:
-        print(f"Using source VM '{input_target_vm_name}' provided via CLI argument.")
+        print(f"Using source VM '{target_vm_name}' provided via CLI argument.")
+    return target_vm_name
+
+
+def _prompt_guest_credentials() -> None:
+    """Prompt for guest credentials and persist them in module-level globals."""
+    global GUEST_ROOT_PWD, GUEST_ADMIN_PWD  # pylint: disable=global-statement
     try:
         GUEST_ROOT_PWD = getpass.getpass(
             f"Password for Guest OS user '{GUEST_ROOT_USER}': "
@@ -4121,1327 +4842,30 @@ def main() -> None:
         _print_execution_summary()
         sys.exit(1)
 
-    # ------------------------------------------------
-    # Main processing
-    # ------------------------------------------------
-    clone_name = None
-    vmx_path = None
-    new_vm_on_source = None
-    migrated_vm_for_rollback = None
-    migrated_vm_name_for_rollback = None
-    migrated_vm: Any | None = None
-    unregistered_from_source = False
-    dest_vm_retained = False
-    original_nic_info: List[NicPlanType] = []
-    original_dns_servers: List[str] = []
-    original_default_gateway: str | None = None
-    original_default_gateway_source: str | None = None
-    original_static_routes: List[Dict[str, Any]] = []
-    source_firewalld_zones: List[FirewalldZonePlanType] = []
-    si_source = None
-    content_source = None
-    si_dest = None
-    sdk_network_client: Optional[VsphereGuestNetworkSDKType] = None
-    source_keepalive_handle: Optional[Tuple[threading.Thread, threading.Event]] = None
-    dest_keepalive_handle: Optional[Tuple[threading.Thread, threading.Event]] = None
-    cancellation_requested = False
-    cancellation_message: Optional[str] = None
-    fatal_error: Optional[BaseException] = None
-    try:
-        si_source = authenticate_vcenter(
-            VCSA_HOST_SOURCE,
-            VCSA_USER,
-            VCSA_PWD_SOURCE,
-            ssl_context,
-            host_env_var=ENV_SOURCE_HOST_VAR,
-        )
-        source_keepalive_handle = _start_keepalive_thread(si_source, "source-vcenter")
-        content_source = si_source.RetrieveContent()
-        target_vm = find_vm_by_name(content_source, input_target_vm_name)
-        if not target_vm:
-            raise FileNotFoundError(f"VM '{input_target_vm_name}' was not found.")
-        print(f"[OK] Located VM '{target_vm.name}'.")
-        if target_vm.guest.toolsRunningStatus != "guestToolsRunning":
-            raise SystemError(
-                "Source VM must be powered on with VMware Tools running to collect IP information."
-            )
-        source_details = collect_source_vm_metadata(
-            content=content_source,
-            target_vm=target_vm,
-            vcsa_host=VCSA_HOST_SOURCE,
-            vcsa_user=VCSA_USER,
-            vcsa_password=VCSA_PWD_SOURCE,
-            guest_root_pwd=GUEST_ROOT_PWD,
-            guest_admin_pwd=GUEST_ADMIN_PWD,
-        )
-        original_nic_info = list(source_details.nic_plans)
-        original_dns_servers = list(source_details.dns_servers)
-        original_default_gateway = source_details.default_gateway
-        original_default_gateway_source = source_details.default_gateway_source
-        default_gateway_owner_idx = source_details.default_gateway_owner_idx
-        original_static_routes = [dict(route) for route in source_details.static_routes]
-        source_dns_servers = list(source_details.dns_servers)
-        source_firewalld_zones = [
-            FirewalldZonePlan.from_raw(zone.to_dict(), FIREWALLD_ZONE_VALIDATOR)
-            for zone in source_details.firewalld_zones
-        ]
-        datastore_view = content_source.viewManager.CreateContainerView(
-            content_source.rootFolder,
-            [vim.Datastore],
-            True,
-        )
-        try:
-            target_datastore = next(
-                (ds for ds in datastore_view.view if ds.name == TARGET_DATASTORE_NAME),
-                None,
-            )
-        finally:
-            datastore_view.Destroy()
-        if not target_datastore:
-            raise FileNotFoundError(
-                f"Datastore '{TARGET_DATASTORE_NAME}' was not found."
-            )
-        print(f"   [OK] Datastore '{target_datastore.name}' confirmed.")
-        date_suffix = datetime.now().strftime("%Y%m%d")
-        clone_name = f"{target_vm.name}-{date_suffix}"
 
-        # --- Pre-execution confirmation (1/4) ---
-        print("\n" + "=" * 25 + " Pre-execution Check (1/4) " + "=" * 25)
-        print(
-            "Review the details below before creating the clone and starting the migration."
-        )
-        print("\n  [Source VM details]")
-        print(f"    - VM name       : {target_vm.name}")
-        print(f"    - OS            : {target_vm.summary.config.guestFullName}")
-        print("\n  [Source NIC details]")
-        if original_nic_info:
-            for i, nic in enumerate(original_nic_info):
-                is_gateway_nic = (
-                    default_gateway_owner_idx is not None
-                    and i == default_gateway_owner_idx
-                )
-                print(f"    - NIC {i + 1} ({nic['mac_address']})")
-                print(f"      - Network     : {nic['network_name']}")
-                print(f"      - IP Address  : {nic['ip_address']}")
-                print(f"      - Subnet Mask : {nic['subnet_mask']}")
-                if is_gateway_nic:
-                    print("      - Default GW  : owns default gateway route")
-        else:
-            print("    - No NIC information was found.")
-        if source_dns_servers:
-            print("\n  [Source DNS servers]")
-            for dns_server in source_dns_servers:
-                print(f"    - {dns_server}")
-        else:
-            print("\n  [Source DNS servers]")
-            print("    - None reported.")
-        if original_default_gateway:
-            if original_default_gateway_source in ("octet-fallback", "nic-gateway"):
-                print(
-                    f"    - Gateway     : (not reported; fallback -> {original_default_gateway})"
-                )
-            elif original_default_gateway_source == "route-inferred":
-                print(f"    - Gateway     : (inferred) {original_default_gateway}")
-            else:
-                print(f"    - Gateway     : {original_default_gateway}")
-        else:
-            print("    - Default gateway not detected.")
-        print("\n  [Clone VM specification]")
-        print(f"    - New VM name   : {clone_name}")
-        print(f"    - Placement datastore: {TARGET_DATASTORE_NAME}")
-        print("=" * 64)
-        user_approval = input("\nProceed with this clone operation? (y/n): ")
-        if user_approval.lower() != "y":
-            cancellation_requested = True
-            cancellation_message = "Operation cancelled by the user."
-            print("\n[INFO] Operation cancelled by the user.")
-            return
+def _execute_workflow(target_vm_name: str, ssl_context: ssl.SSLContext) -> None:
+    """Run the migration workflow phases after credentials and context are prepared."""
+    workflow = CloneAndVmotionWorkflow(
+        ctx=ssl_context,
+        vcsa_pwd_source=VCSA_PWD_SOURCE,
+        vcsa_pwd_dest=VCSA_PWD_DEST,
+        target_vm_name=target_vm_name,
+        guest_root_pwd=GUEST_ROOT_PWD,
+        guest_admin_pwd=GUEST_ADMIN_PWD,
+    )
+    workflow.run()
 
-        # --- Clone, NIC removal, and unregister operations ---
-        relocate_spec = vim.vm.RelocateSpec(datastore=target_datastore)
-        clone_spec = vim.vm.CloneSpec(
-            location=relocate_spec, powerOn=False, template=False
-        )
-        print("\nStarting clone task...")
-        task = target_vm.Clone(
-            folder=target_vm.parent, name=clone_name, spec=clone_spec
-        )
-        wait_for_task_completion(
-            task,
-            "Clone task",
-            poll_interval=5.0,
-            timeout=3600.0,
-            progress_label="Clone progress",
-        )
-        print(f"\n[OK] Clone completed: '{clone_name}'")
 
-        new_vm_on_source = task.info.result
-
-        # NIC removal
-        print(f"   Removing NICs from cloned VM '{new_vm_on_source.name}'...")
-        nic_devices_to_remove = [
-            dev
-            for dev in new_vm_on_source.config.hardware.device
-            if isinstance(dev, vim.vm.device.VirtualEthernetCard)
-        ]
-        if nic_devices_to_remove:
-            nic_change_spec = [
-                vim.vm.device.VirtualDeviceSpec(operation="remove", device=nic)
-                for nic in nic_devices_to_remove
-            ]
-            config_spec = vim.vm.ConfigSpec(deviceChange=nic_change_spec)
-            task = new_vm_on_source.ReconfigVM_Task(spec=config_spec)
-            wait_for_task_completion(
-                task,
-                "NIC removal task",
-                poll_interval=2.0,
-                timeout=600.0,
-            )
-            print("   [OK] Removed NICs.")
-
-        vmx_path = new_vm_on_source.config.files.vmPathName
-        print(f"   Unregistering VM '{clone_name}' from the source vCenter...")
-        new_vm_on_source.UnregisterVM()
-        unregistered_from_source = True
-        print("   [OK] Unregistration completed.")
-        _stop_keepalive_thread(source_keepalive_handle)
-        source_keepalive_handle = None
-        Disconnect(si_source)
-        si_source = None
-        new_vm_on_source = None
-
-        # --- [Phase 2/7] ~ [Phase 7/7]: Destination vCenter operations ---
-        print("\n--- [Phase 2/7] Destination vCenter: Connect & Pre-check ---")
-        si_dest = authenticate_vcenter(
-            VCSA_HOST_DEST,
-            VCSA_USER,
-            VCSA_PWD_DEST,
-            ssl_context,
-            host_env_var=ENV_DEST_HOST_VAR,
-        )
-        print("[OK] Connected to destination vCenter.")
-        dest_keepalive_handle = _start_keepalive_thread(si_dest, "dest-vcenter")
-        content_dest = si_dest.RetrieveContent()
-        vm_view = content_dest.viewManager.CreateContainerView(
-            content_dest.rootFolder,
-            [vim.VirtualMachine],
-            True,
-        )
-        try:
-            clone_exists = any(vm for vm in vm_view.view if vm.name == clone_name)
-        finally:
-            vm_view.Destroy()
-        if clone_exists:
-            raise FileExistsError(
-                f"A VM named '{clone_name}' already exists on the destination vCenter."
-            )
-        print("[OK] No conflicting VM found on destination vCenter.")
-        print("\n--- [Phase 3/7] Destination vCenter: Register VM ---")
-        cluster_view = content_dest.viewManager.CreateContainerView(
-            content_dest.rootFolder,
-            [vim.ClusterComputeResource],
-            True,
-        )
-        try:
-            dest_cluster = next(
-                (
-                    cluster
-                    for cluster in cluster_view.view
-                    if cluster.name == TARGET_CLUSTER_NAME
-                ),
-                None,
-            )
-        finally:
-            cluster_view.Destroy()
-        if not dest_cluster:
-            raise FileNotFoundError(
-                f"Destination cluster '{TARGET_CLUSTER_NAME}' was not found."
-            )
-        task = dest_cluster.parent.parent.vmFolder.RegisterVM_Task(
-            path=vmx_path,
-            name=clone_name,
-            asTemplate=False,
-            pool=dest_cluster.resourcePool,
-        )
-        wait_for_task_completion(
-            task,
-            "VM registration task",
-            poll_interval=5.0,
-            timeout=900.0,
-        )
-        migrated_vm = wait_for_vm_availability(
-            content_dest, clone_name, retries=60, delay_seconds=2
-        )
-        migrated_vm_for_rollback = migrated_vm  # Preserve for rollback
-        migrated_vm_name_for_rollback = clone_name
-        print("[OK] VM registration completed.")
-        print("\n--- [Phase 4/7] Destination vCenter: Reconfigure NICs ---")
-        if original_nic_info:
-            print("\n" + "=" * 25 + " Pre-execution Check (2/4) " + "=" * 25)
-            print("Re-create NICs on the migrated VM and connect to these networks.")
-            device_change_spec: List[vim.vm.device.VirtualDeviceSpec] = []
-            dest_network_lookup: List[Tuple[str, Optional[Tuple[str, ...]]]] = []
-            for i, nic in enumerate(original_nic_info):
-                original_network_name = nic["network_name"]
-                dest_network_name = original_network_name.replace("STG", "PRD", 1)
-                print(
-                    f"  - NIC {i + 1}: '{original_network_name}' -> '{dest_network_name}'"
-                )
-
-                network_view = content_dest.viewManager.CreateContainerView(
-                    content_dest.rootFolder,
-                    [vim.Network],
-                    True,
-                )
-                try:
-                    dest_network = next(
-                        (
-                            net
-                            for net in network_view.view
-                            if net.name == dest_network_name
-                        ),
-                        None,
-                    )
-                finally:
-                    network_view.Destroy()
-
-                nic_spec = vim.vm.device.VirtualDeviceSpec()
-                nic_spec.operation = vim.vm.device.VirtualDeviceSpec.Operation.add
-                nic_device_class = _resolve_virtual_nic_class(nic.get("device_type"))
-                nic_spec.device = nic_device_class()
-                nic_spec.device.key = -(100 + i)
-
-                if isinstance(dest_network, vim.dvs.DistributedVirtualPortgroup):
-                    portgroup_connection = vim.dvs.PortConnection()
-                    portgroup_connection.portgroupKey = dest_network.key
-                    portgroup_connection.switchUuid = (
-                        dest_network.config.distributedVirtualSwitch.uuid
-                    )
-                    nic_spec.device.backing = vim.vm.device.VirtualEthernetCard.DistributedVirtualPortBackingInfo()
-                    nic_spec.device.backing.port = portgroup_connection
-                elif isinstance(dest_network, vim.Network):
-                    nic_spec.device.backing = (
-                        vim.vm.device.VirtualEthernetCard.NetworkBackingInfo()
-                    )
-                    nic_spec.device.backing.network = dest_network
-                    nic_spec.device.backing.deviceName = dest_network_name
-                else:
-                    raise FileNotFoundError(
-                        f"Destination network '{dest_network_name}' was not found."
-                    )
-                nic_spec.device.connectable = vim.vm.device.VirtualDevice.ConnectInfo(
-                    startConnected=True, allowGuestControl=True
-                )
-                device_change_spec.append(nic_spec)
-
-                print("=" * 64)
-                user_approval_nic = input("\nApply this NIC configuration? (y/n): ")
-                if user_approval_nic.lower() != "y":
-                    raise InterruptedError(
-                        "NIC configuration was cancelled by the user."
-                    )
-                if isinstance(dest_network, vim.dvs.DistributedVirtualPortgroup):
-                    dest_identifier = (
-                        "dvs",
-                        dest_network.key,
-                        dest_network.config.distributedVirtualSwitch.uuid,
-                    )
-                elif isinstance(dest_network, vim.Network):
-                    dest_identifier = ("network", getattr(dest_network, "_moId", None))
-                else:
-                    dest_identifier = None
-                dest_network_lookup.append((dest_network_name, dest_identifier))
-
-            if not device_change_spec:
-                print(
-                    "   - Skipping NIC reconfiguration because no NIC specifications were prepared."
-                )
-            else:
-                print("\nApproved. Starting NIC reconfiguration task...")
-                config_spec = vim.vm.ConfigSpec(deviceChange=device_change_spec)
-                try:
-                    task = migrated_vm.ReconfigVM_Task(spec=config_spec)
-                except vmodl.fault.ManagedObjectNotFound:
-                    migrated_vm = wait_for_vm_availability(
-                        content_dest, clone_name, retries=30, delay_seconds=2
-                    )
-                    migrated_vm_for_rollback = migrated_vm
-                    migrated_vm_name_for_rollback = clone_name
-                    task = migrated_vm.ReconfigVM_Task(spec=config_spec)
-                wait_for_task_completion(
-                    task,
-                    "NIC reconfiguration task",
-                    poll_interval=2.0,
-                    timeout=900.0,
-                )
-                print("   [OK] NIC reconfiguration completed.")
-                print("   Fetching updated NIC information...")
-
-            try:
-                migrated_vm.Reload()
-            except vmodl.fault.ManagedObjectNotFound:
-                migrated_vm = wait_for_vm_availability(
-                    content_dest, clone_name, retries=30, delay_seconds=2
-                )
-                migrated_vm_for_rollback = migrated_vm
-                migrated_vm_name_for_rollback = clone_name
-                migrated_vm.Reload()
-            newly_added_nics = [
-                dev
-                for dev in migrated_vm.config.hardware.device
-                if isinstance(dev, vim.vm.device.VirtualEthernetCard)
-            ]
-            if len(newly_added_nics) != len(original_nic_info):
-                raise RuntimeError(
-                    f"Recreated NIC count does not match the expected number "
-                    f"(expected {len(original_nic_info)}, found {len(newly_added_nics)})."
-                )
-
-            remaining_new_nics = list(newly_added_nics)
-            for nic_record, (dest_name, dest_identifier) in zip(
-                original_nic_info, dest_network_lookup
-            ):
-                matched_nic = None
-                for nic_dev in remaining_new_nics:
-                    backing = nic_dev.backing
-                    actual_identifier = None
-                    actual_name = None
-                    if isinstance(
-                        backing,
-                        vim.vm.device.VirtualEthernetCard.DistributedVirtualPortBackingInfo,
-                    ):
-                        actual_identifier = (
-                            "dvs",
-                            getattr(backing.port, "portgroupKey", None),
-                            getattr(backing.port, "switchUuid", None),
-                        )
-                    elif isinstance(
-                        backing, vim.vm.device.VirtualEthernetCard.NetworkBackingInfo
-                    ):
-                        network_obj = getattr(backing, "network", None)
-                        actual_identifier = (
-                            "network",
-                            getattr(network_obj, "_moId", None),
-                        )
-                        actual_name = getattr(backing, "deviceName", None) or getattr(
-                            network_obj, "name", None
-                        )
-                    else:
-                        actual_name = getattr(backing, "deviceName", None)
-
-                    if dest_identifier and actual_identifier == dest_identifier:
-                        matched_nic = nic_dev
-                        break
-                    if actual_name and actual_name.lower() == dest_name.lower():
-                        matched_nic = nic_dev
-                        break
-                if matched_nic is None:
-                    if not remaining_new_nics:
-                        raise RuntimeError(
-                            "Unable to associate newly created NICs with destination networks."
-                        )
-                    matched_nic = remaining_new_nics[0]
-
-                remaining_new_nics.remove(matched_nic)
-                nic_record["new_mac_address"] = matched_nic.macAddress
-            print("   [OK] Associated new MAC addresses.")
-        else:
-            print(
-                "   - Skipping NIC reconfiguration because the original VM had no NICs."
-            )
-
-        print("\n--- [Phase 5/7] Destination vCenter: Power On ---")
-        print("\n" + "=" * 25 + " Pre-execution Check (3/4) " + "=" * 25)
-        print("Powering on the VM and applying guest OS IP configuration.")
-
-        new_default_gateway = (
-            calculate_ip_stg_to_prd(original_default_gateway)
-            if original_default_gateway
-            else None
-        )
-        gateway_nic_present = any(
-            nic.get("is_gateway_nic") for nic in original_nic_info
-        )
-        prd_static_routes: List[Dict[str, Any]] = []
-        if original_nic_info:
-            prd_static_routes = determine_prd_static_routes(
-                original_nic_info,
-                new_default_gateway,
-                original_static_routes,
-            )
-
-        if prd_static_routes:
-            print("   -> PRD static route candidates:")
-            for route_info in prd_static_routes:
-                owner_index = route_info.get("owner_index")
-                owner_label = (
-                    f"NIC #{owner_index + 1}" if owner_index is not None else "Any NIC"
-                )
-                destination = route_info["network"]
-                prefix_value = route_info.get("prefix")
-                if prefix_value is not None:
-                    destination = f"{destination}/{prefix_value}"
-                print(
-                    f"      - {destination} via {route_info['gateway']} ({owner_label})"
-                )
-
-        configured_route_indices: Set[int] = set()
-        for i, nic in enumerate(original_nic_info):
-            new_ip = calculate_ip_stg_to_prd(nic["ip_address"])
-            nic["prd_ip_address"] = new_ip
-            try:
-                nic["prd_ip_segment"] = int(new_ip.split(".")[2]) if new_ip else None
-            except (ValueError, IndexError):
-                nic["prd_ip_segment"] = None
-            print(f"\n  - NIC {i + 1} ({nic['new_mac_address']})")
-            print(f"    - IP Address  : {nic['ip_address']} -> {new_ip}")
-            mask_value = nic.get("subnet_mask") or "(unknown)"
-            print(f"    - Subnet Mask : {mask_value} -> {mask_value}")
-
-        if new_default_gateway:
-            print("\n  [Default gateway configuration]")
-            print(
-                f"    - Gateway     : {original_default_gateway} -> {new_default_gateway}"
-            )
-
-        if original_dns_servers:
-            print("\n  [DNS server configuration]")
-            new_dns_servers = [
-                calculate_ip_stg_to_prd(dns) for dns in original_dns_servers if dns
-            ]
-            for old_dns, new_dns in zip(original_dns_servers, new_dns_servers):
-                print(f"    - {old_dns} -> {new_dns}")
-        else:
-            print("  - No DNS server changes required.")
-        print("=" * 64)
-
-        user_approval_ip = input(
-            "\nApply this IP configuration and power on the VM? (y/n): "
-        )
-        if user_approval_ip.lower() != "y":
-            raise InterruptedError(
-                "IP configuration and power-on were cancelled by the user."
-            )
-        print("\nApproved. Powering on the VM...")
-        try:
-            task = migrated_vm.PowerOnVM_Task()
-        except vmodl.fault.ManagedObjectNotFound:
-            migrated_vm = wait_for_vm_availability(
-                content_dest, clone_name, retries=30, delay_seconds=2
-            )
-            migrated_vm_for_rollback = migrated_vm
-            migrated_vm_name_for_rollback = clone_name
-            task = migrated_vm.PowerOnVM_Task()
-        wait_for_task_completion(
-            task,
-            "Power-on task",
-            poll_interval=2.0,
-            timeout=600.0,
-        )
-        print("   [OK] VM powered on successfully.")
-
-        print("   Verifying guest operations agent readiness (up to 5 minutes)...")
-        guest_operations_manager = content_dest.guestOperationsManager
-        agent_ready = False
-        for i in range(10):
-            print(f"    - Attempt {i + 1}/10...")
-            try:
-                creds_check = vim.vm.guest.NamePasswordAuthentication(
-                    username=GUEST_ROOT_USER, password=GUEST_ROOT_PWD
-                )
-                process_manager = guest_operations_manager.processManager
-                spec_check = vim.vm.guest.ProcessManager.ProgramSpec(
-                    programPath="/bin/echo", arguments="ready"
-                )
-                pid = process_manager.StartProgramInGuest(
-                    vm=migrated_vm, auth=creds_check, spec=spec_check
-                )
-                if pid >= 0:
-                    agent_ready = True
-                    break
-            except vim.fault.InvalidGuestLogin:
-                agent_ready = True
-                break
-            except vmodl.fault.ManagedObjectNotFound:
-                migrated_vm = wait_for_vm_availability(
-                    content_dest, clone_name, retries=30, delay_seconds=2
-                )
-                migrated_vm_for_rollback = migrated_vm
-                migrated_vm_name_for_rollback = clone_name
-                continue
-            except vim.fault.GuestOperationsUnavailable:
-                if i < 9:
-                    time.sleep(30)
-                continue
-            except (vmodl.MethodFault, RuntimeError) as guest_ops_error:
-                LOGGER.debug(
-                    "Guest operations readiness check attempt failed: %s",
-                    guest_ops_error,
-                    exc_info=True,
-                )
-                if i < 9:
-                    time.sleep(30)
-                continue
-
-        if not agent_ready:
-            raise SystemError("Timeout: guest operations agent was not ready in time.")
-        print("   [OK] Guest operations agent is ready.")
-        print("\n--- [Phase 6/7] Destination vCenter: Set IP Address ---")
-
-        if original_nic_info:
-            root_credentials = vim.vm.guest.NamePasswordAuthentication(
-                username=GUEST_ROOT_USER, password=GUEST_ROOT_PWD
-            )
-            admin_credentials = None
-            if GUEST_ADMIN_USER and GUEST_ADMIN_PWD:
-                admin_credentials = vim.vm.guest.NamePasswordAuthentication(
-                    username=GUEST_ADMIN_USER,
-                    password=GUEST_ADMIN_PWD,
-                )
-
-            def guest_command_executor(command, check_exit_code=True):
-                """Execute a guest command, reloading the VM handle if it becomes invalid."""
-                nonlocal \
-                    migrated_vm, \
-                    migrated_vm_for_rollback, \
-                    migrated_vm_name_for_rollback
-                try:
-                    return execute_command_in_guest(
-                        guest_operations_manager,
-                        migrated_vm,
-                        root_credentials,
-                        admin_credentials,
-                        GUEST_ADMIN_PWD,
-                        command,
-                        check_exit_code=check_exit_code,
-                    )
-                except vmodl.fault.ManagedObjectNotFound:
-                    evaluated_vm = wait_for_vm_availability(
-                        content_dest, clone_name, retries=30, delay_seconds=2
-                    )
-                    migrated_vm = evaluated_vm
-                    migrated_vm_for_rollback = evaluated_vm
-                    migrated_vm_name_for_rollback = clone_name
-                    return execute_command_in_guest(
-                        guest_operations_manager,
-                        migrated_vm,
-                        root_credentials,
-                        admin_credentials,
-                        GUEST_ADMIN_PWD,
-                        command,
-                        check_exit_code=check_exit_code,
-                    )
-
-            new_default_gateway = calculate_ip_stg_to_prd(original_default_gateway)
-            sdk_interfaces: List[Dict[str, Any]] = []
-            sdk_vm_id: Optional[str] = None
-            use_sdk_networking = False
-            expected_dns_overall: List[str] = []
-            nmcli_validation_tasks: List[
-                Tuple[str, str, str, Optional[str], List[str], List[str]]
-            ] = []
-            if REQUESTS_AVAILABLE:
-                try:
-                    sdk_network_client = VsphereGuestNetworkSDK(
-                        host=VCSA_HOST_DEST,
-                        username=VCSA_USER,
-                        password=VCSA_PWD_DEST,
-                        verify_ssl=False,
-                    )
-                    sdk_vm_id = getattr(migrated_vm, "_moId", None)
-                    if sdk_vm_id:
-                        sdk_interfaces = sdk_network_client.list_interfaces(sdk_vm_id)
-                        if sdk_interfaces:
-                            use_sdk_networking = True
-                            print(
-                                "   -> Reconfiguring guest networking via the vSphere Automation SDK."
-                            )
-                        else:
-                            print(
-                                "   -> SDK enumerated no guest NICs; using the legacy nmcli workflow."
-                            )
-                except (RequestsExceptionType, RuntimeError, ValueError) as sdk_error:
-                    LOGGER.warning(
-                        "Unable to initialise SDK-based network reconfiguration: %s",
-                        sdk_error,
-                    )
-                    sdk_network_client = None
-                    use_sdk_networking = False
-            for i, nic_info in enumerate(original_nic_info):
-                new_ip = nic_info.get("prd_ip_address") or calculate_ip_stg_to_prd(
-                    nic_info["ip_address"]
-                )
-                nic_info["prd_ip_address"] = new_ip
-                subnet_mask = nic_info.get("subnet_mask") or ""
-                prefix: Optional[int] = None
-                if subnet_mask:
-                    try:
-                        prefix = sum(
-                            bin(int(part)).count("1") for part in subnet_mask.split(".")
-                        )
-                    except ValueError:
-                        prefix = mask_to_prefix(subnet_mask)
-                if prefix is None and subnet_mask:
-                    prefix = mask_to_prefix(subnet_mask)
-                if prefix is None and new_ip:
-                    prefix = 24
-
-                new_mac = nic_info.get("new_mac_address")
-                expected_gateway_value = (
-                    new_default_gateway
-                    if nic_info.get("is_gateway_nic") and new_default_gateway
-                    else None
-                )
-                expected_dns_servers: List[str] = []
-                applied_static_routes: List[str] = []
-
-                print("\n" + "=" * 20 + f" NIC {i + 1} Configuration " + "=" * 20)
-
-                interface_ctx = prepare_guest_interface(
-                    i, nic_info, guest_command_executor, new_mac
-                )
-                device_name = interface_ctx.device_name
-                con_name = device_name
-                guest_iface_names = interface_ctx.interface_names
-                guest_iface_names_compact = interface_ctx.interface_names_compact
-                new_mac_lower = interface_ctx.new_mac_lower
-                original_mac_lower = interface_ctx.original_mac_lower
-                print(f"   -> Guest OS interface '{device_name}' located.")
-                nmcli_check_exit, _, _ = guest_command_executor(
-                    "command -v nmcli", check_exit_code=False
-                )
-                nmcli_supported = nmcli_check_exit == 0
-                new_dns_servers: List[str] = []
-                if i == 0 and original_dns_servers:
-                    new_dns_servers = dedupe_preserving_order(
-                        calculate_ip_stg_to_prd(dns)
-                        for dns in original_dns_servers
-                        if dns
-                    )
-                    if new_dns_servers:
-                        expected_dns_servers = new_dns_servers[:]
-                        expected_dns_overall = dedupe_preserving_order(new_dns_servers)
-                routes_for_nic = _collect_routes_for_nic(
-                    prd_static_routes, configured_route_indices, i
-                )
-
-                should_configure_routes = _should_configure_routes_for_nic(
-                    new_default_gateway,
-                    new_ip,
-                    prefix,
-                    routes_for_nic,
-                    gateway_nic_present,
-                    i,
-                )
-
-                (
-                    rest_configured,
-                    use_sdk_networking,
-                    requires_nmcli,
-                    rest_dns_update,
-                    rest_route_indices,
-                ) = _attempt_rest_guest_update(
-                    use_sdk_networking=use_sdk_networking,
-                    sdk_network_client=sdk_network_client,
-                    sdk_vm_id=sdk_vm_id,
-                    nic_info=nic_info,
-                    new_ip=new_ip,
-                    prefix=prefix,
-                    expected_gateway_value=expected_gateway_value,
-                    should_configure_routes=should_configure_routes,
-                    expected_dns_servers=expected_dns_servers,
-                    routes_for_nic=routes_for_nic,
-                )
-
-                if not expected_dns_overall and rest_dns_update:
-                    expected_dns_overall = rest_dns_update
-
-                selected_route_indices: List[int] = []
-                selected_route_lines: List[str] = []
-                legacy_config_success = True
-                legacy_verification_command: Optional[str] = None
-                use_nmcli_connection = nmcli_supported and requires_nmcli
-
-                if rest_configured:
-                    selected_route_indices = rest_route_indices
-                    use_nmcli_connection = False
-                elif requires_nmcli:
-                    nmcli_result = _configure_nic_with_nmcli(
-                        guest_command_executor=guest_command_executor,
-                        device_name=device_name,
-                        con_name=con_name,
-                        nmcli_supported=nmcli_supported,
-                        new_mac_lower=new_mac_lower,
-                        original_mac_lower=original_mac_lower,
-                        expected_gateway_value=expected_gateway_value,
-                        new_dns_servers=new_dns_servers,
-                        should_configure_routes=should_configure_routes,
-                        routes_for_nic=routes_for_nic,
-                        new_ip=new_ip,
-                        prefix=prefix,
-                        expected_dns_servers=expected_dns_servers,
-                        expected_dns_overall=expected_dns_overall,
-                        guest_iface_names=guest_iface_names,
-                        guest_iface_names_compact=guest_iface_names_compact,
-                    )
-                    selected_route_indices = nmcli_result.route_indices
-                    selected_route_lines = nmcli_result.route_lines
-                    expected_dns_servers = nmcli_result.expected_dns_servers
-                    if not expected_dns_overall and nmcli_result.expected_dns_overall:
-                        expected_dns_overall = nmcli_result.expected_dns_overall
-                    legacy_config_success = nmcli_result.legacy_success
-                    legacy_verification_command = (
-                        nmcli_result.legacy_verification_command
-                    )
-                    use_nmcli_connection = nmcli_result.use_nmcli_connection
-                else:
-                    selected_route_lines = []
-                if selected_route_lines:
-                    applied_static_routes.extend(selected_route_lines)
-                if not use_nmcli_connection and not legacy_config_success:
-                    raise RuntimeError(
-                        "Legacy network configuration failed inside the guest OS. See log output above."
-                    )
-                for route_idx in selected_route_indices:
-                    configured_route_indices.add(route_idx)
-                # 4. Bring up the new connection
-                if use_nmcli_connection:
-                    guest_command_executor(
-                        f"nmcli connection modify '{con_name}' connection.autoconnect yes",
-                        check_exit_code=False,
-                    )
-                    guest_command_executor(
-                        f"nmcli device connect '{device_name}'",
-                        check_exit_code=False,
-                    )
-                    up_exit, up_stdout, up_stderr = guest_command_executor(
-                        f"nmcli connection up '{con_name}'",
-                        check_exit_code=False,
-                    )
-                    if up_exit != 0:
-                        combined_output = "\n".join(
-                            filter(None, (up_stdout, up_stderr))
-                        ).lower()
-                        if "base network connection was interrupted" in combined_output:
-                            print(
-                                "   -> nmcli reported an interrupted base connection; retrying activation."
-                            )
-                            guest_command_executor(
-                                f"nmcli device disconnect '{device_name}' || true",
-                                check_exit_code=False,
-                            )
-                            guest_command_executor(
-                                f"nmcli device connect '{device_name}'",
-                                check_exit_code=False,
-                            )
-                            up_exit, up_stdout, up_stderr = guest_command_executor(
-                                f"nmcli connection up '{con_name}'",
-                                check_exit_code=False,
-                            )
-                        if up_exit != 0:
-                            print(
-                                "   [WARN] nmcli connection up returned a non-zero exit code; continuing with validation."
-                            )
-                guest_command_executor(
-                    f"ip -6 addr flush dev {device_name}", check_exit_code=False
-                )
-                guest_command_executor(
-                    (
-                        f"if [ -f /proc/sys/net/ipv6/conf/{device_name}/disable_ipv6 ]; then "
-                        f"sysctl -w net.ipv6.conf.{device_name}.disable_ipv6=1; "
-                        "fi"
-                    ),
-                    check_exit_code=False,
-                )
-                guest_command_executor(
-                    (
-                        f"if [ -f /proc/sys/net/ipv6/conf/{device_name}/autoconf ]; then "
-                        f"sysctl -w net.ipv6.conf.{device_name}.autoconf=0; "
-                        "fi"
-                    ),
-                    check_exit_code=False,
-                )
-                # 4.5. Broadcast gratuitous ARP to refresh neighbor caches
-                if new_ip:
-                    guest_command_executor(
-                        (
-                            "if command -v ip >/dev/null 2>&1; then "
-                            f"ip link set {device_name} up; "
-                            "elif command -v ifconfig >/dev/null 2>&1; then "
-                            f"ifconfig {device_name} up; "
-                            "fi"
-                        ),
-                        check_exit_code=False,
-                    )
-                    arping_commands = [
-                        f"arping -c 3 -A -I {device_name} {new_ip}",
-                        f"arping -c 3 -U -I {device_name} {new_ip}",
-                    ]
-                    for arping_cmd in arping_commands:
-                        guest_command_executor(arping_cmd, check_exit_code=False)
-
-                # 5. Final verification
-                time.sleep(5)
-                if new_ip:
-                    verification_cmd = None
-                    if use_nmcli_connection:
-                        verification_cmd = (
-                            f"ip addr show {device_name} | grep -q '{new_ip}'"
-                        )
-                    else:
-                        verification_cmd = (
-                            legacy_verification_command
-                            or f"ip addr show {device_name} | grep -q '{new_ip}'"
-                        )
-                    guest_command_executor(verification_cmd)
-                ping_targets = []
-                candidate_gateways = []
-                if expected_gateway_value:
-                    candidate_gateways.append(expected_gateway_value)
-                elif new_default_gateway and not gateway_nic_present:
-                    candidate_gateways.append(new_default_gateway)
-                if new_ip and prefix:
-                    try:
-                        iface = ipaddress.IPv4Interface(f"{new_ip}/{prefix}")
-                        first_host = next(iface.network.hosts(), None)
-                        if first_host:
-                            candidate_gateways.append(str(first_host))
-                    except ValueError:
-                        LOGGER.debug(
-                            "Failed to derive fallback gateway from %s/%s",
-                            new_ip,
-                            prefix,
-                            exc_info=True,
-                        )
-                for route_line in applied_static_routes:
-                    parts = route_line.split()
-                    gw_candidate = ""
-                    if len(parts) >= 3 and parts[1].lower() == "via":
-                        gw_candidate = parts[2]
-                    elif parts:
-                        gw_candidate = parts[-1]
-                    if gw_candidate and gw_candidate not in candidate_gateways:
-                        candidate_gateways.append(gw_candidate)
-                for candidate in candidate_gateways:
-                    if (
-                        candidate
-                        and candidate != new_ip
-                        and candidate not in ping_targets
-                    ):
-                        ping_targets.append(candidate)
-                LOGGER.debug(
-                    "Connectivity targets for %s (%s): %s",
-                    device_name,
-                    new_ip,
-                    ping_targets or "[none]",
-                )
-                try:
-                    ensure_connection_activation(
-                        guest_command_executor,
-                        con_name if use_nmcli_connection else None,
-                        device_name,
-                        ping_targets=ping_targets,
-                    )
-                except RuntimeError as activation_error:
-                    print(
-                        f"\n[WARN] Connectivity verification failed for '{con_name}': {activation_error}"
-                    )
-                    decision = (
-                        input(
-                            "Continue despite the connectivity failure? (c=continue / a=abort): "
-                        )
-                        .strip()
-                        .lower()
-                    )
-                    if decision == "c":
-                        print(
-                            "   -> Continuing despite failed connectivity checks per user direction."
-                        )
-                        workflow_had_warnings = True
-                    else:
-                        raise
-
-                expected_ip_cidr = (
-                    f"{new_ip}/{prefix}" if new_ip and prefix is not None else ""
-                )
-                if use_nmcli_connection:
-                    nmcli_validation_tasks.append(
-                        (
-                            con_name,
-                            device_name,
-                            expected_ip_cidr,
-                            expected_gateway_value,
-                            applied_static_routes.copy(),
-                            expected_dns_servers[:] if expected_dns_servers else [],
-                        )
-                    )
-            if not _sync_prd_system_configuration(
-                guest_command_executor,
-                source_firewalld_zones,
-            ):
-                workflow_had_warnings = True
-            ensure_firewall_allows_ssh(guest_command_executor, SSH_ALLOWED_SOURCE_IP)
-            print("   [OK] Completed IP configuration for all NICs.")
-        expected_dns_overall = dedupe_preserving_order(expected_dns_overall)
-        sdk_verification_succeeded = False
-        if REQUESTS_AVAILABLE:
-            validation_client = sdk_network_client
-            created_validation_client = False
-            validation_vm_id = sdk_vm_id or getattr(migrated_vm, "_moId", None)
-            if validation_vm_id and validation_client is None:
-                try:
-                    validation_client = VsphereGuestNetworkSDK(
-                        host=VCSA_HOST_DEST,
-                        username=VCSA_USER,
-                        password=VCSA_PWD_DEST,
-                        verify_ssl=False,
-                    )
-                    created_validation_client = True
-                except (RequestsExceptionType, RuntimeError) as sdk_error:
-                    LOGGER.warning(
-                        "Failed to initialise SDK client for post-migration verification: %s",
-                        sdk_error,
-                    )
-            if validation_vm_id and validation_client:
-                try:
-                    configured_route_payload = [
-                        route_entry
-                        for idx, route_entry in enumerate(prd_static_routes)
-                        if idx in configured_route_indices
-                    ]
-                    sdk_verification_succeeded = verify_destination_network_with_sdk(
-                        validation_client,
-                        validation_vm_id,
-                        original_nic_info,
-                        expected_dns_overall,
-                        configured_route_payload,
-                    )
-                except (RequestsExceptionType, RuntimeError, ValueError) as sdk_error:
-                    LOGGER.warning(
-                        "SDK verification encountered an error: %s", sdk_error
-                    )
-                finally:
-                    if created_validation_client and validation_client:
-                        validation_client.close()
-        if not sdk_verification_succeeded:
-            workflow_had_warnings = True
-            for (
-                con_name,
-                device_name,
-                expected_ip_cidr,
-                expected_gateway_value,
-                routes_snapshot,
-                dns_snapshot,
-            ) in nmcli_validation_tasks:
-                try:
-                    verify_nmcli_connection_settings(
-                        guest_command_executor,
-                        con_name,
-                        device_name,
-                        expected_ip_cidr,
-                        expected_gateway_value,
-                        routes_snapshot,
-                        dns_snapshot,
-                    )
-                except RuntimeError as validation_error:
-                    print(f"\n[WARN] nmcli validation failed: {validation_error}")
-                    decision = (
-                        input(
-                            "Continue despite nmcli validation failure? (c=continue / a=abort): "
-                        )
-                        .strip()
-                        .lower()
-                    )
-                    if decision == "c":
-                        print(
-                            "   -> Proceeding despite nmcli validation failure per user request."
-                        )
-                    else:
-                        raise
-        print("\n--- [Phase 7/7] Destination vCenter: Final Storage vMotion ---")
-        print(f"Searching for final datastore '{TARGET_DATASTORE_NAME_FINAL}'...")
-        final_view = content_dest.viewManager.CreateContainerView(
-            content_dest.rootFolder,
-            [vim.Datastore],
-            True,
-        )
-        try:
-            final_datastore = next(
-                (
-                    ds
-                    for ds in final_view.view
-                    if ds.name == TARGET_DATASTORE_NAME_FINAL
-                ),
-                None,
-            )
-        finally:
-            final_view.Destroy()
-        if not final_datastore:
-            raise FileNotFoundError(
-                f"Final datastore '{TARGET_DATASTORE_NAME_FINAL}' was not found."
-            )
-        print(f"[OK] Confirmed final datastore '{final_datastore.name}'.")
-        print("\n" + "=" * 25 + " Pre-execution Check (4/4) " + "=" * 25)
-        print("Move the VM storage to the final PRD datastore.")
-        print(f"  - Target VM       : {clone_name}")
-        try:
-            current_datastores = ", ".join([ds.name for ds in migrated_vm.datastore])
-        except vmodl.fault.ManagedObjectNotFound:
-            migrated_vm = wait_for_vm_availability(
-                content_dest, clone_name, retries=30, delay_seconds=2
-            )
-            migrated_vm_for_rollback = migrated_vm
-            migrated_vm_name_for_rollback = clone_name
-            current_datastores = ", ".join([ds.name for ds in migrated_vm.datastore])
-        print(f"  - Current datastores : {current_datastores}")
-        print(f"  - Destination datastore: {TARGET_DATASTORE_NAME_FINAL}")
-        print("=" * 64)
-
-        user_approval_svmotion = input("\nProceed with this storage vMotion? (y/n): ")
-        if user_approval_svmotion.lower() != "y":
-            raise InterruptedError("Storage vMotion was cancelled by the user.")
-        print("\nApproved. Starting storage vMotion task...")
-        relocate_spec_final = vim.vm.RelocateSpec(datastore=final_datastore)
-        try:
-            task = migrated_vm.RelocateVM_Task(spec=relocate_spec_final)
-        except vmodl.fault.ManagedObjectNotFound:
-            migrated_vm = wait_for_vm_availability(
-                content_dest, clone_name, retries=30, delay_seconds=2
-            )
-            migrated_vm_for_rollback = migrated_vm
-            migrated_vm_name_for_rollback = clone_name
-            task = migrated_vm.RelocateVM_Task(spec=relocate_spec_final)
-
-        wait_for_task_completion(
-            task,
-            "Storage vMotion task",
-            poll_interval=5.0,
-            timeout=3600.0,
-            progress_label="Storage vMotion progress",
-        )
-
-        print("\n[OK] Storage vMotion completed successfully.")
-        print("\n[OK] Migration workflow finished without errors.")
-        _stop_keepalive_thread(dest_keepalive_handle)
-        dest_keepalive_handle = None
-        Disconnect(si_dest)
-        si_dest = None
-    except WORKFLOW_RECOVERABLE_EXCEPTIONS as error:
-        cancellation_requested = isinstance(error, InterruptedError)
-        if cancellation_requested:
-            cancellation_message = (
-                str(error) or ""
-            ).strip() or "Operation cancelled by the user."
-            print(f"\n[INFO] {cancellation_message}")
-        else:
-            fatal_error = error
-            print(f"\n[ERROR] An error occurred during processing: {error}")
-
-        dest_vm_retained = False
-        if migrated_vm_for_rollback:
-            dest_vm_retained = True
-            print(
-                "\n"
-                + "=" * 20
-                + " Rollback Confirmation (Destination VM Removal) "
-                + "=" * 20
-            )
-            print(
-                "The process stopped, leaving a partially migrated VM on the destination vCenter."
-            )
-            vm_name_display = migrated_vm_name_for_rollback or clone_name or "(unknown)"
-            print(f"  - Target VM: {vm_name_display}")
-
-            rollback_approval = input(
-                "\nDelete this VM to return to the pre-operation state? (y/n): "
-            )
-            if rollback_approval.lower() == "y":
-                try:
-                    si_dest, dest_keepalive_handle = _ensure_destination_session(
-                        si_dest,
-                        dest_keepalive_handle,
-                        ssl_context,
-                    )
-                    (
-                        dest_vm_retained,
-                        unregistered_from_source,
-                    ) = _delete_destination_vm(
-                        si_dest,
-                        clone_name,
-                        cause=error,
-                    )
-                except WORKFLOW_RECOVERABLE_EXCEPTIONS as cleanup_error:
-                    print(
-                        f"[WARN] Error during destination VM rollback: {cleanup_error}"
-                    )
-                    unregistered_from_source = True
-                    dest_vm_retained = True
-            else:
-                print(
-                    "Rollback was cancelled; the VM remains on the destination vCenter."
-                )
-                dest_vm_retained = True
-        if unregistered_from_source and not dest_vm_retained:
-            print(
-                "\n"
-                + "=" * 20
-                + " Rollback Confirmation (Datastore Cleanup) "
-                + "=" * 20
-            )
-            print(
-                "   Clone files remain on the source vCenter datastore and must be cleaned up."
-            )
-            print(
-                f"   VM files may still exist on datastore '{TARGET_DATASTORE_NAME}'."
-            )
-
-            rollback_approval_files = input(
-                "\nConnect to the source vCenter and delete these files? (y/n): "
-            )
-            if rollback_approval_files.lower() == "y":
-                si_source_cleanup = None
-                try:
-                    print(
-                        "\nApproved. Reconnecting to the source vCenter for cleanup..."
-                    )
-                    si_source_cleanup = authenticate_vcenter(
-                        VCSA_HOST_SOURCE,
-                        VCSA_USER,
-                        VCSA_PWD_SOURCE,
-                        ssl_context,
-                        host_env_var=ENV_SOURCE_HOST_VAR,
-                    )
-                    print("   [OK] Reconnected successfully.")
-
-                    content_cleanup = si_source_cleanup.RetrieveContent()
-                    file_manager = content_cleanup.fileManager
-                    vm_dir_path = os.path.dirname(vmx_path)
-                    print(
-                        f"   Deleting directory '{vm_dir_path}' from the datastore..."
-                    )
-                    datacenter = content_cleanup.rootFolder.childEntity[0]
-                    delete_task = file_manager.DeleteDatastoreFile_Task(
-                        name=vm_dir_path, datacenter=datacenter
-                    )
-                    delete_state = wait_for_task_completion(
-                        delete_task,
-                        "Datastore cleanup task",
-                        poll_interval=2.0,
-                        timeout=900.0,
-                        raise_on_error=False,
-                    )
-                    if delete_state == vim.TaskInfo.State.success:
-                        print(
-                            "[OK] Rollback complete: removed files from the datastore."
-                        )
-                    else:
-                        raise RuntimeError(
-                            f"Failed to delete files from datastore: {delete_task.info.error.msg}"
-                        ) from error
-                except WORKFLOW_RECOVERABLE_EXCEPTIONS as cleanup_error:
-                    print(f"[WARN] Error during datastore cleanup: {cleanup_error}")
-                    print(
-                        "   Please clean up manually via the datastore browser if needed."
-                    )
-                finally:
-                    if si_source_cleanup:
-                        Disconnect(si_source_cleanup)
-            else:
-                print(
-                    "File cleanup was cancelled by the user; files remain on the datastore."
-                )
-        elif new_vm_on_source:
-            print(
-                "\n"
-                + "=" * 20
-                + " Rollback Confirmation (Source VM Removal) "
-                + "=" * 20
-            )
-            print(
-                f"VM '{new_vm_on_source.name}' remains on the source vCenter from an interrupted run."
-            )
-            rollback_approval = input(
-                "\nDelete this VM to restore the pre-operation state? (y/n): "
-            )
-            if rollback_approval.lower() == "y":
-                if new_vm_on_source.runtime.powerState == "poweredOn":
-                    print(f"   Powering off VM '{new_vm_on_source.name}'...")
-                    poweroff_task = new_vm_on_source.PowerOffVM_Task()
-                    poweroff_state = wait_for_task_completion(
-                        poweroff_task,
-                        "Power-off task",
-                        poll_interval=2.0,
-                        timeout=600.0,
-                        raise_on_error=False,
-                    )
-                    if poweroff_state == vim.TaskInfo.State.success:
-                        print("   [OK] Power-off completed.")
-                    else:
-                        print(
-                            f"   [WARN] Power-off failed: {poweroff_task.info.error.msg}. Continuing with deletion."
-                        )
-                task = new_vm_on_source.Destroy_Task()
-                destroy_state = wait_for_task_completion(
-                    task,
-                    "Source VM destruction task",
-                    poll_interval=2.0,
-                    timeout=900.0,
-                    raise_on_error=False,
-                )
-                if destroy_state == vim.TaskInfo.State.success:
-                    print("[OK] Rollback complete: deleted source VM.")
-                else:
-                    print(f"[WARN] Rollback failed: {task.info.error.msg}")
-            else:
-                print("Rollback was cancelled; the VM remains on the source vCenter.")
-    finally:
-        try:
-            if "sdk_network_client" in locals() and sdk_network_client:
-                sdk_network_client.close()
-        except WORKFLOW_RECOVERABLE_EXCEPTIONS:
-            pass
-        dest_keepalive_stopped = True
-        if "dest_keepalive_handle" in locals():
-            dest_keepalive_stopped = _stop_keepalive_thread(dest_keepalive_handle)
-        try:
-            if "si_dest" in locals() and si_dest:
-                if dest_keepalive_stopped:
-                    Disconnect(si_dest)
-                else:
-                    LOGGER.warning(
-                        "Skipping disconnect from destination vCenter because keep-alive thread is still running."
-                    )
-        except (vmodl.MethodFault, IOError, RuntimeError) as disconnect_error:
-            LOGGER.debug(
-                "Error while disconnecting from destination vCenter: %s",
-                disconnect_error,
-                exc_info=True,
-            )
-        source_keepalive_stopped = True
-        if "source_keepalive_handle" in locals():
-            source_keepalive_stopped = _stop_keepalive_thread(source_keepalive_handle)
-        try:
-            if "si_source" in locals() and si_source:
-                if source_keepalive_stopped:
-                    Disconnect(si_source)
-                else:
-                    LOGGER.warning(
-                        "Skipping disconnect from source vCenter because keep-alive thread is still running."
-                    )
-        except (vmodl.MethodFault, IOError, RuntimeError) as disconnect_error:
-            LOGGER.debug(
-                "Error while disconnecting from source vCenter: %s",
-                disconnect_error,
-                exc_info=True,
-            )
-        if cancellation_requested:
-            final_message = cancellation_message or "Processing cancelled by the user."
-        elif fatal_error is not None:
-            final_message = "Processing finished with errors."
-        else:
-            final_message = "Processing finished."
-        print(final_message)
-        _print_execution_summary()
+def main() -> None:
+    """CLI entrypoint to orchestrate the staged-to-production migration workflow."""
+    cli_args = _parse_cli_arguments()
+    provided_source_vm_name = _apply_cli_configuration(cli_args)
+    _prompt_vcenter_passwords()
+    reset_root_login_disabled()
+    ssl_context = _create_ssl_context()
+    target_vm_name = _resolve_target_vm_name(provided_source_vm_name)
+    _prompt_guest_credentials()
+    _execute_workflow(target_vm_name, ssl_context)
 
 
 if __name__ == "__main__":
